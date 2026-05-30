@@ -1,0 +1,19 @@
+# AI Movie - MVP dependencies
+
+# Video playback (VLC embedding)
+python-vlc
+
+# Image processing (thumbnails)
+Pillow
+
+# ASR (speech-to-text)
+faster-whisper
+
+# Future dependencies:
+# ffmpeg-python
+# pydub
+# faster-whisper
+# edge-tts
+# openai
+# loguru
+# tqdm
