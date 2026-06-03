@@ -19,12 +19,11 @@ _MODEL_HINT = """
 Whisper 模型未下载。请先下载到本地缓存。
 
 方式 1 — 命令行（需要能访问 HuggingFace）:
-  # 在 venv312 环境中运行:
-  venv312/Scripts/python.exe -c "import whisper; whisper.load_model('large-v3')"
+  python -c "import whisper; whisper.load_model('large-v3')"
 
 方式 2 — 用 HF 镜像:
-  set HF_ENDPOINT=https://hf-mirror.com
-  venv312/Scripts/python.exe -c "import whisper; whisper.load_model('large-v3')"
+  export HF_ENDPOINT=https://hf-mirror.com
+  python -c "import whisper; whisper.load_model('large-v3')"
 
 方式 3 — 手动下载后指定路径:
   修改 asr_gpu.py 中 MODEL_PATH 变量指向本地模型目录。
@@ -53,11 +52,18 @@ def main():
 
     # Load model (first run downloads ~3 GB)
     try:
-        import torch_directml
-        import whisper
+        import sys
+        if sys.platform == "win32":
+            import torch_directml
+            import whisper
+            device = torch_directml.device()
+        else:
+            # Linux/macOS: use native PyTorch CUDA/ROCm or CPU
+            import torch
+            import whisper
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        device = torch_directml.device()
-        # Load to CPU first to avoid torch-directml device() typing bug
+        # Load to CPU first to avoid device typing issues
         model = whisper.load_model(model_size, device="cpu")
         model = model.to(device)
     except Exception as e:

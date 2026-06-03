@@ -9,6 +9,9 @@ STEP_NAMES = [
     "拆分音轨",
     "转换文字",
     "文本翻译",
+    "人声分离",
+    "人声生成",
+    "重新混音",
     "合成音轨",
     "人物锚定",
     "口型匹配",
@@ -16,7 +19,22 @@ STEP_NAMES = [
 ]
 
 # Steps whose completion is NOT required to unlock the next step.
-OPTIONAL_STEPS = {"切割视频"}
+OPTIONAL_STEPS = {"切割视频", "合成音轨"}
+
+# Each step's prerequisites (must all be "done" to unlock).
+STEP_DEPS: dict[str, list[str]] = {
+    "切割视频": [],
+    "拆分音轨": [],
+    "转换文字": ["拆分音轨"],
+    "文本翻译": ["转换文字"],
+    "人声分离": ["拆分音轨"],
+    "人声生成": ["人声分离", "文本翻译"],
+    "重新混音": ["人声生成"],
+    "合成音轨": ["拆分音轨", "文本翻译"],  # one-click shortcut
+    "人物锚定": ["文本翻译"],
+    "口型匹配": ["人物锚定"],
+    "合成视频": ["口型匹配", "重新混音"],
+}
 
 
 class ProjectLog:
@@ -39,26 +57,15 @@ class ProjectLog:
     # ── step helpers ──────────────────────────────────────────
 
     def step_status(self, step_name: str) -> str:
-        """Return ``locked`` | ``ready`` | ``running`` | ``done`` | ``failed``.
-
-        An optional step does **not** block the step that follows it.
-        """
+        """Return ``locked`` | ``ready`` | ``running`` | ``done`` | ``failed``."""
         if step_name not in STEP_NAMES:
             return "locked"
-        idx = STEP_NAMES.index(step_name)
-        if idx == 0:
+        deps = STEP_DEPS.get(step_name, [])
+        if not deps:
             return self.steps.get(step_name, "ready")
-
-        # Walk backwards through blockers, skipping optional steps
-        for prev_idx in range(idx - 1, -1, -1):
-            prev_name = STEP_NAMES[prev_idx]
-            if prev_name in OPTIONAL_STEPS:
-                continue
-            if self.steps.get(prev_name) == "done":
-                return self.steps.get(step_name, "ready")
-            return "locked"
-
-        # All preceding steps are optional → always ready
+        for dep in deps:
+            if self.steps.get(dep) != "done":
+                return "locked"
         return self.steps.get(step_name, "ready")
 
     def mark_step(self, step_name: str, status: str):

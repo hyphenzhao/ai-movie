@@ -33,3 +33,4 @@ workspace/
 *.flv
 *.m4v
 *.wav
+.venv/

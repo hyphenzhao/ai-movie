@@ -6,7 +6,7 @@ import tempfile
 import tkinter as tk
 from pathlib import Path
 
-from ai_movie.config import WORKSPACE_DIR
+from ai_movie.config import WORKSPACE_DIR, CJK_FONT
 from ai_movie.utils import ensure_dir
 
 
@@ -43,7 +43,7 @@ class VideoPlayer:
         self._placeholder = tk.Label(
             self.frame, text=placeholder,
             bg="#1a1a1a", fg="#666",
-            font=("Microsoft YaHei", 14),
+            font=(CJK_FONT, 14),
         )
         self._placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -57,8 +57,12 @@ class VideoPlayer:
             import vlc
             # Use different audio output modules so each player gets an
             # independent Windows audio session (volume/mute are isolated).
-            aout = "directsound" if self.channel == "left" else "mmdevice"
-            self._vlc_instance = vlc.Instance(f"--aout={aout} --quiet")
+            if sys.platform == "win32":
+                aout = "directsound" if self.channel == "left" else "mmdevice"
+                self._vlc_instance = vlc.Instance(f"--aout={aout} --quiet")
+            else:
+                # Linux/macOS: VLC auto-detects the best audio backend
+                self._vlc_instance = vlc.Instance("--quiet")
             self._media_player = self._vlc_instance.media_player_new()
 
             # Embed into tkinter frame

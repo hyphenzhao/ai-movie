@@ -1,19 +1,25 @@
-# AI Movie - MVP dependencies
+# ══ AI Movie — Python dependencies ══════════════════════════════════
+#
+# Install:  pip install -r requirements.txt
+#
+# GPU acceleration:
+#   AMD ROCm:  pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+#   NVIDIA:    pip install torch --index-url https://download.pytorch.org/whl/cu126
+#
+# System prerequisites (Ubuntu/Debian):
+#   sudo apt install ffmpeg vlc python3-tk python3-pil.imagetk
 
-# Video playback (VLC embedding)
-python-vlc
+# ── Core ─────────────────────────────────────────────────────────
+python-vlc>=3.0            # VLC media player embedding
+Pillow>=10.0               # image thumbnails + ImageTk
+faster-whisper>=1.0        # ASR CPU fallback (CTranslate2, int8)
+openai-whisper>=20250625   # ASR GPU backend (PyTorch ROCm/CUDA)
 
-# Image processing (thumbnails)
-Pillow
-
-# ASR (speech-to-text)
-faster-whisper
-
-# Future dependencies:
-# ffmpeg-python
-# pydub
-# faster-whisper
-# edge-tts
-# openai
-# loguru
-# tqdm
+# ── Optional / future ────────────────────────────────────────────
+# torch                    # installed separately (GPU backend)
+# edge-tts                 # free TTS synthesis
+# openai                   # OpenAI TTS API
+# ffmpeg-python            # FFmpeg bindings (currently called via subprocess)
+# pydub                    # audio post-processing
+# loguru                   # structured logging
+# tqdm                     # progress bars
