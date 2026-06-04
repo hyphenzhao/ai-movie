@@ -1131,6 +1131,21 @@ class App:
 
     def _build_generate_tab(self, tab: ttk.Frame):
         """Tab showing generated speech segments with play buttons."""
+        # Mode selector bar
+        mode_bar = ttk.Frame(tab, padding=(10, 6, 10, 2))
+        mode_bar.pack(fill="x", side="top")
+        ttk.Label(mode_bar, text="合成模式：",
+                  font=(config.CJK_FONT, 10)).pack(side="left")
+        self._tts_mode_var = tk.StringVar(value="gender")
+        ttk.Radiobutton(mode_bar, text="性别匹配（清晰，推荐）",
+                        variable=self._tts_mode_var,
+                        value="gender").pack(side="left", padx=(8, 4))
+        ttk.Radiobutton(mode_bar, text="声音克隆（近似原声）",
+                        variable=self._tts_mode_var,
+                        value="clone").pack(side="left", padx=4)
+
+        ttk.Separator(tab, orient="horizontal").pack(fill="x", padx=10)
+
         # Scrollable canvas for segment list
         self._gen_result_canvas = tk.Canvas(tab, bg="#f5f5f5", highlightthickness=0)
         scrollbar = ttk.Scrollbar(tab, orient="vertical", command=self._gen_result_canvas.yview)
@@ -1344,13 +1359,26 @@ class App:
         import ai_movie.tts as tts_mod
         tts_mod._load_model()
 
-        # Trim reference audio once (CosyVoice rejects audio > 30s)
-        trimmed_ref = tts_mod.trim_reference_audio(vocals_path)
+        # Detect gender / extract reference segment (a few seconds, acceptable on main thread)
+        mode = getattr(self, "_tts_mode_var", None)
+        mode = mode.get() if mode else "gender"
+        out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+        ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+            vocals_path, mode=mode, cache_dir=out_dir
+        )
+        # Update dialog to show detected info
+        gender_hint = ""
+        if mode == "gender":
+            gender_hint = "（女声）" if ref_text else "（男声）"
+        self._lbl_gen_prog.configure(
+            text=f"模式：{'性别匹配' if mode == 'gender' else '声音克隆'}{gender_hint}")
 
         # Process segments one at a time on main thread via root.after()
         self._gen_segments = segments
-        self._gen_vocals_path = trimmed_ref
-        self._gen_output_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+        self._gen_ref_audio = ref_audio
+        self._gen_ref_text = ref_text
+        self._gen_ref_method = ref_method
+        self._gen_output_dir = out_dir
         self._gen_idx = 0
         self._gen_results: list[dict] = []
         self._gen_tts_mod = tts_mod
@@ -1386,15 +1414,11 @@ class App:
 
         # Run inference on main thread
         try:
-            import numpy as np
             import soundfile as sf
-            tagged = f"<|zh|>{text}"
-            chunks = []
-            for gen in mod._model.inference_cross_lingual(
-                tagged, str(self._gen_vocals_path), stream=False
-            ):
-                chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
-            audio_np = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+            audio_np = mod.call_tts(
+                mod._model, text,
+                self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method,
+            )
             out_path = str(self._gen_output_dir / f"seg_{idx + 1:04d}.wav")
             sf.write(out_path, audio_np, mod._model.sample_rate)
             self._gen_results.append({**seg, "audio": out_path})
@@ -1612,11 +1636,18 @@ class App:
         import ai_movie.tts as tts_mod
         self._update_syn_stage("Step 2/3: 合成语音…")
         tts_mod._load_model()
-        trimmed_ref = tts_mod.trim_reference_audio(sep["vocals"])
+        out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+        mode = getattr(self, "_tts_mode_var", None)
+        mode = mode.get() if mode else "gender"
+        ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+            sep["vocals"], mode=mode, cache_dir=out_dir
+        )
         self._syn_segments = segments
         self._syn_sep = sep
-        self._syn_vocals_ref = trimmed_ref
-        self._syn_output_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+        self._syn_vocals_ref = ref_audio
+        self._syn_ref_text = ref_text
+        self._syn_ref_method = ref_method
+        self._syn_output_dir = out_dir
         self._syn_idx = 0
         self._syn_results: list[dict] = []
         self._syn_tts_mod = tts_mod
@@ -1642,14 +1673,11 @@ class App:
             return
         mod = self._syn_tts_mod
         try:
-            import numpy as np
             import soundfile as sf
-            chunks = []
-            for gen in mod._model.inference_cross_lingual(
-                f"<|zh|>{text}", self._syn_vocals_ref, stream=False
-            ):
-                chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
-            audio_np = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+            audio_np = mod.call_tts(
+                mod._model, text,
+                self._syn_vocals_ref, self._syn_ref_text, self._syn_ref_method,
+            )
             out_path = str(self._syn_output_dir / f"seg_{idx + 1:04d}.wav")
             sf.write(out_path, audio_np, mod._model.sample_rate)
             self._syn_results.append({**seg, "audio": out_path})
