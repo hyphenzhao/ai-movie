@@ -1379,6 +1379,7 @@ class App:
 
         # Process segments one at a time on main thread via root.after()
         self._gen_segments = segments
+        self._gen_vocals_path = vocals_path   # kept for per-segment gender detection
         self._gen_ref_audio = ref_audio
         self._gen_ref_text = ref_text
         self._gen_ref_method = ref_method
@@ -1418,7 +1419,9 @@ class App:
         # Per-segment speaker selection (SFT gender mode)
         if self._gen_ref_method == "sft":
             last = getattr(self, "_gen_last_gender", "female")
-            seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
+            seg_gender = mod.detect_gender_from_segment(
+                seg, fallback=last,
+                vocals_path=getattr(self, "_gen_vocals_path", None))
             self._gen_last_gender = seg_gender
             spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
             ref, ref_text, ref_method = spk, None, "sft"
@@ -1660,6 +1663,7 @@ class App:
         )
         self._syn_segments = segments
         self._syn_sep = sep
+        self._syn_vocals_path = sep["vocals"]  # kept for per-segment gender detection
         self._syn_vocals_ref = ref_audio
         self._syn_ref_text = ref_text
         self._syn_ref_method = ref_method
@@ -1691,7 +1695,9 @@ class App:
         # Per-segment speaker selection (SFT gender mode)
         if self._syn_ref_method == "sft":
             last = getattr(self, "_syn_last_gender", "female")
-            seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
+            seg_gender = mod.detect_gender_from_segment(
+                seg, fallback=last,
+                vocals_path=getattr(self, "_syn_vocals_path", None))
             self._syn_last_gender = seg_gender
             spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
             ref, ref_text, ref_method = spk, None, "sft"

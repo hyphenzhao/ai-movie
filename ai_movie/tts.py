@@ -72,18 +72,24 @@ def _load_model():
 # ── public helpers ────────────────────────────────────────────────
 
 def _pyin_gender(clip: np.ndarray, sr: int) -> str | None:
-    """Return 'female'/'male' from a mono float32 clip, or None if inconclusive."""
+    """Return 'female'/'male' from a mono float32 clip, or None if inconclusive.
+
+    Only uses frames with voicing probability > 0.8 to filter out noise.
+    Returns None when fewer than 3 high-confidence frames are available.
+    """
     import librosa
     if len(clip) < sr * 1.5:          # need ≥ 1.5 s for reliable estimate
         return None
-    f0, voiced_flag, _ = librosa.pyin(
+    f0, voiced_flag, voiced_prob = librosa.pyin(
         clip,
         fmin=float(librosa.note_to_hz("C2")),
         fmax=float(librosa.note_to_hz("C7")),
         sr=sr,
     )
-    valid = f0[voiced_flag]
-    if len(valid) == 0:
+    # Require high voicing confidence to suppress music / noise artifacts
+    high_conf = voiced_prob > 0.8
+    valid = f0[high_conf & voiced_flag]
+    if len(valid) < 3:                 # too few confident frames
         return None
     return "female" if float(np.median(valid)) >= _GENDER_THRESHOLD_HZ else "male"
 
@@ -104,14 +110,27 @@ def detect_gender(audio_path: str | Path) -> str:
     return _pyin_gender(clip, sr) or "female"
 
 
-def detect_gender_from_segment(seg: dict, fallback: str = "female") -> str:
+def detect_gender_from_segment(
+    seg: dict,
+    fallback: str = "female",
+    vocals_path: str | Path | None = None,
+) -> str:
     """Detect speaker gender from a single translated segment.
 
-    Reads the clip ``[seg['start'], seg['end']]`` from ``seg['source']``
-    and runs pitch estimation.  Returns *fallback* when the clip is too
-    short or no voiced frames are detected.
+    Parameters
+    ----------
+    seg:
+        Segment dict with ``source``, ``start``, ``end`` fields.
+    fallback:
+        Gender to return when the clip is too short or detection fails.
+    vocals_path:
+        If provided, use this Demucs-separated vocals file instead of
+        ``seg['source']``.  The same ``[start, end]`` timestamps apply.
+        Vocals tracks yield more high-confidence voiced frames because
+        background music is removed, giving better F0 estimates.
     """
-    source = seg.get("source")
+    source = str(vocals_path) if vocals_path and Path(vocals_path).exists() \
+             else seg.get("source")
     start  = seg.get("start", 0.0)
     end    = seg.get("end")
     if not source or not Path(source).exists() or end is None:
@@ -286,7 +305,8 @@ def synthesize(
 
         # Per-segment speaker selection (SFT gender mode only)
         if per_segment_gender:
-            seg_gender = detect_gender_from_segment(seg, fallback=last_gender)
+            seg_gender = detect_gender_from_segment(
+                seg, fallback=last_gender, vocals_path=reference_audio)
             last_gender = seg_gender          # carry forward for short clips
             spk = _SFT_FEMALE_SPK if seg_gender == "female" else _SFT_MALE_SPK
             seg_ref, seg_ref_text, seg_method = spk, None, "sft"
