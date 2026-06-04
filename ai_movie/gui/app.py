@@ -1140,9 +1140,10 @@ class App:
         ttk.Radiobutton(mode_bar, text="性别匹配（清晰，推荐）",
                         variable=self._tts_mode_var,
                         value="gender").pack(side="left", padx=(8, 4))
-        ttk.Radiobutton(mode_bar, text="声音克隆（近似原声）",
+        ttk.Radiobutton(mode_bar, text="声音克隆（未实现）",
                         variable=self._tts_mode_var,
-                        value="clone").pack(side="left", padx=4)
+                        value="clone",
+                        state="disabled").pack(side="left", padx=4)
 
         ttk.Separator(tab, orient="horizontal").pack(fill="x", padx=10)
 
