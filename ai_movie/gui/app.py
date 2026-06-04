@@ -1367,11 +1367,14 @@ class App:
             vocals_path, mode=mode, cache_dir=out_dir
         )
         # Update dialog to show detected info
-        gender_hint = ""
         if mode == "gender":
-            gender_hint = "（女声）" if ref_text else "（男声）"
-        self._lbl_gen_prog.configure(
-            text=f"模式：{'性别匹配' if mode == 'gender' else '声音克隆'}{gender_hint}")
+            if ref_method == "sft":
+                hint = f"已选择：{ref_audio}（SFT内置声音）"
+            else:
+                hint = f"已选择：{'女声' if ref_text else '男声'}参考音频"
+        else:
+            hint = "声音克隆（原声片段）"
+        self._lbl_gen_prog.configure(text=hint)
 
         # Process segments one at a time on main thread via root.after()
         self._gen_segments = segments

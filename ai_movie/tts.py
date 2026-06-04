@@ -1,14 +1,13 @@
-"""Text-to-speech synthesis using CosyVoice 2.
+"""Text-to-speech synthesis using CosyVoice.
 
 Two synthesis modes (selectable per-run):
   "gender"  — detect speaker gender from the source vocals, then use the
-               bundled high-quality male/female reference voice for synthesis.
-               Best clarity; voice is same gender as original but not the same
-               person.
+               matching CosyVoice-300M-SFT built-in speaker ("中文女" / "中文男").
+               Requires CosyVoice-300M-SFT in models/; falls back to
+               CosyVoice2-0.5B zero-shot if SFT model is absent.
   "clone"   — extract the highest-energy 8 s speech segment from the source
-               vocals and use it for cross-lingual voice cloning.
-               Attempts to preserve the original speaker timbre; quality
-               depends on how clean the Demucs-separated vocals are.
+               vocals and use it for cross-lingual voice cloning via
+               CosyVoice2-0.5B.  Quality depends on Demucs separation.
 
 IMPORTANT: CosyVoice uses internal threading for LLM inference and
 must be called from the main thread.
@@ -25,28 +24,33 @@ import soundfile as sf
 from ai_movie.config import WORKSPACE_DIR
 from ai_movie.utils import ensure_dir
 
-# ── model cache ──────────────────────────────────────────────────
-_model = None
-_lock = threading.Lock()
-
+# ── model paths ──────────────────────────────────────────────────
 _COSYVOICE_SRC = Path(__file__).parent.parent / "models" / "CosyVoice"
-_MATCHA_SRC = _COSYVOICE_SRC / "third_party" / "Matcha-TTS"
-_MODEL_DIR = Path(__file__).parent.parent / "models" / "CosyVoice2-0.5B"
+_MATCHA_SRC    = _COSYVOICE_SRC / "third_party" / "Matcha-TTS"
+_SFT_MODEL_DIR = Path(__file__).parent.parent / "models" / "CosyVoice-300M-SFT"
+_ZS_MODEL_DIR  = Path(__file__).parent.parent / "models" / "CosyVoice2-0.5B"
 
-# ── bundled clean reference voices (shipped with CosyVoice) ──────
-_ASSET_DIR = _COSYVOICE_SRC / "asset"
-# Female: 274 Hz, 3.5 s, Mandarin — known reference text available
-_FEMALE_REF_AUDIO = _ASSET_DIR / "zero_shot_prompt.wav"
+# ── SFT speaker IDs ───────────────────────────────────────────────
+_SFT_FEMALE_SPK = "中文女"
+_SFT_MALE_SPK   = "中文男"
+
+# ── fallback reference voices (CosyVoice2 zero-shot) ─────────────
+_ASSET_DIR       = _COSYVOICE_SRC / "asset"
+_FEMALE_REF_WAV  = _ASSET_DIR / "zero_shot_prompt.wav"
 _FEMALE_REF_TEXT = "希望你以后能够做的比我还好呦。"
-# Male: 148 Hz, 13.7 s, English — use cross-lingual (no reference text needed)
-_MALE_REF_AUDIO = _ASSET_DIR / "cross_lingual_prompt.wav"
+_MALE_REF_WAV    = _ASSET_DIR / "cross_lingual_prompt.wav"
 
 # F0 threshold (Hz) separating male from female
 _GENDER_THRESHOLD_HZ = 165.0
 
+# ── model cache ───────────────────────────────────────────────────
+_model    = None
+_is_sft   = False          # True when CosyVoice-300M-SFT is loaded
+_lock     = threading.Lock()
+
 
 def _load_model():
-    global _model
+    global _model, _is_sft
     if _model is not None:
         return
     with _lock:
@@ -57,7 +61,12 @@ def _load_model():
         if str(_MATCHA_SRC) not in sys.path:
             sys.path.insert(0, str(_MATCHA_SRC))
         from cosyvoice.cli.cosyvoice import AutoModel
-        _model = AutoModel(model_dir=str(_MODEL_DIR))
+        if _SFT_MODEL_DIR.exists() and (_SFT_MODEL_DIR / "llm.pt").exists():
+            _model  = AutoModel(model_dir=str(_SFT_MODEL_DIR))
+            _is_sft = True
+        else:
+            _model  = AutoModel(model_dir=str(_ZS_MODEL_DIR))
+            _is_sft = False
 
 
 # ── public helpers ────────────────────────────────────────────────
@@ -145,36 +154,33 @@ def prepare_reference(
     mode: Literal["gender", "clone"] = "gender",
     cache_dir: str | Path | None = None,
 ) -> tuple[str, str | None, str]:
-    """Derive the reference audio and synthesis method for one session.
-
-    Parameters
-    ----------
-    vocals_path:
-        Demucs-separated vocals file for the current project.
-    mode:
-        ``'gender'``  — detect gender, use bundled clean reference.
-        ``'clone'``   — extract the best 8 s segment from *vocals_path*.
-    cache_dir:
-        Directory for temporary files; defaults to WORKSPACE_DIR/synthesized.
+    """Derive the speaker / reference and synthesis method for one session.
 
     Returns
     -------
-    (ref_audio_path, ref_text_or_None, synthesis_method)
+    (spk_or_ref, ref_text_or_None, method)
 
-    *synthesis_method* is ``'zero_shot'`` or ``'cross_lingual'``.
+    When *method* is ``'sft'``, *spk_or_ref* is a speaker ID string
+    (e.g. ``'中文女'``) and *ref_text* is None.
+    When *method* is ``'zero_shot'`` or ``'cross_lingual'``, *spk_or_ref*
+    is a file path to reference audio.
     """
     cache_dir = ensure_dir(Path(cache_dir) if cache_dir else WORKSPACE_DIR / "synthesized")
+    gender    = detect_gender(vocals_path)
 
     if mode == "gender":
-        gender = detect_gender(vocals_path)
-        if gender == "female" and _FEMALE_REF_AUDIO.exists():
-            return str(_FEMALE_REF_AUDIO), _FEMALE_REF_TEXT, "zero_shot"
-        if _MALE_REF_AUDIO.exists():
-            return str(_MALE_REF_AUDIO), None, "cross_lingual"
-        # Fallback: use trimmed vocals if bundled files missing
+        if _is_sft:
+            # Best path: SFT built-in speaker, no reference audio needed
+            spk = _SFT_FEMALE_SPK if gender == "female" else _SFT_MALE_SPK
+            return spk, None, "sft"
+        # Fallback: zero-shot / cross-lingual with bundled reference audio
+        if gender == "female" and _FEMALE_REF_WAV.exists():
+            return str(_FEMALE_REF_WAV), _FEMALE_REF_TEXT, "zero_shot"
+        if _MALE_REF_WAV.exists():
+            return str(_MALE_REF_WAV), None, "cross_lingual"
         return trim_reference_audio(vocals_path), None, "cross_lingual"
 
-    # mode == "clone"
+    # mode == "clone" — extract best speech segment from source vocals
     best_seg = str(cache_dir / "ref_best_segment.wav")
     extract_best_speech_segment(vocals_path, best_seg)
     return best_seg, None, "cross_lingual"
@@ -183,34 +189,28 @@ def prepare_reference(
 def call_tts(
     model,
     text: str,
-    ref_audio: str,
+    spk_or_ref: str,
     ref_text: str | None,
     method: str,
 ) -> np.ndarray:
-    """Run one CosyVoice2 inference call and return a float32 numpy array.
+    """Run one CosyVoice inference call and return a float32 numpy array.
 
     Parameters
     ----------
-    model:
-        Loaded CosyVoice2 AutoModel instance.
-    text:
-        Chinese text to synthesise.
-    ref_audio:
-        Path to reference audio (≤ 30 s).
-    ref_text:
-        Text spoken in *ref_audio*; required for ``'zero_shot'`` method.
     method:
-        ``'zero_shot'`` or ``'cross_lingual'``.
+        ``'sft'``           — *spk_or_ref* is a speaker ID; uses inference_sft.
+        ``'zero_shot'``     — *spk_or_ref* is a reference audio path.
+        ``'cross_lingual'`` — *spk_or_ref* is a reference audio path.
     """
-    # CosyVoice2 does NOT have <|zh|> etc. as special vocab tokens.
-    # Language is inferred from the text itself; adding the tag makes the
-    # model literally "speak" the ASCII characters <|zh|> → garbled output.
     chunks = []
-    if method == "zero_shot" and ref_text:
-        for gen in model.inference_zero_shot(text, ref_text, ref_audio, stream=False):
+    if method == "sft":
+        for gen in model.inference_sft(text, spk_or_ref, stream=False):
+            chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
+    elif method == "zero_shot" and ref_text:
+        for gen in model.inference_zero_shot(text, ref_text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     else:
-        for gen in model.inference_cross_lingual(text, ref_audio, stream=False):
+        for gen in model.inference_cross_lingual(text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
