@@ -71,24 +71,11 @@ def _load_model():
 
 # ── public helpers ────────────────────────────────────────────────
 
-def detect_gender(audio_path: str | Path) -> str:
-    """Estimate speaker gender by fundamental frequency (F0).
-
-    Analyses up to 20 s of audio around the midpoint and returns
-    ``'female'`` if median F0 >= 165 Hz, else ``'male'``.
-    Falls back to ``'female'`` when no voiced frames are found.
-    """
+def _pyin_gender(clip: np.ndarray, sr: int) -> str | None:
+    """Return 'female'/'male' from a mono float32 clip, or None if inconclusive."""
     import librosa
-
-    a, sr = sf.read(str(audio_path))
-    if a.ndim > 1:
-        a = a.mean(axis=1)
-    # Analyse a centred 20 s window for a representative estimate
-    clip_len = min(len(a), sr * 20)
-    mid = len(a) // 2
-    start = max(0, mid - clip_len // 2)
-    clip = a[start: start + clip_len].astype(np.float32)
-
+    if len(clip) < sr * 1.5:          # need ≥ 1.5 s for reliable estimate
+        return None
     f0, voiced_flag, _ = librosa.pyin(
         clip,
         fmin=float(librosa.note_to_hz("C2")),
@@ -97,8 +84,45 @@ def detect_gender(audio_path: str | Path) -> str:
     )
     valid = f0[voiced_flag]
     if len(valid) == 0:
-        return "female"
+        return None
     return "female" if float(np.median(valid)) >= _GENDER_THRESHOLD_HZ else "male"
+
+
+def detect_gender(audio_path: str | Path) -> str:
+    """Estimate speaker gender for an entire audio file.
+
+    Analyses a centred 20 s window. Falls back to ``'female'`` when
+    no voiced frames are found.
+    """
+    a, sr = sf.read(str(audio_path))
+    if a.ndim > 1:
+        a = a.mean(axis=1)
+    clip_len = min(len(a), sr * 20)
+    mid = len(a) // 2
+    start = max(0, mid - clip_len // 2)
+    clip = a[start: start + clip_len].astype(np.float32)
+    return _pyin_gender(clip, sr) or "female"
+
+
+def detect_gender_from_segment(seg: dict, fallback: str = "female") -> str:
+    """Detect speaker gender from a single translated segment.
+
+    Reads the clip ``[seg['start'], seg['end']]`` from ``seg['source']``
+    and runs pitch estimation.  Returns *fallback* when the clip is too
+    short or no voiced frames are detected.
+    """
+    source = seg.get("source")
+    start  = seg.get("start", 0.0)
+    end    = seg.get("end")
+    if not source or not Path(source).exists() or end is None:
+        return fallback
+    a, sr = sf.read(str(source))
+    if a.ndim > 1:
+        a = a.mean(axis=1)
+    s0 = int(start * sr)
+    s1 = int(end   * sr)
+    clip = a[s0:s1].astype(np.float32)
+    return _pyin_gender(clip, sr) or fallback
 
 
 def extract_best_speech_segment(
@@ -246,6 +270,8 @@ def synthesize(
 
     total = len(segments)
     results: list[dict] = list(segments)
+    per_segment_gender = _is_sft and mode == "gender"
+    last_gender = detect_gender(reference_audio)  # whole-track baseline
 
     for i, seg in enumerate(results):
         if cancel_check and cancel_check():
@@ -258,11 +284,21 @@ def synthesize(
                 progress_cb(i + 1, total)
             continue
 
+        # Per-segment speaker selection (SFT gender mode only)
+        if per_segment_gender:
+            seg_gender = detect_gender_from_segment(seg, fallback=last_gender)
+            last_gender = seg_gender          # carry forward for short clips
+            spk = _SFT_FEMALE_SPK if seg_gender == "female" else _SFT_MALE_SPK
+            seg_ref, seg_ref_text, seg_method = spk, None, "sft"
+        else:
+            seg_ref, seg_ref_text, seg_method = ref_audio, ref_text, method
+
         try:
-            audio_np = call_tts(_model, text, ref_audio, ref_text, method)
+            audio_np = call_tts(_model, text, seg_ref, seg_ref_text, seg_method)
             out_path = str(output_dir / f"seg_{i + 1:04d}.wav")
             sf.write(out_path, audio_np, _model.sample_rate)
             results[i]["audio"] = out_path
+            results[i]["tts_gender"] = seg_gender if per_segment_gender else last_gender
         except Exception as exc:
             results[i]["audio"] = None
             results[i]["tts_error"] = str(exc)

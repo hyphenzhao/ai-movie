@@ -1405,7 +1405,6 @@ class App:
 
         # Update progress
         self._bar_gen.configure(value=idx)
-        self._lbl_gen_prog.configure(text=f"{idx} / {total}")
 
         seg = segments[idx]
         text = seg.get("text_translated", "").strip()
@@ -1415,12 +1414,25 @@ class App:
             self.root.after(50, self._process_next_generate)
             return
 
+        # Per-segment speaker selection (SFT gender mode)
+        if self._gen_ref_method == "sft":
+            last = getattr(self, "_gen_last_gender", "female")
+            seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
+            self._gen_last_gender = seg_gender
+            spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
+            ref, ref_text, ref_method = spk, None, "sft"
+        else:
+            ref, ref_text, ref_method = self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method
+            seg_gender = "female"
+
+        self._lbl_gen_prog.configure(
+            text=f"{idx + 1} / {total}  ({'女声' if seg_gender == 'female' else '男声'})")
+
         # Run inference on main thread
         try:
             import soundfile as sf
             audio_np = mod.call_tts(
-                mod._model, text,
-                self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method,
+                mod._model, text, ref, ref_text, ref_method,
             )
             out_path = str(self._gen_output_dir / f"seg_{idx + 1:04d}.wav")
             sf.write(out_path, audio_np, mod._model.sample_rate)
@@ -1666,7 +1678,6 @@ class App:
         if idx >= total:
             self._finish_syn_tts()
             return
-        self._update_syn_stage(f"Step 2/3: 合成语音… ({idx + 1}/{total})")
         seg = segments[idx]
         text = seg.get("text_translated", "").strip()
         if not text:
@@ -1675,11 +1686,25 @@ class App:
             self.root.after(50, self._process_next_syn_segment)
             return
         mod = self._syn_tts_mod
+
+        # Per-segment speaker selection (SFT gender mode)
+        if self._syn_ref_method == "sft":
+            last = getattr(self, "_syn_last_gender", "female")
+            seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
+            self._syn_last_gender = seg_gender
+            spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
+            ref, ref_text, ref_method = spk, None, "sft"
+        else:
+            ref, ref_text, ref_method = self._syn_vocals_ref, self._syn_ref_text, self._syn_ref_method
+            seg_gender = "female"
+
+        self._update_syn_stage(
+            f"Step 2/3: 合成语音… ({idx + 1}/{total})  {'女声' if seg_gender == 'female' else '男声'}")
+
         try:
             import soundfile as sf
             audio_np = mod.call_tts(
-                mod._model, text,
-                self._syn_vocals_ref, self._syn_ref_text, self._syn_ref_method,
+                mod._model, text, ref, ref_text, ref_method,
             )
             out_path = str(self._syn_output_dir / f"seg_{idx + 1:04d}.wav")
             sf.write(out_path, audio_np, mod._model.sample_rate)
