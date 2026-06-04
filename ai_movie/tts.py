@@ -74,8 +74,8 @@ def _load_model():
 def _pyin_gender(clip: np.ndarray, sr: int) -> str | None:
     """Return 'female'/'male' from a mono float32 clip, or None if inconclusive.
 
-    Only uses frames with voicing probability > 0.8 to filter out noise.
-    Returns None when fewer than 3 high-confidence frames are available.
+    Uses frames with voicing probability > 0.7 to balance noise suppression
+    against sensitivity.  Returns None when fewer than 2 frames are available.
     """
     import librosa
     if len(clip) < sr * 1.5:          # need ≥ 1.5 s for reliable estimate
@@ -86,10 +86,9 @@ def _pyin_gender(clip: np.ndarray, sr: int) -> str | None:
         fmax=float(librosa.note_to_hz("C7")),
         sr=sr,
     )
-    # Require high voicing confidence to suppress music / noise artifacts
-    high_conf = voiced_prob > 0.8
+    high_conf = voiced_prob > 0.7
     valid = f0[high_conf & voiced_flag]
-    if len(valid) < 3:                 # too few confident frames
+    if len(valid) < 2:
         return None
     return "female" if float(np.median(valid)) >= _GENDER_THRESHOLD_HZ else "male"
 
@@ -305,9 +304,10 @@ def synthesize(
 
         # Per-segment speaker selection (SFT gender mode only)
         if per_segment_gender:
-            seg_gender = detect_gender_from_segment(
-                seg, fallback=last_gender, vocals_path=reference_audio)
-            last_gender = seg_gender          # carry forward for short clips
+            # Use seg['source'] (original demuxed audio) — NOT Demucs vocals,
+            # which suppresses the male voice and corrupts F0 detection.
+            seg_gender = detect_gender_from_segment(seg, fallback=last_gender)
+            last_gender = seg_gender
             spk = _SFT_FEMALE_SPK if seg_gender == "female" else _SFT_MALE_SPK
             seg_ref, seg_ref_text, seg_method = spk, None, "sft"
         else:

@@ -1506,9 +1506,7 @@ class App:
             if getattr(self, "_gen_voice_mode", "gender") == "gender":
                 # Auto-detect per segment
                 last = getattr(self, "_gen_last_gender", "female")
-                seg_gender = mod.detect_gender_from_segment(
-                    seg, fallback=last,
-                    vocals_path=getattr(self, "_gen_vocals_path", None))
+                seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
                 self._gen_last_gender = seg_gender
                 spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
             else:
@@ -1787,9 +1785,7 @@ class App:
         if self._syn_ref_method == "sft":
             if getattr(self, "_gen_voice_mode", "gender") == "gender":
                 last = getattr(self, "_syn_last_gender", "female")
-                seg_gender = mod.detect_gender_from_segment(
-                    seg, fallback=last,
-                    vocals_path=getattr(self, "_syn_vocals_path", None))
+                seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
                 self._syn_last_gender = seg_gender
                 spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
             else:
