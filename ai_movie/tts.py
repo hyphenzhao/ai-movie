@@ -143,6 +143,166 @@ def detect_gender_from_segment(
     return _pyin_gender(clip, sr) or fallback
 
 
+# ── Algorithm 2: global F0 cache ─────────────────────────────────
+_f0_cache: dict[str, tuple] = {}   # audio_path → (f0_array, voiced_prob, sr)
+
+
+def _load_global_f0(audio_path: str | Path) -> tuple:
+    """Load and cache the full-track F0 arrays for *audio_path*."""
+    import librosa
+    key = str(audio_path)
+    if key not in _f0_cache:
+        a, sr = sf.read(key)
+        if a.ndim > 1:
+            a = a.mean(axis=1)
+        f0, voiced_flag, voiced_prob = librosa.pyin(
+            a.astype(np.float32),
+            fmin=float(librosa.note_to_hz("C2")),
+            fmax=float(librosa.note_to_hz("C7")),
+            sr=sr,
+        )
+        _f0_cache[key] = (f0, voiced_flag, voiced_prob, sr)
+    return _f0_cache[key]
+
+
+def detect_gender_global_f0(seg: dict, fallback: str = "female") -> str:
+    """Gender detection using a pre-computed whole-track F0 array.
+
+    Computes F0 for the entire source audio once (cached), then looks up
+    the frames that fall within [seg['start'], seg['end']].  More stable
+    than re-running pyin per segment because background-music frames are
+    filtered globally.
+    """
+    source = seg.get("source")
+    start  = seg.get("start", 0.0)
+    end    = seg.get("end")
+    if not source or not Path(source).exists() or end is None:
+        return fallback
+    try:
+        f0, voiced_flag, voiced_prob, sr = _load_global_f0(source)
+        # Hop size used by librosa.pyin default (512 samples)
+        hop = 512
+        frame_start = int(start * sr / hop)
+        frame_end   = int(end   * sr / hop)
+        seg_f0   = f0[frame_start:frame_end]
+        seg_vf   = voiced_flag[frame_start:frame_end]
+        seg_vp   = voiced_prob[frame_start:frame_end]
+        high_conf = seg_vp > 0.7
+        valid = seg_f0[high_conf & seg_vf]
+        if len(valid) < 2:
+            return fallback
+        return "female" if float(np.median(valid)) >= _GENDER_THRESHOLD_HZ else "male"
+    except Exception:
+        return fallback
+
+
+# ── Algorithm 3: ECAPA speaker diarization ───────────────────────
+
+def build_ecapa_gender_map(
+    audio_path: str | Path,
+    num_speakers: int = 2,
+    progress_cb=None,
+) -> dict:
+    """Run speaker diarization and return a gender map for each speaker label.
+
+    Uses ``simple_diarizer`` (silero-VAD + SpeechBrain ECAPA-TDNN +
+    spectral clustering).  All models are loaded from local disk — no
+    internet required after first download.
+
+    Returns
+    -------
+    dict with keys:
+      ``"segments"``: list of ``{start, end, label}`` dicts
+      ``"gender"``:   dict mapping speaker label → ``'male'``/``'female'``
+    """
+    import torch
+    import tempfile
+    import librosa as _librosa
+
+    # Ensure torch.hub uses local cache (for silero-vad)
+    _hub_dir = Path(__file__).parent.parent / "models" / "torch_hub"
+    _hub_dir.mkdir(exist_ok=True)
+    torch.hub.set_dir(str(_hub_dir))
+
+    from simple_diarizer.diarizer import Diarizer
+
+    if progress_cb:
+        progress_cb("加载说话人日志模型…")
+
+    diar = Diarizer(embed_model="ecapa", cluster_method="sc")
+
+    # Resample to 16kHz mono WAV for diarizer
+    a, sr = sf.read(str(audio_path))
+    if a.ndim > 1:
+        a = a.mean(axis=1)
+    if sr != 16000:
+        a = _librosa.resample(a.astype(np.float32), orig_sr=sr, target_sr=16000)
+        sr = 16000
+
+    if progress_cb:
+        progress_cb("运行说话人分割（约30-60秒）…")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        sf.write(f.name, a, sr)
+        tmp = f.name
+    try:
+        diar_segs = diar.diarize(tmp, num_speakers=num_speakers)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+    if progress_cb:
+        progress_cb("用 F0 标注说话人性别…")
+
+    # Label each speaker cluster with F0
+    speaker_f0: dict = {}
+    for ds in diar_segs:
+        spk = ds["label"]
+        s0 = int(ds["start"] * sr)
+        s1 = int(ds["end"]   * sr)
+        clip = a[s0:s1].astype(np.float32)
+        g = _pyin_gender(clip, sr)
+        if g is not None:
+            speaker_f0.setdefault(spk, []).append(g)
+
+    gender_map: dict[int, str] = {}
+    for spk, labels in speaker_f0.items():
+        female_count = labels.count("female")
+        gender_map[spk] = "female" if female_count >= len(labels) / 2 else "male"
+
+    # Fallback: if only one speaker found, label by overall F0
+    if not gender_map:
+        g = detect_gender(audio_path)
+        gender_map[0] = g
+
+    return {"segments": diar_segs, "gender": gender_map}
+
+
+def lookup_ecapa_gender(
+    seg: dict,
+    ecapa_result: dict,
+    fallback: str = "female",
+) -> str:
+    """Return the gender for a segment using pre-computed ECAPA diarization."""
+    diar_segs = ecapa_result.get("segments", [])
+    gender_map = ecapa_result.get("gender", {})
+    if not diar_segs:
+        return fallback
+    mid = (seg.get("start", 0) + seg.get("end", 0)) / 2
+    best_spk = None
+    best_overlap = 0.0
+    seg_start = seg.get("start", 0)
+    seg_end   = seg.get("end",   0)
+    for ds in diar_segs:
+        overlap = min(ds["end"], seg_end) - max(ds["start"], seg_start)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_spk = ds["label"]
+    if best_spk is None:
+        # Fallback: nearest midpoint
+        best_spk = min(diar_segs, key=lambda d: abs((d["start"]+d["end"])/2 - mid))["label"]
+    return gender_map.get(best_spk, fallback)
+
+
 def extract_best_speech_segment(
     audio_path: str | Path,
     out_path: str | Path,

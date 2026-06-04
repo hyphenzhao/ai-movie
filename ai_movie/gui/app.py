@@ -1132,6 +1132,7 @@ class App:
     def _build_generate_tab(self, tab: ttk.Frame):
         """Tab showing generated speech segments with play buttons."""
         # ── voice mode selector ────────────────────────────────────
+        # ── Row 1: voice mode ─────────────────────────────────────
         mode_bar = ttk.Frame(tab, padding=(10, 6, 10, 2))
         mode_bar.pack(fill="x", side="top")
         ttk.Label(mode_bar, text="声音选择：",
@@ -1145,6 +1146,31 @@ class App:
             ttk.Radiobutton(mode_bar, text=text,
                             variable=self._tts_mode_var,
                             value=val).pack(side="left", padx=(8, 2))
+
+        # ── Row 2: detection algorithm (only for "自动检测") ──────
+        algo_bar = ttk.Frame(tab, padding=(10, 0, 10, 4))
+        algo_bar.pack(fill="x", side="top")
+        ttk.Label(algo_bar, text="检测算法：",
+                  font=(config.CJK_FONT, 9), foreground="#555").pack(side="left")
+        self._tts_algo_var = tk.StringVar(value="f0_per_seg")
+        _algo_opts = [
+            ("F0 逐片段（快速，推荐）",  "f0_per_seg"),
+            ("F0 全局统计（稳定）",       "f0_global"),
+            ("ECAPA 说话人日志（最准，较慢）", "ecapa"),
+        ]
+        for text, val in _algo_opts:
+            ttk.Radiobutton(algo_bar, text=text,
+                            variable=self._tts_algo_var,
+                            value=val).pack(side="left", padx=(6, 2))
+
+        # Grey out algorithm row when voice is fixed (not auto-detect)
+        def _update_algo_state(*_):
+            state = "normal" if self._tts_mode_var.get() == "gender" else "disabled"
+            for w in algo_bar.winfo_children():
+                try: w.configure(state=state)
+                except Exception: pass
+        self._tts_mode_var.trace_add("write", _update_algo_state)
+        _update_algo_state()
 
         ttk.Separator(tab, orient="horizontal").pack(fill="x", padx=10)
 
@@ -1447,6 +1473,9 @@ class App:
         voice_mode = getattr(self, "_tts_mode_var", None)
         voice_mode = voice_mode.get() if voice_mode else "gender"
         self._gen_voice_mode = voice_mode
+        algo = getattr(self, "_tts_algo_var", None)
+        self._gen_algo = algo.get() if algo else "f0_per_seg"
+        self._gen_ecapa_result = None   # filled below for ecapa mode
 
         if voice_mode == "female":
             ref_audio, ref_text, ref_method = tts_mod._SFT_FEMALE_SPK, None, "sft"
@@ -1457,14 +1486,13 @@ class App:
         else:
             ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
                 vocals_path, mode="gender", cache_dir=out_dir)
-            if ref_method == "sft":
-                self._lbl_gen_prog.configure(text=f"自动检测 → 初始声音：{ref_audio}")
-            else:
-                self._lbl_gen_prog.configure(text="自动检测（参考音频模式）")
+            algo_label = {"f0_per_seg": "F0逐片段", "f0_global": "F0全局",
+                          "ecapa": "ECAPA日志"}.get(self._gen_algo, self._gen_algo)
+            self._lbl_gen_prog.configure(text=f"自动检测（{algo_label}）…")
 
-        # Process segments one at a time on main thread via root.after()
+        # For ECAPA mode, pre-compute diarization in background then start TTS
         self._gen_segments = segments
-        self._gen_vocals_path = vocals_path   # kept for per-segment gender detection
+        self._gen_vocals_path = vocals_path
         self._gen_ref_audio = ref_audio
         self._gen_ref_text = ref_text
         self._gen_ref_method = ref_method
@@ -1472,7 +1500,36 @@ class App:
         self._gen_idx = 0
         self._gen_results: list[dict] = []
         self._gen_tts_mod = tts_mod
-        self.root.after(100, self._process_next_generate)
+
+        if voice_mode == "gender" and self._gen_algo == "ecapa":
+            self._lbl_gen_prog.configure(text="ECAPA：正在分析说话人（约30-60秒）…")
+            def _run_ecapa():
+                try:
+                    result = tts_mod.build_ecapa_gender_map(
+                        vocals_path,
+                        progress_cb=lambda msg: self.root.after(
+                            0, lambda m=msg: self._lbl_gen_prog.configure(text=m)))
+                    self.root.after(0, lambda r=result: self._on_ecapa_done(r))
+                except Exception as e:
+                    self.root.after(0, lambda: self._lbl_gen_prog.configure(
+                        text=f"ECAPA 失败，改用F0逐片段: {e}"))
+                    self.root.after(0, self._start_tts_loop)
+            threading.Thread(target=_run_ecapa, daemon=True).start()
+        else:
+            self.root.after(100, self._start_tts_loop)
+
+    def _on_ecapa_done(self, result):
+        self._gen_ecapa_result = result
+        n_spk = len(result.get("gender", {}))
+        gmap = result.get("gender", {})
+        summary = "、".join(f"说话人{k}={v}" for k, v in gmap.items())
+        self._lbl_gen_prog.configure(text=f"ECAPA完成（{n_spk}人：{summary}）")
+        self.root.after(100, self._start_tts_loop)
+
+    def _start_tts_loop(self):
+        """Kick off the per-segment TTS root.after() loop."""
+        if not self._cancel_requested:
+            self.root.after(0, self._process_next_generate)
 
     def _on_cancel_generate(self):
         self._cancel_requested = True
@@ -1504,14 +1561,19 @@ class App:
         # Per-segment speaker selection
         if self._gen_ref_method == "sft":
             if getattr(self, "_gen_voice_mode", "gender") == "gender":
-                # Auto-detect per segment
                 last = getattr(self, "_gen_last_gender", "female")
-                seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
+                algo = getattr(self, "_gen_algo", "f0_per_seg")
+                if algo == "ecapa" and getattr(self, "_gen_ecapa_result", None):
+                    seg_gender = mod.lookup_ecapa_gender(
+                        seg, self._gen_ecapa_result, fallback=last)
+                elif algo == "f0_global":
+                    seg_gender = mod.detect_gender_global_f0(seg, fallback=last)
+                else:  # f0_per_seg (default)
+                    seg_gender = mod.detect_gender_from_segment(seg, fallback=last)
                 self._gen_last_gender = seg_gender
                 spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
             else:
-                # Fixed voice from user selection
-                spk = self._gen_ref_audio   # already "中文男" or "中文女"
+                spk = self._gen_ref_audio
                 seg_gender = "female" if spk == mod._SFT_FEMALE_SPK else "male"
             ref, ref_text, ref_method = spk, None, "sft"
         else:
