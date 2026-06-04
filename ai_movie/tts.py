@@ -202,12 +202,15 @@ def call_tts(
     method:
         ``'zero_shot'`` or ``'cross_lingual'``.
     """
+    # CosyVoice2 does NOT have <|zh|> etc. as special vocab tokens.
+    # Language is inferred from the text itself; adding the tag makes the
+    # model literally "speak" the ASCII characters <|zh|> → garbled output.
     chunks = []
     if method == "zero_shot" and ref_text:
         for gen in model.inference_zero_shot(text, ref_text, ref_audio, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     else:
-        for gen in model.inference_cross_lingual(f"<|zh|>{text}", ref_audio, stream=False):
+        for gen in model.inference_cross_lingual(text, ref_audio, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
