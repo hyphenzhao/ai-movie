@@ -1131,19 +1131,20 @@ class App:
 
     def _build_generate_tab(self, tab: ttk.Frame):
         """Tab showing generated speech segments with play buttons."""
-        # Mode selector bar
+        # ── voice mode selector ────────────────────────────────────
         mode_bar = ttk.Frame(tab, padding=(10, 6, 10, 2))
         mode_bar.pack(fill="x", side="top")
-        ttk.Label(mode_bar, text="合成模式：",
+        ttk.Label(mode_bar, text="声音选择：",
                   font=(config.CJK_FONT, 10)).pack(side="left")
         self._tts_mode_var = tk.StringVar(value="gender")
-        ttk.Radiobutton(mode_bar, text="性别匹配（清晰，推荐）",
-                        variable=self._tts_mode_var,
-                        value="gender").pack(side="left", padx=(8, 4))
-        ttk.Radiobutton(mode_bar, text="声音克隆（未实现）",
-                        variable=self._tts_mode_var,
-                        value="clone",
-                        state="disabled").pack(side="left", padx=4)
+        for text, val in [
+            ("自动检测性别", "gender"),
+            ("全部女声（中文女）", "female"),
+            ("全部男声（中文男）", "male"),
+        ]:
+            ttk.Radiobutton(mode_bar, text=text,
+                            variable=self._tts_mode_var,
+                            value=val).pack(side="left", padx=(8, 2))
 
         ttk.Separator(tab, orient="horizontal").pack(fill="x", padx=10)
 
@@ -1174,58 +1175,140 @@ class App:
         placeholder.pack(expand=True, pady=80)
 
     def _populate_generate_tab(self, results):
-        """Show generated speech segments with play buttons + translated text."""
+        """Show generated speech segments — with voice selector, regen button, sync play."""
+        # Store full results for per-segment regeneration
+        self._gen_all_results = results
+
         for w in self._gen_scroll_frame.winfo_children():
             w.destroy()
 
-        ok = [r for r in results if r.get("audio")]
-        if not ok:
+        n_ok = sum(1 for r in results if r.get("audio"))
+        if n_ok == 0:
             tk.Label(self._gen_scroll_frame, text="无生成结果",
                      fg="#aaa", font=(config.CJK_FONT, 13)).pack(expand=True, pady=80)
             return
 
-        # Header
         hdr = ttk.Frame(self._gen_scroll_frame)
         hdr.pack(fill="x", padx=16, pady=(12, 8))
-        tk.Label(hdr, text=f"✓ 共生成 {len(ok)} 个语音片段",
+        tk.Label(hdr, text=f"✓ 共生成 {n_ok}/{len(results)} 个片段",
                  font=(config.CJK_FONT, 12, "bold"), fg="#155724").pack(side="left")
 
-        for i, seg in enumerate(ok):
+        for seg_idx, seg in enumerate(results):
+            has_audio = bool(seg.get("audio"))
             card = ttk.Frame(self._gen_scroll_frame, relief="solid", borderwidth=1)
-            card.pack(fill="x", padx=16, pady=4, ipady=6)
+            card.pack(fill="x", padx=16, pady=4, ipady=4)
+            card.configure(style="TFrame")
 
-            # Segment header
-            ch = ttk.Frame(card); ch.pack(fill="x", padx=12, pady=(8, 2))
-            start = seg.get("start", 0)
-            end = seg.get("end", 0)
-            ts = f"{int(start // 60)}:{start % 60:04.1f} — {int(end // 60)}:{end % 60:04.1f}"
-            tk.Label(ch, text=f"片段 {i+1}  [{ts}]",
-                     font=(config.CJK_FONT, 9, "bold")).pack(side="left")
+            # ── header row ──────────────────────────────────────
+            ch = ttk.Frame(card); ch.pack(fill="x", padx=12, pady=(6, 2))
+            start = seg.get("start", 0); end = seg.get("end", 0)
+            ts = f"{int(start//60)}:{start%60:04.1f} — {int(end//60)}:{end%60:04.1f}"
+            status = "✓" if has_audio else ("✗" if seg.get("tts_error") else "–")
+            tk.Label(ch, text=f"{status} 片段 {seg_idx+1}  [{ts}]",
+                     font=(config.CJK_FONT, 9, "bold"),
+                     fg="#155724" if has_audio else "#721c24").pack(side="left")
+            tk.Label(ch, text=f"{end-start:.1f}s",
+                     font=(config.CJK_FONT, 8), fg="#888").pack(side="right")
 
-            dur_str = f"{end - start:.1f}s"
-            tk.Label(ch, text=dur_str, font=(config.CJK_FONT, 8), fg="#888").pack(side="right")
-
-            # Text: original
-            txt_frame = ttk.Frame(card); txt_frame.pack(fill="x", padx=12, pady=(2, 0))
-            orig = seg.get("text", "")
-            trans = seg.get("text_translated", "")
-            if orig:
-                tk.Label(txt_frame, text=f"原文: {orig}",
+            # ── text rows ────────────────────────────────────────
+            tf = ttk.Frame(card); tf.pack(fill="x", padx=12, pady=(2, 0))
+            if seg.get("text"):
+                tk.Label(tf, text=f"原文: {seg['text']}",
                          font=(config.CJK_FONT, 8), fg="#666",
-                         wraplength=600, anchor="w", justify="left").pack(anchor="w")
-            if trans:
-                tk.Label(txt_frame, text=f"译文: {trans}",
+                         wraplength=680, anchor="w", justify="left").pack(anchor="w")
+            if seg.get("text_translated"):
+                tk.Label(tf, text=f"译文: {seg['text_translated']}",
                          font=(config.CJK_FONT, 9), fg="#333",
-                         wraplength=600, anchor="w", justify="left").pack(anchor="w")
+                         wraplength=680, anchor="w", justify="left").pack(anchor="w")
+            if seg.get("tts_error"):
+                tk.Label(tf, text=f"错误: {seg['tts_error']}",
+                         font=(config.CJK_FONT, 8), fg="#721c24").pack(anchor="w")
 
-            # Play button
-            audio_path = Path(seg["audio"])
-            btn_frame = ttk.Frame(card); btn_frame.pack(fill="x", padx=12, pady=(4, 8))
-            size_kb = audio_path.stat().st_size / 1024 if audio_path.exists() else 0
-            tk.Label(btn_frame, text=f"{audio_path.name}  ({size_kb:.0f} KB)",
-                     font=(config.CJK_FONT, 7), fg="#aaa").pack(side="left")
-            tk.Button(btn_frame, text="▶ 播放", font=(config.CJK_FONT, 9),
-                      command=lambda p=audio_path: self._play_segment(p)).pack(side="right")
+            # ── action row ───────────────────────────────────────
+            af = ttk.Frame(card); af.pack(fill="x", padx=12, pady=(4, 6))
+
+            # Voice selector (shows current voice used, editable before regen)
+            detected = seg.get("tts_gender", "female")
+            import ai_movie.tts as _t
+            init_spk = _t._SFT_FEMALE_SPK if detected == "female" else _t._SFT_MALE_SPK
+            voice_var = tk.StringVar(value=init_spk)
+            ttk.Combobox(af, textvariable=voice_var,
+                         values=[_t._SFT_FEMALE_SPK, _t._SFT_MALE_SPK],
+                         width=8, state="readonly").pack(side="left", padx=(0, 6))
+
+            # Regen button
+            def _regen(idx=seg_idx, vv=voice_var):
+                self._regenerate_one_segment(idx, vv.get())
+            tk.Button(af, text="🔄 重新生成", font=(config.CJK_FONT, 9),
+                      command=_regen).pack(side="left", padx=(0, 8))
+
+            # Play + sync button (only if audio exists)
+            if has_audio:
+                audio_path = Path(seg["audio"])
+                def _play_sync(p=audio_path, s=seg):
+                    self._play_with_left_sync(p, s)
+                tk.Button(af, text="▶ 播放（同步原视频）", font=(config.CJK_FONT, 9),
+                          command=_play_sync).pack(side="right")
+
+    def _play_with_left_sync(self, audio_path: Path, seg: dict):
+        """Play a generated audio segment and seek the left video to its start time."""
+        # Seek and play left video in sync
+        try:
+            dur_ms = self.left_player.get_duration_ms()
+            if dur_ms and dur_ms > 0:
+                start_ms = seg.get("start", 0) * 1000
+                self.left_player.seek_absolute(start_ms / dur_ms)
+                self.left_player.play()
+                self._is_playing = True
+                self._btn_play.configure(text="⏸")
+        except Exception:
+            pass
+        # Open audio playback popup
+        self._play_segment(audio_path)
+
+    def _regenerate_one_segment(self, seg_idx: int, spk: str):
+        """Regenerate a single segment with the chosen SFT speaker on the main thread."""
+        import ai_movie.tts as tts_mod
+        tts_mod._load_model()
+
+        results = getattr(self, "_gen_all_results", None)
+        if not results or seg_idx >= len(results):
+            messagebox.showerror("错误", "找不到片段数据，请重新生成全部片段。")
+            return
+
+        seg = results[seg_idx]
+        text = seg.get("text_translated", "").strip()
+        if not text:
+            messagebox.showwarning("提示", "此片段无译文，跳过。")
+            return
+
+        # Determine output path
+        existing = seg.get("audio")
+        if existing:
+            out_path = Path(existing)
+        else:
+            out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+            out_path = out_dir / f"seg_{seg_idx + 1:04d}.wav"
+
+        try:
+            audio_np = tts_mod.call_tts(tts_mod._model, text, spk, None, "sft")
+            import soundfile as sf
+            sf.write(str(out_path), audio_np, tts_mod._model.sample_rate)
+        except Exception as e:
+            messagebox.showerror("重新生成失败", str(e))
+            return
+
+        # Update results
+        results[seg_idx]["audio"] = str(out_path)
+        results[seg_idx]["tts_gender"] = "female" if spk == tts_mod._SFT_FEMALE_SPK else "male"
+        results[seg_idx].pop("tts_error", None)
+        n_ok = sum(1 for r in results if r.get("audio"))
+        self.log.set_step_data("人声生成", {"results": results, "ok": n_ok})
+
+        # Refresh tab
+        self._populate_generate_tab(results)
+        messagebox.showinfo("重新生成完成",
+            f"片段 {seg_idx + 1} 已用「{spk}」重新合成。")
 
     def _populate_separate_tab(self, vocals_path, bg_path):
         """Show separated audio files with play buttons."""
@@ -1360,22 +1443,24 @@ class App:
         import ai_movie.tts as tts_mod
         tts_mod._load_model()
 
-        # Detect gender / extract reference segment (a few seconds, acceptable on main thread)
-        mode = getattr(self, "_tts_mode_var", None)
-        mode = mode.get() if mode else "gender"
         out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
-        ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
-            vocals_path, mode=mode, cache_dir=out_dir
-        )
-        # Update dialog to show detected info
-        if mode == "gender":
-            if ref_method == "sft":
-                hint = f"已选择：{ref_audio}（SFT内置声音）"
-            else:
-                hint = f"已选择：{'女声' if ref_text else '男声'}参考音频"
+        voice_mode = getattr(self, "_tts_mode_var", None)
+        voice_mode = voice_mode.get() if voice_mode else "gender"
+        self._gen_voice_mode = voice_mode
+
+        if voice_mode == "female":
+            ref_audio, ref_text, ref_method = tts_mod._SFT_FEMALE_SPK, None, "sft"
+            self._lbl_gen_prog.configure(text="固定使用：中文女")
+        elif voice_mode == "male":
+            ref_audio, ref_text, ref_method = tts_mod._SFT_MALE_SPK, None, "sft"
+            self._lbl_gen_prog.configure(text="固定使用：中文男")
         else:
-            hint = "声音克隆（原声片段）"
-        self._lbl_gen_prog.configure(text=hint)
+            ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+                vocals_path, mode="gender", cache_dir=out_dir)
+            if ref_method == "sft":
+                self._lbl_gen_prog.configure(text=f"自动检测 → 初始声音：{ref_audio}")
+            else:
+                self._lbl_gen_prog.configure(text="自动检测（参考音频模式）")
 
         # Process segments one at a time on main thread via root.after()
         self._gen_segments = segments
@@ -1416,14 +1501,20 @@ class App:
             self.root.after(50, self._process_next_generate)
             return
 
-        # Per-segment speaker selection (SFT gender mode)
+        # Per-segment speaker selection
         if self._gen_ref_method == "sft":
-            last = getattr(self, "_gen_last_gender", "female")
-            seg_gender = mod.detect_gender_from_segment(
-                seg, fallback=last,
-                vocals_path=getattr(self, "_gen_vocals_path", None))
-            self._gen_last_gender = seg_gender
-            spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
+            if getattr(self, "_gen_voice_mode", "gender") == "gender":
+                # Auto-detect per segment
+                last = getattr(self, "_gen_last_gender", "female")
+                seg_gender = mod.detect_gender_from_segment(
+                    seg, fallback=last,
+                    vocals_path=getattr(self, "_gen_vocals_path", None))
+                self._gen_last_gender = seg_gender
+                spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
+            else:
+                # Fixed voice from user selection
+                spk = self._gen_ref_audio   # already "中文男" or "中文女"
+                seg_gender = "female" if spk == mod._SFT_FEMALE_SPK else "male"
             ref, ref_text, ref_method = spk, None, "sft"
         else:
             ref, ref_text, ref_method = self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method
@@ -1692,14 +1783,18 @@ class App:
             return
         mod = self._syn_tts_mod
 
-        # Per-segment speaker selection (SFT gender mode)
+        # Per-segment speaker selection
         if self._syn_ref_method == "sft":
-            last = getattr(self, "_syn_last_gender", "female")
-            seg_gender = mod.detect_gender_from_segment(
-                seg, fallback=last,
-                vocals_path=getattr(self, "_syn_vocals_path", None))
-            self._syn_last_gender = seg_gender
-            spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
+            if getattr(self, "_gen_voice_mode", "gender") == "gender":
+                last = getattr(self, "_syn_last_gender", "female")
+                seg_gender = mod.detect_gender_from_segment(
+                    seg, fallback=last,
+                    vocals_path=getattr(self, "_syn_vocals_path", None))
+                self._syn_last_gender = seg_gender
+                spk = mod._SFT_FEMALE_SPK if seg_gender == "female" else mod._SFT_MALE_SPK
+            else:
+                spk = self._syn_vocals_ref
+                seg_gender = "female" if spk == mod._SFT_FEMALE_SPK else "male"
             ref, ref_text, ref_method = spk, None, "sft"
         else:
             ref, ref_text, ref_method = self._syn_vocals_ref, self._syn_ref_text, self._syn_ref_method
