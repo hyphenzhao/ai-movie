@@ -1653,15 +1653,9 @@ class App:
         import ai_movie.composer as composer
         try:
             out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
-            audio_paths = [
-                Path(r["audio"]) if r.get("audio") else None
-                for r in gen_results
-            ]
             mixed_path = out_dir / "final_audio.wav"
-            composer.mix_audio(
-                [p for p in audio_paths if p is not None],
-                bg_path, mixed_path,
-            )
+            # Pass full segment dicts — mix_audio uses start/end for time alignment
+            composer.mix_audio(gen_results, bg_path, mixed_path)
         except Exception as e:
             self.root.after(0, lambda: self._on_remix_error(str(e)))
             return
@@ -1674,7 +1668,8 @@ class App:
         self.log.set_step_data("重新混音", {"mixed_audio": str(mixed_path)})
         self.log.add_entry("重新混音", "done", str(mixed_path))
         self._refresh_toolbar()
-        messagebox.showinfo("混音完成", f"混音完成：{mixed_path}")
+        self._populate_remix_tab(mixed_path)
+        messagebox.showinfo("混音完成", f"混音完成：\n{mixed_path}")
 
     def _on_remix_error(self, error_msg):
         if hasattr(self, "_mix_dlg") and self._mix_dlg.winfo_exists():
@@ -1683,6 +1678,39 @@ class App:
         self.log.add_entry("重新混音", "error", error_msg)
         self._refresh_toolbar()
         messagebox.showerror("混音失败", error_msg)
+
+    def _populate_remix_tab(self, mixed_path: Path):
+        """Show mixed audio result in the 重新混音 tab."""
+        tab = self._tab_frames.get("重新混音")
+        if tab is None:
+            return
+        for w in tab.winfo_children():
+            w.destroy()
+
+        f = ttk.Frame(tab, padding=20)
+        f.pack(expand=True)
+
+        tk.Label(f, text="✓ 混音完成", font=(config.CJK_FONT, 14, "bold"),
+                 fg="#155724").pack(pady=(0, 12))
+
+        # File info
+        info_frame = ttk.LabelFrame(f, text="输出文件", padding=10)
+        info_frame.pack(fill="x", pady=(0, 12))
+        p = Path(mixed_path)
+        size_mb = p.stat().st_size / 1e6 if p.exists() else 0
+        import soundfile as sf
+        try:
+            info = sf.info(str(p))
+            dur = f"{info.duration:.1f}s  {info.samplerate}Hz  {'单声道' if info.channels==1 else '立体声'}"
+        except Exception:
+            dur = "—"
+        tk.Label(info_frame, text=str(p), font=(config.MONO_FONT, 8),
+                 fg="#555", wraplength=500).pack(anchor="w")
+        tk.Label(info_frame, text=f"大小：{size_mb:.1f} MB    时长：{dur}",
+                 font=(config.CJK_FONT, 9), fg="#666").pack(anchor="w", pady=(4, 0))
+
+        tk.Button(f, text="▶  播放混音", font=(config.CJK_FONT, 11),
+                  command=lambda: self._play_segment(p)).pack(pady=8)
 
     # ═══ helper methods for audio pipeline ═══════════════════════
 
@@ -1960,10 +1988,13 @@ class App:
         self._cmp_dlg.resizable(False, False)
 
         ttk.Label(self._cmp_dlg, text="正在合成最终视频…",
-                  font=(config.CJK_FONT, 11)).pack(pady=(12, 8))
+                  font=(config.CJK_FONT, 11)).pack(pady=(12, 4))
+        self._lbl_cmp_status = ttk.Label(self._cmp_dlg, text="准备中…",
+                                          font=(config.CJK_FONT, 9), foreground="#666")
+        self._lbl_cmp_status.pack()
         self._bar_cmp = ttk.Progressbar(self._cmp_dlg, length=320,
                                          mode="indeterminate")
-        self._bar_cmp.pack(padx=20, pady=10)
+        self._bar_cmp.pack(padx=20, pady=8)
         self._bar_cmp.start(10)
 
         threading.Thread(
@@ -1974,10 +2005,15 @@ class App:
 
     def _run_compose(self, video_path, audio_path):
         import ai_movie.composer as composer
+        def _upd(msg):
+            self.root.after(0, lambda m=msg: (
+                hasattr(self, "_lbl_cmp_status") and
+                self._lbl_cmp_status.configure(text=m)))
         try:
             out_dir = ensure_dir(WORKSPACE_DIR / "output")
             out_path = out_dir / f"{Path(video_path).stem}_dubbed.mp4"
-            composer.compose_video(video_path, audio_path, out_path)
+            composer.compose_video(video_path, audio_path, out_path,
+                                   progress_cb=_upd)
         except Exception as e:
             self.root.after(0, lambda: self._on_compose_error(str(e)))
             return
@@ -1990,17 +2026,53 @@ class App:
         self.log.set_step_data("合成视频", {"output_video": str(out_path)})
         self.log.add_entry("合成视频", "done", str(out_path))
         self._refresh_toolbar()
+        self._populate_compose_tab(out_path)
+        messagebox.showinfo("合成完成", f"配音视频已生成：\n{out_path}")
 
-        # Populate output tab
-        if hasattr(self, "_cmp_out_text"):
-            self._cmp_out_text.configure(state="normal")
-            self._cmp_out_text.delete("1.0", "end")
-            self._cmp_out_text.insert("1.0",
-                f"✓ 合成完成\n\n输出视频：\n{out_path}")
-            self._cmp_out_text.configure(state="disabled")
+    def _populate_compose_tab(self, out_path: Path):
+        """Show finished video in the 合成视频 tab and auto-load in left player."""
+        tab = self._tab_frames.get("合成视频")
+        if tab is None:
+            return
+        for w in tab.winfo_children():
+            w.destroy()
 
-        messagebox.showinfo("合成完成",
-            f"配音视频已生成：\n{out_path}")
+        f = ttk.Frame(tab, padding=20)
+        f.pack(expand=True)
+
+        tk.Label(f, text="✓ 配音视频合成完成", font=(config.CJK_FONT, 14, "bold"),
+                 fg="#155724").pack(pady=(0, 12))
+
+        info_frame = ttk.LabelFrame(f, text="输出文件", padding=10)
+        info_frame.pack(fill="x", pady=(0, 16))
+        p = Path(out_path)
+        size_mb = p.stat().st_size / 1e6 if p.exists() else 0
+        tk.Label(info_frame, text=str(p), font=(config.MONO_FONT, 8),
+                 fg="#555", wraplength=500).pack(anchor="w")
+        tk.Label(info_frame, text=f"大小：{size_mb:.1f} MB",
+                 font=(config.CJK_FONT, 9), fg="#666").pack(anchor="w", pady=(4, 0))
+
+        btn_frame = ttk.Frame(f)
+        btn_frame.pack()
+        tk.Button(btn_frame, text="▶  在左侧播放", font=(config.CJK_FONT, 11),
+                  command=lambda: self._load_composed_video(p)).pack(
+                      side="left", padx=8)
+        tk.Button(btn_frame, text="📂  打开所在目录", font=(config.CJK_FONT, 10),
+                  command=lambda: subprocess.Popen(
+                      ["xdg-open", str(p.parent)])).pack(side="left", padx=8)
+
+        # Auto-load in left player
+        self._load_composed_video(p)
+
+    def _load_composed_video(self, path: Path):
+        """Load the composed video into the left player."""
+        try:
+            self._on_stop()
+            self.left_player.load(path)
+            self._is_playing = True
+            self._btn_play.configure(text="⏸")
+        except Exception as e:
+            messagebox.showwarning("播放失败", str(e))
 
     def _on_compose_error(self, error_msg: str):
         if hasattr(self, "_cmp_dlg") and self._cmp_dlg.winfo_exists():
@@ -2108,6 +2180,20 @@ class App:
         gen_results = gen_data.get("results", [])
         if gen_results and self.log.steps.get("人声生成") == "done":
             self._populate_generate_tab(gen_results)
+
+        # Restore 重新混音 tab
+        remix_data = self.log.step_data.get("重新混音", {})
+        if self.log.steps.get("重新混音") == "done" and remix_data.get("mixed_audio"):
+            p = Path(remix_data["mixed_audio"])
+            if p.exists():
+                self._populate_remix_tab(p)
+
+        # Restore 合成视频 tab
+        compose_data = self.log.step_data.get("合成视频", {})
+        if self.log.steps.get("合成视频") == "done" and compose_data.get("output_video"):
+            p = Path(compose_data["output_video"])
+            if p.exists():
+                self._populate_compose_tab(p)
 
         self.root.title(f"{config.WINDOW_TITLE} - {self.log.name}")
         done_count = sum(1 for v in self.log.steps.values() if v == "done")

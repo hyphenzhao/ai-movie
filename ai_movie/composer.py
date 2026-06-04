@@ -75,61 +75,97 @@ def separate_vocals(
 
 
 def mix_audio(
-    speech_paths: list[Path],
+    segments: list[dict],
     background_path: Path,
     output_path: Path,
-    sample_rate: int = 24000,
+    speech_gain: float = 0.85,
+    bg_gain_speech: float = 0.25,
+    bg_gain_silence: float = 1.0,
+    fade_ms: int = 20,
 ) -> Path:
-    """Mix generated speech segments with background audio.
+    """Mix TTS speech segments into background audio at their original timestamps.
+
+    Each segment is placed at ``seg['start']`` seconds in the timeline so
+    the dubbed speech stays in sync with the original video.  Background
+    audio is ducked (reduced) wherever speech is present.
 
     Parameters
     ----------
-    speech_paths:
-        Ordered list of per-segment generated speech WAV files.
+    segments:
+        List of segment dicts with keys ``audio``, ``start``, ``end``.
+        Segments without an ``audio`` value are skipped (silence retained).
     background_path:
-        Background audio (without vocals).
+        Demucs-separated background (no vocals) WAV.
     output_path:
-        Where to write the mixed audio.
-    sample_rate:
-        Output sample rate.
-
-    Returns
-    -------
-    *output_path*
+        Destination WAV path.
+    speech_gain:
+        Peak volume for the speech track (0-1).
+    bg_gain_speech:
+        Background volume where speech is active.
+    bg_gain_silence:
+        Background volume where there is no speech.
+    fade_ms:
+        Fade-in/out duration in milliseconds to avoid clicks.
     """
-    # Concatenate speech segments with silence gaps
-    speech_parts = []
-    for p in speech_paths:
-        if p is not None and Path(p).exists():
-            audio, sr = sf.read(str(p))
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)  # stereo → mono
-            speech_parts.append(audio)
-        else:
-            speech_parts.append(np.array([], dtype=np.float32))
+    import librosa as _librosa
 
-    full_speech = np.concatenate(speech_parts) if speech_parts else np.array([], dtype=np.float32)
-
-    # Load background
-    bg, bg_sr = sf.read(str(background_path))
-    if bg.ndim == 2:
+    # Load background (authoritative sample-rate and length)
+    bg, sr = sf.read(str(background_path))
+    if bg.ndim > 1:
         bg = bg.mean(axis=1)
+    bg = bg.astype(np.float32)
 
-    # Match lengths: pad or trim background to match speech
-    if len(full_speech) > len(bg):
-        bg = np.pad(bg, (0, len(full_speech) - len(bg)))
+    # Total output length: at least as long as the background
+    last_end = max((seg.get("end", 0) for seg in segments), default=0)
+    total = max(len(bg), int(last_end * sr) + sr)   # +1 s buffer
+
+    speech_track = np.zeros(total, dtype=np.float32)
+    speech_mask  = np.zeros(total, dtype=np.float32)
+
+    for seg in segments:
+        audio_path = seg.get("audio")
+        if not audio_path or not Path(audio_path).exists():
+            continue
+        wav, wav_sr = sf.read(str(audio_path))
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        wav = wav.astype(np.float32)
+        if wav_sr != sr:
+            wav = _librosa.resample(wav, orig_sr=wav_sr, target_sr=sr)
+
+        start_s = max(0, int(seg.get("start", 0) * sr))
+        end_s   = min(total, start_s + len(wav))
+        wav     = wav[: end_s - start_s]
+
+        # Short fade-in / fade-out to suppress clicks
+        fade = min(int(fade_ms * sr / 1000), max(1, len(wav) // 4))
+        wav[:fade]  *= np.linspace(0, 1, fade, dtype=np.float32)
+        wav[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
+
+        speech_track[start_s:end_s] += wav
+        speech_mask[start_s:end_s]   = 1.0
+
+    # Normalize speech track
+    peak = np.abs(speech_track).max()
+    if peak > 1e-8:
+        speech_track = speech_track / peak * speech_gain
+
+    # Pad / trim background
+    if len(bg) < total:
+        bg = np.pad(bg, (0, total - len(bg)))
     else:
-        bg = bg[:len(full_speech)]
+        bg = bg[:total]
 
-    # Normalize and mix
-    if full_speech.size > 0:
-        full_speech = full_speech / (np.abs(full_speech).max() + 1e-8)
-    if bg.size > 0:
-        bg = bg / (np.abs(bg).max() + 1e-8)
+    # Duck background under speech
+    bg_gain = speech_mask * bg_gain_speech + (1 - speech_mask) * bg_gain_silence
+    mixed = speech_track + bg * bg_gain
 
-    mixed = (full_speech * 0.7 + bg * 0.3) if full_speech.size > 0 else bg
+    # Final peak-normalize to prevent clipping
+    peak = np.abs(mixed).max()
+    if peak > 1.0:
+        mixed = mixed / peak
 
-    sf.write(str(output_path), mixed.astype(np.float32), sample_rate)
+    sf.write(str(output_path), mixed.astype(np.float32), sr)
     return output_path
 
 
@@ -137,12 +173,16 @@ def compose_video(
     video_path: Path,
     audio_path: Path,
     output_path: Path,
+    progress_cb=None,
 ) -> Path:
     """Replace the audio track of *video_path* with *audio_path*.
 
-    Returns *output_path*.
+    Copies the video stream without re-encoding; re-encodes audio to AAC 192k.
+    *progress_cb* is called with a status string at key steps.
     """
-    subprocess.run([
+    if progress_cb:
+        progress_cb("FFmpeg 合成中…")
+    result = subprocess.run([
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-i", str(audio_path),
@@ -151,5 +191,7 @@ def compose_video(
         "-map", "0:v:0", "-map", "1:a:0",
         "-shortest",
         str(output_path),
-    ], check=True, capture_output=True)
+    ], capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace")[-500:])
     return output_path
