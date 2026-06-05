@@ -980,9 +980,16 @@ class App:
         src_name_map = {"ja": "Japanese", "en": "English", "zh": "Chinese", "ko": "Korean"}
         src_lang = src_name_map.get(src_lang_code, "Japanese")
 
+        # ── read engine selection ────────────────────────────────
+        engine = getattr(self, "_tl_engine_var", tk.StringVar(value="hy-mt+polish")).get()
+        _engine_labels = {
+            "hy-mt": "Hy-MT", "ollama": "Ollama 直翻", "hy-mt+polish": "Hy-MT + 润色",
+        }
+        engine_label = _engine_labels.get(engine, engine)
+
         self.log.mark_step("文本翻译", "running")
         self.log.add_entry("文本翻译", "start",
-                           f"{src_lang}→{target_lang} segs={len(segments)}")
+                           f"{src_lang}→{target_lang} engine={engine} segs={len(segments)}")
         self._refresh_toolbar()
         self._cancel_requested = False
 
@@ -990,14 +997,14 @@ class App:
 
         # Progress dialog
         self._tl_dlg = tk.Toplevel(self.root)
-        self._tl_dlg.title("文本翻译")
+        self._tl_dlg.title(f"文本翻译 - {engine_label}")
         self._tl_dlg.geometry("420x200")
         self._tl_dlg.transient(self.root)
         self._tl_dlg.grab_set()
         self._tl_dlg.protocol("WM_DELETE_WINDOW", self._on_cancel_translate)
         self._tl_dlg.resizable(False, False)
 
-        ttk.Label(self._tl_dlg, text="正在翻译…",
+        ttk.Label(self._tl_dlg, text=f"正在翻译 ({engine_label})…",
                   font=(config.CJK_FONT, 11)).pack(pady=(12, 8))
 
         f1 = ttk.Frame(self._tl_dlg); f1.pack(fill="x", padx=20, pady=4)
@@ -1035,27 +1042,72 @@ class App:
 
         threading.Thread(
             target=self._run_translate,
-            args=(segments, target_lang, src_lang, total),
+            args=(segments, target_lang, src_lang, total, engine),
             daemon=True,
         ).start()
 
     def _on_cancel_translate(self):
         self._cancel_requested = True
 
-    def _run_translate(self, segments, target_lang, src_lang, total):
-        from ai_movie.translator import translate
-        try:
-            results = translate(
-                segments,
-                target_lang=target_lang,
-                src_lang=src_lang,
-                progress_cb=self._on_tl_progress,
-                cancel_check=lambda: self._cancel_requested,
-            )
-        except Exception as e:
-            self.root.after(0, lambda: self._on_translate_error(str(e)))
-            return
-        self.root.after(0, lambda: self._on_translate_done(results, target_lang))
+    def _run_translate(self, segments, target_lang, src_lang, total, engine="hy-mt+polish"):
+        # ── Hy-MT + Ollama polish (two-stage) ───────────────────
+        if engine == "hy-mt+polish":
+            from ai_movie.translator import translate, polish_ollama
+            try:
+                # Stage 1: accurate translation via Hy-MT
+                results = translate(
+                    segments,
+                    target_lang=target_lang,
+                    src_lang=src_lang,
+                    progress_cb=self._on_tl_progress,
+                    cancel_check=lambda: self._cancel_requested,
+                )
+                if self._cancel_requested:
+                    return
+                # Stage 2: colloquial polish via Ollama
+                results = polish_ollama(
+                    results,
+                    progress_cb=self._on_tl_progress,
+                    segment_cb=lambda idx, text: self._on_tl_segment(segments, idx, text),
+                    cancel_check=lambda: self._cancel_requested,
+                )
+            except Exception as e:
+                self.root.after(0, lambda: self._on_translate_error(str(e)))
+                return
+            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine))
+
+        # ── Ollama direct translation ──────────────────────────
+        elif engine == "ollama":
+            from ai_movie.translator import translate_ollama
+            try:
+                results = translate_ollama(
+                    segments,
+                    target_lang=target_lang,
+                    src_lang=src_lang,
+                    progress_cb=self._on_tl_progress,
+                    segment_cb=lambda idx, text: self._on_tl_segment(segments, idx, text),
+                    cancel_check=lambda: self._cancel_requested,
+                )
+            except Exception as e:
+                self.root.after(0, lambda: self._on_translate_error(str(e)))
+                return
+            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine))
+
+        # ── Hy-MT only ─────────────────────────────────────────
+        else:
+            from ai_movie.translator import translate
+            try:
+                results = translate(
+                    segments,
+                    target_lang=target_lang,
+                    src_lang=src_lang,
+                    progress_cb=self._on_tl_progress,
+                    cancel_check=lambda: self._cancel_requested,
+                )
+            except Exception as e:
+                self.root.after(0, lambda: self._on_translate_error(str(e)))
+                return
+            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine))
 
     def _on_tl_progress(self, current: int, total: int):
         self.root.after(0, lambda: self._update_tl_dialog(current, total))
@@ -1067,13 +1119,34 @@ class App:
         self._lbl_tl_prog.configure(text=f"{current} / {total}")
         self._lbl_tl_seg.configure(text=f"已翻译: {current} 句")
 
-    def _on_translate_done(self, results, target_lang):
+    def _on_tl_segment(self, segments, idx: int, translated: str):
+        """Called from background thread — schedule UI update."""
+        seg = segments[idx] if idx < len(segments) else {}
+        self.root.after(0, lambda: self._append_tl_segment(seg, translated))
+
+    def _append_tl_segment(self, seg: dict, translated: str):
+        """Append one translated segment to the result text area (main thread)."""
+        try:
+            self._tl_text.configure(state="normal")
+            start = seg.get("start", 0)
+            ts = f"{int(start // 60)}:{start % 60:04.1f}"
+            original = seg.get("text", "")
+            self._tl_text.insert("end",
+                f"  [{ts}]  {original}\n"
+                f"         → {translated}\n\n")
+            self._tl_text.see("end")
+            self._tl_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _on_translate_done(self, results, target_lang, engine="hy-mt"):
         if hasattr(self, "_tl_dlg") and self._tl_dlg.winfo_exists():
             self._tl_dlg.destroy()
 
         self.log.mark_step("文本翻译", "done")
         self.log.set_step_data("文本翻译", {
             "target_lang": target_lang,
+            "engine": engine,
             "segments": results,
             "count": len(results),
         })
@@ -2330,6 +2403,27 @@ class App:
         self._tl_src_label = ttk.Label(bar, text="（自动检测）",
                                         font=(config.CJK_FONT, 10, "bold"))
         self._tl_src_label.pack(side="left")
+
+        # ── translation engine selector ──────────────────────────
+        bar2 = ttk.Frame(tab, padding=(10, 4))
+        bar2.pack(fill="x")
+
+        ttk.Label(bar2, text="翻译引擎：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 8))
+
+        self._tl_engine_var = tk.StringVar(value="hy-mt+polish")
+        ttk.Radiobutton(
+            bar2, text="Hy-MT1.5-1.8B (本地)",
+            variable=self._tl_engine_var, value="hy-mt",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            bar2, text="Hy-MT + Ollama 润色",
+            variable=self._tl_engine_var, value="hy-mt+polish",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            bar2, text="Ollama 直翻",
+            variable=self._tl_engine_var, value="ollama",
+        ).pack(side="left")
 
         # Scrollable result area
         result_frame = ttk.Frame(tab)
