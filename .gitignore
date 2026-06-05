@@ -33,4 +33,21 @@ workspace/
 *.flv
 *.m4v
 *.wav
-.venv/
+
+# Exception: CosyVoice reference audio (used by TTS zero-shot)
+!models/CosyVoice/asset/*.wav
+
+# Project: generated output
+output_test.aimovie.json
+*.aimovie.json
+
+# Claude Code local config
+.claude/
+
+# CodeGraph local index
+.codegraph/
+
+# ═══════════════════════════════════════════════════════════════
+# Model weights — keep folder structure, ignore contents
+# Each weight directory has its own .gitignore with: *\n!.gitkeep\n!.gitignore
+# ═══════════════════════════════════════════════════════════════
