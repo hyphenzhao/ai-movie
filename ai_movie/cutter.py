@@ -40,7 +40,8 @@ def cut_video(
 
     Returns
     -------
-    list[dict] with keys ``path``, ``thumb``, ``index``, ``duration``.
+    list[dict] with keys ``path``, ``thumb``, ``index``, ``duration``, ``start``.
+    ``start`` is the offset in seconds from the beginning of the original video.
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = ensure_dir(WORKSPACE_DIR / video_path.stem / f"cuts_{ts}")
@@ -68,6 +69,7 @@ def cut_video(
             "path": str(seg_path),
             "thumb": str(thumb_path),
             "duration": dur,
+            "start": start,
         })
 
         if progress_cb:

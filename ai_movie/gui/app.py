@@ -956,17 +956,44 @@ class App:
             messagebox.showwarning("提示", "请先完成「转换文字」步骤。")
             return
 
-        # Flatten segments
+        # Build audio_path → offset map from cutter + split data
+        # When the video is cut into segments, ASR timestamps are relative
+        # to each cut segment's audio file (starting at 0).  The cutter
+        # stores the original-video offset in ``start``.
+        cut_data = self.log.step_data.get("切割视频", {})
+        cut_segs = cut_data.get("segments", [])
+        audio_offset_map: dict[str, float] = {}
+        if cut_segs:
+            index_to_offset = {
+                s["index"]: s.get("start", (s["index"] - 1) * 180.0)
+                for s in cut_segs
+            }
+            split_data = self.log.step_data.get("拆分音轨", {})
+            split_results = split_data.get("results", [])
+            for r in split_results:
+                label = r.get("label", "")
+                if label.startswith("seg_"):
+                    try:
+                        idx = int(label.rsplit("_", 1)[-1])
+                        offset = index_to_offset.get(idx, 0.0)
+                        audio = r.get("audio", "")
+                        if audio:
+                            audio_offset_map[audio] = offset
+                    except (ValueError, IndexError):
+                        pass
+
+        # Flatten segments (applying cut-segment offset where needed)
         segments = []
         for r in asr_results:
             if "error" in r:
                 continue
             src = r.get("source", "")
+            offset = audio_offset_map.get(src, 0.0)
             for seg in r.get("segments", []):
                 segments.append({
                     "text": seg["text"],
-                    "start": seg["start"],
-                    "end": seg["end"],
+                    "start": seg["start"] + offset,
+                    "end": seg["end"] + offset,
                     "source": src,
                 })
 
@@ -1448,8 +1475,9 @@ class App:
     # ═══ toolbar: 人声分离 ═════════════════════════════════════
 
     def _on_separate_vocals(self):
-        ref_audio = self._get_reference_audio()
+        ref_audio = self._get_full_audio()
         if ref_audio is None:
+            messagebox.showwarning("提示", "请先加载视频文件。")
             return
 
         self.log.mark_step("人声分离", "running")
@@ -1824,6 +1852,25 @@ class App:
         messagebox.showwarning("提示", "请先完成「人声分离」。")
         return None
 
+    def _get_full_audio(self) -> Path | None:
+        """Return a WAV of the **full** original video audio.
+
+        Unlike ``_get_reference_audio``, which may return a single cut
+        segment's audio when the video was split, this always extracts
+        audio from the original source file.  Use this for Demucs
+        background separation so the background length matches the
+        full video.
+        """
+        if self.log.video_path:
+            import tempfile
+            tmp = Path(tempfile.mktemp(suffix=".wav"))
+            subprocess.run([
+                "ffmpeg", "-y", "-i", self.log.video_path,
+                "-vn", "-ar", "16000", "-ac", "1", str(tmp),
+            ], check=True, capture_output=True)
+            return tmp
+        return None
+
     def _get_translated_segments(self):
         tl_data = self.log.step_data.get("文本翻译", {})
         segments = tl_data.get("segments", [])
@@ -1837,7 +1884,7 @@ class App:
     def _on_synthesize_audio(self):
         """One-click: runs 人声分离 → 人声生成 → 重新混音 in sequence."""
         segments = self._get_translated_segments()
-        ref_audio = self._get_reference_audio()
+        ref_audio = self._get_full_audio()  # full audio for Demucs background
         if segments is None or ref_audio is None:
             return
 
@@ -1991,9 +2038,8 @@ class App:
         import ai_movie.composer as composer
         try:
             out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
-            audio_paths = [Path(r["audio"]) for r in results if r.get("audio")]
             mixed_path = out_dir / "final_audio.wav"
-            composer.mix_audio(audio_paths, sep["background"], mixed_path)
+            composer.mix_audio(results, sep["background"], mixed_path)
             if self._cancel_requested:
                 return
             self.log.mark_step("重新混音", "done")
@@ -2032,19 +2078,25 @@ class App:
             messagebox.showwarning("提示", "请先完成「重新混音」或「合成音轨」步骤。")
             return
 
-        # Get silent video from demux step
-        split_data = self.log.step_data.get("拆分音轨", {})
-        split_results = split_data.get("results", [])
-        video_path = None
-        if split_results:
-            for r in split_results:
-                if "error" not in r:
-                    p = Path(r.get("video", ""))
-                    if p.exists() and p.suffix in (".mp4", ".mkv", ".mov"):
-                        video_path = p
-                        break
-        if video_path is None:
-            messagebox.showwarning("提示", "未找到无声视频文件。")
+        # Use the original full video when it was cut into segments;
+        # otherwise use the silent video from the demux step.
+        cut_data = self.log.step_data.get("切割视频", {})
+        has_cuts = bool(cut_data.get("segments"))
+        if has_cuts and self.log.video_path:
+            video_path = Path(self.log.video_path)
+        else:
+            split_data = self.log.step_data.get("拆分音轨", {})
+            split_results = split_data.get("results", [])
+            video_path = None
+            if split_results:
+                for r in split_results:
+                    if "error" not in r:
+                        p = Path(r.get("video", ""))
+                        if p.exists() and p.suffix in (".mp4", ".mkv", ".mov"):
+                            video_path = p
+                            break
+        if video_path is None or not video_path.exists():
+            messagebox.showwarning("提示", "未找到视频文件。")
             return
 
         self.log.mark_step("合成视频", "running")
