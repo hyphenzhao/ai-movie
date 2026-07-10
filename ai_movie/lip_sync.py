@@ -762,6 +762,7 @@ def _extract_speech_ranges(
     padding_after: float = 0.3,
     merge_gap: float = 1.0,
     max_duration: float = 12.0,
+    anchor_gender: str | None = None,
 ) -> list[tuple[float, float]]:
     """Extract and merge time ranges where TTS speech audio exists.
 
@@ -788,13 +789,24 @@ def _extract_speech_ranges(
     -------
     List of ``(start_sec, end_sec)`` tuples, sorted ascending.
     """
-    # 1. Collect raw ranges from segments with valid audio
+    # 1. Collect raw ranges from segments with valid audio.
+    #    When anchor_gender is set (person-anchoring), only segments whose
+    #    speaker matches that gender are lip-synced; the rest pass through as
+    #    original video (their dubbed audio still plays via build_speech_track).
     raw: list[tuple[float, float]] = []
+    skipped_gender = 0
     for seg in tts_results:
         audio = seg.get("audio")
         if not audio or not Path(str(audio)).exists():
             continue
+        if anchor_gender and seg.get("tts_gender") != anchor_gender:
+            skipped_gender += 1
+            continue
         raw.append((float(seg["start"]), float(seg["end"])))
+
+    if anchor_gender:
+        _log(f"Person-anchoring ({anchor_gender}-only): lip-syncing {len(raw)} "
+             f"segments, {skipped_gender} other-gender segments pass through")
 
     if not raw:
         return []
@@ -847,11 +859,16 @@ def _cut_video_clip(
     output_path: Path,
     *,
     reencode: bool = False,
+    fps: float | None = None,
 ) -> Path:
     """Cut a precise clip from *video_path*.
 
     When ``reencode=False`` (default) uses stream copy for speed.
-    When ``reencode=True`` re-encodes for frame-accurate cutting.
+    When ``reencode=True`` re-encodes for frame-accurate cutting.  ``-ss`` is
+    placed AFTER ``-i`` so the seek is frame-accurate (a fast pre-input seek
+    with ``-c copy`` snaps to the previous keyframe and re-includes already
+    shown frames → duplicated/stuttering seams).  ``fps`` forces the output
+    frame rate so every clip in the timeline shares one rate for clean concat.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if reencode:
@@ -861,9 +878,10 @@ def _cut_video_clip(
             "-ss", str(start), "-t", str(duration),
             "-c:v", "libx264", "-crf", "18",
             "-pix_fmt", "yuv420p",
-            "-an",
-            str(output_path),
         ]
+        if fps:
+            cmd += ["-r", f"{fps}"]
+        cmd += ["-an", str(output_path)]
     else:
         cmd = [
             "ffmpeg", "-y",
@@ -1169,6 +1187,7 @@ def segment_based_lip_sync(
     max_segment_duration: float = 12.0,
     resize_factor: int | None = None,
     face_restore: bool = False,
+    anchor_gender: str | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
@@ -1270,6 +1289,7 @@ def segment_based_lip_sync(
         padding_after=padding_after,
         merge_gap=merge_gap,
         max_duration=max_segment_duration,
+        anchor_gender=anchor_gender,
     )
 
     if not speech_ranges:
@@ -1288,6 +1308,12 @@ def segment_based_lip_sync(
         _log(f"Downscaling video {resize_factor}× for lip-sync…")
         _downscale_video(video_path, scaled_video, resize_factor)
         working_video = scaled_video
+
+    # Uniform frame rate for the whole timeline: MuseTalk otherwise forces 25 fps
+    # (re-timing speech clips → drift/stutter vs the gap clips).  Cut gaps and
+    # drive MuseTalk at the source rate so every clip shares one fps.
+    target_fps = _probe_fps(working_video)
+    ms_fps = int(round(target_fps))
 
     # ── Process each speech range ────────────────────────────────
     processed_map: dict[tuple[float, float], Path] = {}
@@ -1318,6 +1344,7 @@ def segment_based_lip_sync(
             if backend == "musetalk":
                 musetalk_sync(
                     orig_clip, audio_clip, lipsync_clip,
+                    fps=ms_fps,
                     use_float16=True,
                     batch_size=4,
                     progress_cb=detail_progress_cb,
@@ -1370,6 +1397,12 @@ def segment_based_lip_sync(
             progress_cb(idx + 1, total_segments)
 
     # ── Build complete clip timeline ─────────────────────────────
+    # Gaps are cut from working_video (SAME resolution as the speech clips) and
+    # re-encoded frame-accurately (stream-copy would keyframe-snap and duplicate
+    # frames at the seams → the reported stutter/repeat).  MuseTalk clips are
+    # forced to ms_fps, so gaps match that; Wav2Lip preserves the source fps, so
+    # gaps inherit working_video's fps (fps=None).
+    gap_fps = ms_fps if backend == "musetalk" else None
     all_clips: list[Path] = []
     cursor = 0.0
     min_gap = 0.05  # 50ms minimum to avoid zero-duration clips
@@ -1378,7 +1411,8 @@ def segment_based_lip_sync(
         # Gap before this speech segment
         if seg_start - cursor > min_gap:
             gap_clip = tmp_dir / f"gap_{cursor:.3f}_{seg_start:.3f}.mp4"
-            _cut_video_clip(video_path, cursor, seg_start - cursor, gap_clip, reencode=False)
+            _cut_video_clip(working_video, cursor, seg_start - cursor, gap_clip,
+                            reencode=True, fps=gap_fps)
             all_clips.append(gap_clip)
 
         # Speech clip (lip-synced or original fallback)
@@ -1388,7 +1422,8 @@ def segment_based_lip_sync(
     # Trailing gap
     if video_duration - cursor > min_gap:
         gap_clip = tmp_dir / f"gap_{cursor:.3f}_{video_duration:.3f}.mp4"
-        _cut_video_clip(video_path, cursor, video_duration - cursor, gap_clip, reencode=False)
+        _cut_video_clip(working_video, cursor, video_duration - cursor, gap_clip,
+                        reencode=True, fps=gap_fps)
         all_clips.append(gap_clip)
 
     # ── Concatenate all clips ────────────────────────────────────
@@ -1400,6 +1435,21 @@ def segment_based_lip_sync(
 
     _log(f"Segment-based lip-sync DONE: {output_path}")
     return output_path
+
+
+def _probe_fps(video_path: Path) -> float:
+    """Return the average frame rate of *video_path* (fallback 25.0)."""
+    try:
+        out = subprocess.run([
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=nw=1:nk=1", str(video_path),
+        ], capture_output=True, text=True).stdout.strip()
+        num, _, den = out.partition("/")
+        fps = float(num) / float(den) if den and float(den) else float(num)
+        return fps if fps and fps > 0 else 25.0
+    except Exception:
+        return 25.0
 
 
 def _downscale_video(

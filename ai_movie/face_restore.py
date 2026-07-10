@@ -176,11 +176,24 @@ def _lower_face_mask(size: int) -> np.ndarray:
     return m
 
 
+def _mouth_band_keep(size: int) -> np.ndarray:
+    """Feathered mask that is 0 over the central mouth band, 1 elsewhere.
+
+    Fallback used to protect the lip-sync mouth when the BiSeNet parser is
+    unavailable (no per-pixel lip classes) — restoration then sharpens the
+    surrounding skin/jaw but leaves the generated mouth region untouched.
+    """
+    m = np.ones((size, size), np.float32)
+    m[int(0.60 * size):int(0.90 * size), int(0.24 * size):int(0.76 * size)] = 0.0
+    sigma = max(1.0, size * 0.03)
+    return cv2.GaussianBlur(m, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+
 def restore_video(
     in_video: str | Path,
     out_video: str | Path,
     *,
-    fidelity_weight: float = 0.7,
+    fidelity_weight: float = 0.85,
     face_det_batch_size: int = 8,
     det_max_width: int = 640,
     det_device: str = "cpu",
@@ -188,6 +201,7 @@ def restore_video(
     conf_thresh: float = 0.9,
     occlusion_aware: bool = True,
     occlusion_lip_thresh: float = 0.004,
+    protect_lips: bool = True,
     parse_device: str | None = None,
     chunk_size: int = 600,
     progress_cb: Callable[[int, int], None] | None = None,
@@ -201,8 +215,16 @@ def restore_video(
     fidelity_weight:
         CodeFormer ``w`` in [0, 1].  Higher = stay closer to the input
         (more identity fidelity, less aggressive restoration); lower = more
-        restoration (sharper but can drift).  0.7 keeps the mouth faithful
-        while restoring detail.
+        restoration (sharper but can drift).  Default 0.85 keeps the
+        lip-synced mouth shape faithful (a low ``w`` makes CodeFormer's
+        codebook regularize the generated mouth back toward a neutral,
+        original-looking mouth).
+    protect_lips:
+        When True (default) the mouth/lip pixels are **excluded** from the
+        restoration mask, so the generated lip-sync mouth shape is left
+        completely untouched and only the surrounding skin/jaw is sharpened.
+        Requires the BiSeNet parser for accurate lip pixels; without it, a
+        central mouth band of the geometric mask is zeroed as a fallback.
     det_max_width:
         Face detection is run on a copy of each frame downscaled so its
         width ≤ this many pixels; the resulting boxes are scaled back to
@@ -378,8 +400,18 @@ def restore_video(
                                     skipped_occluded += 1
                                 else:
                                     face = np.isin(par, _FACE_CLASSES).astype(np.float32)
+                                    if protect_lips:
+                                        # Exclude the generated lips so CodeFormer
+                                        # can't regularize the lip-sync mouth shape.
+                                        lips = np.isin(par, _LIP_CLASSES).astype(np.uint8)
+                                        k = max(3, S // 40)
+                                        lips = cv2.dilate(lips, np.ones((k, k), np.uint8), 1)
+                                        face[lips > 0] = 0.0
                                     face = cv2.GaussianBlur(face, (0, 0), sigmaX=max(1.0, S * 0.02))
                                     mask2d = mask2d * face
+                            elif protect_lips:
+                                # No parser: geometrically exclude the mouth band.
+                                mask2d = mask2d * _mouth_band_keep(S)
                             if do_blend:
                                 restored = _restore_crop(crop, net, device, fidelity_weight)
                                 restored = cv2.resize(restored, (S, S), interpolation=cv2.INTER_LINEAR)

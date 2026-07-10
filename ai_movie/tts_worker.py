@@ -100,8 +100,8 @@ def main() -> int:
     def _n_hanzi(s: str) -> int:
         return sum(1 for ch in s if "一" <= ch <= "鿿")
 
-    def _synth_once(text: str) -> np.ndarray:
-        return call_tts(model, text, ref_audio, ref_text, method)
+    def _synth_once(text: str, r_audio, r_text, r_method) -> np.ndarray:
+        return call_tts(model, text, r_audio, r_text, r_method)
 
     def _reseed(seed: int) -> None:
         import random
@@ -115,7 +115,8 @@ def main() -> int:
         except Exception:
             pass
 
-    def _synth_clean(text: str, base_seed: int) -> np.ndarray:
+    def _synth_clean(text: str, base_seed: int,
+                     r_audio, r_text, r_method) -> np.ndarray:
         """CosyVoice2/3 zero_shot occasionally collapses to a near-empty
         (~0.04 s) output for some RNG states.  Detect that by duration and
         retry with *different* seeds (the yaml fixes a seed at load, so
@@ -126,7 +127,7 @@ def main() -> int:
         best = None
         for k in range(4):
             _reseed(base_seed + k * 7919)
-            a = _synth_once(text)
+            a = _synth_once(text, r_audio, r_text, r_method)
             if best is None or len(a) > len(best):
                 best = a
             if len(a) / model.sample_rate >= min_dur:
@@ -141,8 +142,15 @@ def main() -> int:
             items[str(idx)] = {"audio": None}
             _emit({"ev": "progress", "done": done, "total": total})
             continue
+        # Optional per-segment reference override (e.g. gender routing:
+        # female → soft/Taiwanese ref, male → Mandarin male ref). Falls back
+        # to the job-global reference when the segment carries no override.
+        if "ref_audio" in seg:
+            s_audio, s_text, s_method = seg.get("ref_audio"), seg.get("ref_text"), seg.get("method")
+        else:
+            s_audio, s_text, s_method = ref_audio, ref_text, method
         try:
-            audio_np = _synth_clean(text, base_seed=1986 + idx * 131)
+            audio_np = _synth_clean(text, 1986 + idx * 131, s_audio, s_text, s_method)
             out_path = str(out_dir / f"seg_{idx + 1:04d}.wav")
             sf.write(out_path, audio_np, model.sample_rate)
             items[str(idx)] = {"audio": out_path}

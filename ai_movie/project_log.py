@@ -32,7 +32,7 @@ STEP_DEPS: dict[str, list[str]] = {
     "人声生成": ["人声分离", "文本翻译"],
     "重新混音": ["人声生成"],
     "合成音轨": ["拆分音轨", "文本翻译"],  # one-click shortcut
-    "人物锚定": ["文本翻译"],
+    "人物锚定": ["人声生成"],   # needs per-segment gender from TTS
     "口型匹配": ["人声生成"],
     "人脸增强": ["口型匹配"],   # optional polish pass on the lip-sync output
     "合成视频": ["口型匹配", "重新混音"],

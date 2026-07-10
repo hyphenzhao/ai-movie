@@ -64,8 +64,17 @@ _MALE_REF_WAV    = _ASSET_DIR / "cross_lingual_prompt.wav"
 # voice identity/tone comes entirely from the reference clip — swap
 # _STYLE_REF_WAV / _STYLE_REF_TEXT for a Taiwanese soft-voice clip (with its
 # exact transcript) to get authentic Taiwanese styling.
-_STYLE_REF_WAV  = _FEMALE_REF_WAV          # soft female reference (bundled)
-_STYLE_REF_TEXT = _FEMALE_REF_TEXT         # exact transcript of _STYLE_REF_WAV
+# Swap hook: drop a real Taiwanese-accent female clip at asset/taiwan_ref.wav
+# (+ its exact transcript in asset/taiwan_ref.txt) to get authentic Taiwanese
+# styling; otherwise fall back to the bundled soft-female reference.
+_TAIWAN_REF_WAV = _ASSET_DIR / "taiwan_ref.wav"
+_TAIWAN_REF_TXT = _ASSET_DIR / "taiwan_ref.txt"
+if _TAIWAN_REF_WAV.exists() and _TAIWAN_REF_TXT.exists():
+    _STYLE_REF_WAV  = _TAIWAN_REF_WAV
+    _STYLE_REF_TEXT = _TAIWAN_REF_TXT.read_text(encoding="utf-8").strip()
+else:
+    _STYLE_REF_WAV  = _FEMALE_REF_WAV      # soft female reference (bundled)
+    _STYLE_REF_TEXT = _FEMALE_REF_TEXT     # exact transcript of _STYLE_REF_WAV
 
 # F0 threshold (Hz) separating male from female
 _GENDER_THRESHOLD_HZ = 165.0
@@ -556,6 +565,7 @@ def run_isolated_synthesis(
     output_dir: str | Path,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    seg_refs: dict[int, tuple[str, str | None, str]] | None = None,
 ) -> dict[int, dict]:
     """Synthesize Qwen-based (CosyVoice2/3) segments in a pinned subprocess.
 
@@ -568,6 +578,14 @@ def run_isolated_synthesis(
     """
     output_dir = ensure_dir(Path(output_dir))
     model_dir = _CV3_MODEL_DIR if model_choice == "cosyvoice3" else _ZS_MODEL_DIR
+
+    def _seg_entry(i, t):
+        entry = {"index": i, "text": t}
+        if seg_refs and i in seg_refs:
+            r_audio, r_text, r_method = seg_refs[i]
+            entry["ref_audio"], entry["ref_text"], entry["method"] = r_audio, r_text, r_method
+        return entry
+
     job = {
         "model_dir":  str(model_dir),
         "ref_audio":  ref_audio,
@@ -575,7 +593,7 @@ def run_isolated_synthesis(
         "method":     method,
         "output_dir": str(output_dir),
         "fp16":       True,
-        "segments":   [{"index": i, "text": t} for i, t in seg_texts],
+        "segments":   [_seg_entry(i, t) for i, t in seg_texts],
     }
     job_path = output_dir / "_tts_job.json"
     with open(job_path, "w", encoding="utf-8") as f:
