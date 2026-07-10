@@ -3,13 +3,17 @@
 Architecture (priority order)
 -----------------------------
 **Linux / macOS:**
-  1. openai-whisper + PyTorch GPU (ROCm / CUDA) — in-process
-  2. faster-whisper (CTranslate2) CPU fallback, int8 quantized
+  1. openai-whisper + PyTorch GPU (ROCm / CUDA) + Silero VAD pre-segmentation
+  2. faster-whisper (CTranslate2) + built-in Silero VAD — CPU/GPU fallback
 
 **Windows:**
   1. WSL + ROCm: launches ``wsl.exe python3 asr_wsl.py`` subprocess
   2. DirectML GPU: launches subprocess with torch-directml + openai-whisper
   3. CPU fallback: faster-whisper (CTranslate2, int8 quantized)
+
+All GPU paths now use Silero VAD to prevent hallucination loops
+(especially critical for Japanese) and to produce sentence boundaries
+aligned with natural conversational pauses.
 
 Call ``transcribe_all()`` — it auto-selects the best available backend.
 """
@@ -352,21 +356,6 @@ def _transcribe_cpu(
 
 # ── openai-whisper GPU backend (Linux ROCm / CUDA) ───────────────
 
-import re
-import threading as _threading
-
-# Regex to parse whisper verbose output timestamps:
-#   [00:29.980 --> 00:30.000] 音楽
-# Group 1: end time seconds (float)
-_TS_RE = re.compile(r"\[[\d:.]+ -->\s*(\d+):(\d+\.\d+)]")
-
-
-def _parse_end_seconds(line: str) -> float | None:
-    """Return the end timestamp in seconds from a whisper verbose line."""
-    m = _TS_RE.search(line)
-    if m:
-        return int(m.group(1)) * 60 + float(m.group(2))
-    return None
 
 
 def _get_audio_duration(audio_path: Path) -> float:
@@ -382,6 +371,97 @@ def _get_audio_duration(audio_path: Path) -> float:
     return 0.0
 
 
+# ── VAD (Voice Activity Detection) ─────────────────────────────
+
+_VAD_CACHE: dict = {}
+
+
+def _load_silero_vad():
+    """Lazy-load Silero VAD model (thread-safe, cached).
+
+    Silero VAD is a lightweight ONNX model (~1.7 MB) that detects
+    speech vs. silence with high accuracy across 100+ languages.
+
+    Returns
+    -------
+    ``(model, utils)`` tuple on success, ``(None, None)`` if VAD is
+    unavailable (the caller should fall back to whole-file transcription).
+    """
+    if "model" in _VAD_CACHE:
+        return _VAD_CACHE["model"], _VAD_CACHE["utils"]
+
+    try:
+        import torch
+
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+        )
+        _VAD_CACHE["model"] = model
+        _VAD_CACHE["utils"] = utils
+        return model, utils
+    except Exception as exc:
+        print(
+            f"[ASR] Silero VAD 加载失败，将回退到整文件转录: {exc}",
+            file=sys.stderr,
+        )
+        _VAD_CACHE["model"] = None
+        _VAD_CACHE["utils"] = None
+        return None, None
+
+
+def _vad_detect(
+    audio,  # 1-D float tensor, 16 kHz mono
+    threshold: float = 0.35,
+    min_silence_duration_ms: int = 500,
+    min_speech_duration_ms: int = 150,
+    speech_pad_ms: int = 200,
+) -> list[dict]:
+    """Run Silero VAD and return speech-segment timestamps.
+
+    Parameters
+    ----------
+    audio:
+        1-D float tensor, **must be 16 kHz mono** (as loaded by
+        ``whisper.load_audio()``).
+    threshold:
+        Speech probability threshold (0.0–1.0).  Lower = more sensitive.
+        Default 0.35 is tuned for Japanese conversational speech.
+    min_silence_duration_ms:
+        How many ms of silence before marking a segment boundary.
+    min_speech_duration_ms:
+        Segments shorter than this are treated as noise.
+    speech_pad_ms:
+        Padding added to each side of a detected speech segment.
+
+    Returns
+    -------
+    List of dicts with ``start`` and ``end`` keys (seconds, float).
+    Returns empty list if VAD is unavailable.
+    """
+    model, utils = _load_silero_vad()
+    if model is None:
+        return []
+
+    get_speech_timestamps = utils[0]
+
+    timestamps = get_speech_timestamps(
+        audio, model,
+        sampling_rate=16000,
+        threshold=threshold,
+        min_silence_duration_ms=min_silence_duration_ms,
+        min_speech_duration_ms=min_speech_duration_ms,
+        speech_pad_ms=speech_pad_ms,
+    )
+
+    return [
+        {"start": ts["start"] / 16000, "end": ts["end"] / 16000}
+        for ts in timestamps
+    ]
+
+
+
 def _transcribe_whisper_gpu(
     audio_paths: list[Path],
     language: str,
@@ -392,16 +472,30 @@ def _transcribe_whisper_gpu(
     file_progress_cb: Callable[[int, int], None] | None,
     cancel_check: Callable[[], bool] | None,
 ) -> list[dict]:
-    """Transcribe using openai-whisper on GPU (PyTorch ROCm/CUDA).
+    """Transcribe with openai-whisper GPU + Silero VAD pre-segmentation.
 
-    Captures verbose stdout to parse timestamps and drive
-    *file_progress_cb* with 0–100 % based on audio position.
+    VAD (Voice Activity Detection) splits the audio at silence gaps
+    before transcription.  Each speech segment is transcribed
+    independently, then timestamps are adjusted to the original
+    timeline.  This prevents the hallucination-loop issue that Whisper
+    exhibits on long Japanese audio and produces more natural sentence
+    boundaries aligned with conversational pauses.
+
+    Falls back to whole-file transcription if VAD is unavailable.
     """
     import torch
     import whisper
 
+    from ai_movie.config import (
+        ASR_VAD_MIN_SILENCE_DURATION_MS,
+        ASR_VAD_MIN_SPEECH_DURATION_MS,
+        ASR_VAD_SPEECH_PAD_MS,
+        ASR_VAD_THRESHOLD,
+    )
+
     device = torch.device("cuda")
     model = whisper.load_model(model_size).to(device)
+    WHISPER_SR = whisper.audio.SAMPLE_RATE  # 16 000
 
     all_results: list[dict] = []
     for i, p in enumerate(audio_paths):
@@ -413,66 +507,91 @@ def _transcribe_whisper_gpu(
 
         duration = _get_audio_duration(p)
 
-        # ── capture stdout for per-file progress (whisper verbose output) ──
-        stdout_pipe_r, stdout_pipe_w = os.pipe()
-        old_stdout = os.dup(1)
-        os.dup2(stdout_pipe_w, 1)
-        os.close(stdout_pipe_w)
+        # ── load audio & run VAD ─────────────────────────────────
+        audio_np = whisper.load_audio(str(p))       # float32, 16 kHz
+        audio_pt = torch.from_numpy(audio_np)
 
-        last_pct = [-1]
+        speech_segs = _vad_detect(
+            audio_pt,
+            threshold=ASR_VAD_THRESHOLD,
+            min_silence_duration_ms=ASR_VAD_MIN_SILENCE_DURATION_MS,
+            min_speech_duration_ms=ASR_VAD_MIN_SPEECH_DURATION_MS,
+            speech_pad_ms=ASR_VAD_SPEECH_PAD_MS,
+        )
 
-        def _reader():
+        if not speech_segs:
+            # VAD unavailable or found nothing → whole-file fallback
+            speech_segs = [{"start": 0.0, "end": len(audio_np) / WHISPER_SR}]
+
+        # ── transcribe each VAD segment ──────────────────────────
+        all_segs: list[dict] = []
+
+        for vad_seg in speech_segs:
+            if cancel_check and cancel_check():
+                break
+
+            start_samp = int(vad_seg["start"] * WHISPER_SR)
+            end_samp = int(vad_seg["end"] * WHISPER_SR)
+            chunk = audio_np[start_samp:end_samp]
+
+            if len(chunk) < WHISPER_SR * 0.1:   # skip < 100 ms
+                continue
+
             try:
-                with os.fdopen(stdout_pipe_r, "r", encoding="utf-8", errors="replace") as rf:
-                    for line in rf:
-                        if duration > 0:
-                            end_sec = _parse_end_seconds(line)
-                            if end_sec is not None:
-                                pct = min(int(end_sec / duration * 100), 99)
-                                if pct > last_pct[0]:
-                                    last_pct[0] = pct
-                                    if file_progress_cb:
-                                        try:
-                                            file_progress_cb(i, pct)
-                                        except Exception:
-                                            pass
+                result = model.transcribe(
+                    chunk, language=language, verbose=False,
+                )
             except Exception:
-                pass
+                # single-chunk failure shouldn't kill the whole file
+                continue
 
-        reader_thread = _threading.Thread(target=_reader, daemon=True)
-        reader_thread.start()
+            offset = vad_seg["start"]
 
-        try:
-            result = model.transcribe(str(p), language=language, verbose=True)
-        except Exception as exc:
-            all_results.append({"source": str(p), "error": str(exc)})
-            if progress_cb:
-                progress_cb(i + 1, len(audio_paths))
-            os.dup2(old_stdout, 1)
-            os.close(old_stdout)
-            reader_thread.join(timeout=1)
-            continue
-        finally:
-            os.dup2(old_stdout, 1)
-            os.close(old_stdout)
-            reader_thread.join(timeout=1)
+            for seg in result.get("segments", []):
+                all_segs.append({
+                    "start": round(seg["start"] + offset, 2),
+                    "end": round(seg["end"] + offset, 2),
+                    "text": seg["text"].strip(),
+                })
 
-        if file_progress_cb:
-            file_progress_cb(i, 100)
+            # per-VAD-segment progress (0..99 % within file)
+            if file_progress_cb and duration > 0:
+                pct = min(int(vad_seg["end"] / duration * 100), 99)
+                file_progress_cb(i, pct)
 
+        # ── sort by start time & deduplicate ───────────────────
+        all_segs.sort(key=lambda s: s["start"])
+
+        merged: list[dict] = []
+        for seg in all_segs:
+            if not seg["text"]:
+                continue
+            if merged and seg["start"] <= merged[-1]["end"] + 0.05:
+                # overlapping / abutting → merge
+                merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+                merged[-1]["text"] += seg["text"]
+            else:
+                merged.append(seg)
+
+        # ── emit segments via callbacks ─────────────────────────
         segs: list[dict] = []
-        for seg in result["segments"]:
-            d = {"start": round(seg["start"], 2),
-                  "end": round(seg["end"], 2),
-                  "text": seg["text"].strip(),
-                  "source": str(p)}
+        for seg in merged:
+            d = {
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"],
+                "source": str(p),
+            }
             segs.append(d)
             if segment_cb:
                 segment_cb(i, d)
 
+        if file_progress_cb:
+            file_progress_cb(i, 100)
+
         all_results.append({
             "source": str(p),
-            "language": result.get("language", language),
+            "language": language,
             "segments": segs,
         })
 

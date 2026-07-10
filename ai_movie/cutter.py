@@ -120,3 +120,91 @@ def _extract_thumbnail(video_path: Path, thumb_path: Path) -> Path:
         str(thumb_path),
     ], check=True, capture_output=True)
     return thumb_path
+
+
+def cut_segment(
+    video_path: Path,
+    start: float,
+    duration: float,
+    output_path: Path,
+    *,
+    reencode: bool = False,
+) -> Path:
+    """Cut a precise time segment from *video_path*.
+
+    When ``reencode=False`` (default) uses stream copy for speed but
+    cuts are keyframe-aligned.  When ``reencode=True`` re-encodes
+    with libx264 for frame-accurate boundaries.
+
+    Returns
+    -------
+    ``output_path`` on success.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if reencode:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-ss", str(start), "-t", str(duration),
+            "-c:v", "libx264", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(output_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-i", str(video_path),
+            "-t", str(duration),
+            "-c", "copy", "-an",
+            str(output_path),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd,
+            output=result.stdout, stderr=result.stderr,
+        )
+    return output_path
+
+
+def concat_videos(
+    clip_paths: list[Path],
+    output_path: Path,
+) -> Path:
+    """Concatenate video clips using FFmpeg concat demuxer.
+
+    Falls back to re-encoding if stream copy fails.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    filelist = output_path.parent / f"{output_path.stem}_concat.txt"
+    with open(filelist, "w") as f:
+        for p in clip_paths:
+            f.write(f"file '{p.absolute()}'\n")
+
+    # Try stream copy first
+    result = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(filelist),
+        "-c", "copy",
+        str(output_path),
+    ], capture_output=True, text=True)
+
+    if result.returncode == 0:
+        filelist.unlink(missing_ok=True)
+        return output_path
+
+    # Fallback: re-encode
+    result = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(filelist),
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        str(output_path),
+    ], capture_output=True, text=True, check=True)
+
+    filelist.unlink(missing_ok=True)
+    return output_path

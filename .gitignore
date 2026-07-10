@@ -51,3 +51,6 @@ output_test.aimovie.json
 # Model weights — keep folder structure, ignore contents
 # Each weight directory has its own .gitignore with: *\n!.gitkeep\n!.gitignore
 # ═══════════════════════════════════════════════════════════════
+
+# Pinned transformers 4.51.3 for CosyVoice2/3 subprocess (rebuild via scripts/setup_tts_transformers.sh)
+vendor/tts_transformers/

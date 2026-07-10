@@ -1,6 +1,7 @@
 """Main application window."""
 
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -9,7 +10,8 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 from ai_movie import config
-from ai_movie.config import WORKSPACE_DIR
+from ai_movie.cache_manager import CacheManager
+from ai_movie.config import PROJECTS_DIR, WORKSPACE_DIR
 from ai_movie.cutter import cut_video
 from ai_movie.asr import LANGUAGES, LANG_LABELS, transcribe_all
 from ai_movie.demuxer import demux_all
@@ -46,6 +48,7 @@ class App:
         ("合成音轨",   "_on_synthesize_audio"),
         ("人物锚定",   "_on_anchor_person"),
         ("口型匹配",   "_on_lip_sync"),
+        ("人脸增强",   "_on_face_enhance"),
         ("合成视频",   "_on_compose_video"),
     ]
 
@@ -56,6 +59,30 @@ class App:
         "done":     ("#d4edda", "#155724", "raised",   "normal"),
         "failed":   ("#f8d7da", "#721c24", "raised",   "normal"),
     }
+
+    # ═══ tab navigation ═══════════════════════════════════════
+
+    def _switch_to_tab(self, step_name: str):
+        """Select the notebook tab for the given step name."""
+        for idx in range(self._notebook.index("end")):
+            if self._notebook.tab(idx, "text") == step_name:
+                self._notebook.select(idx)
+                return
+
+    def _switch_to_next_tab(self, current_step: str):
+        """After a step completes, switch to the next step's tab in the pipeline.
+
+        Skips "合成音轨" (no dedicated tab) and stops at the last step.
+        """
+        step_names = [s[0] for s in self._PIPELINE_STEPS]
+        try:
+            idx = step_names.index(current_step)
+            for next_name in step_names[idx + 1:]:
+                if next_name != "合成音轨" and next_name in self._tab_frames:
+                    self._switch_to_tab(next_name)
+                    return
+        except ValueError:
+            pass
 
     # ═══ init ══════════════════════════════════════════════════
 
@@ -96,6 +123,8 @@ class App:
         file_menu.add_separator()
         file_menu.add_command(label="保存项目", command=self._on_save_project)
         file_menu.add_command(label="加载项目...", command=self._on_load_project)
+        file_menu.add_separator()
+        file_menu.add_command(label="清除缓存...", command=self._on_clear_cache)
         menubar.add_cascade(label="文件", menu=file_menu)
         menubar.add_command(label="退出", command=self._on_exit)
 
@@ -178,7 +207,16 @@ class App:
         _arrow()
         _btn("人物锚定", "_on_anchor_person"); _arrow()
         _btn("口型匹配", "_on_lip_sync");       _arrow()
+        _btn("人脸增强", "_on_face_enhance");    _arrow()
         _btn("合成视频", "_on_compose_video")
+
+        # ── one-click button: large, left-aligned, below 切割视频 ──
+        one_click_btn = tk.Button(
+            inner, text="🚀  一键生成", font=(config.CJK_FONT, 10, "bold"),
+            width=14, height=3, bg="#0078d4", fg="white",
+            activebackground="#005a9e", activeforeground="white",
+            command=self._on_one_click)
+        one_click_btn.grid(row=4, column=0, columnspan=2, padx=1, pady=(10, 4), sticky="w")
 
         self._refresh_toolbar()
 
@@ -258,8 +296,9 @@ class App:
                 progress_cb=self._on_cut_progress,
                 cancel_check=lambda: self._cancel_requested,
             )
-        except Exception as e:
-            self.root.after(0, lambda: self._on_cut_error(str(e)))
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_cut_error(_err))
             return
 
         self.root.after(0, lambda: self._on_cut_done(src, segments))
@@ -292,6 +331,7 @@ class App:
                            f"{len(segments)} 段 → {seg_dir}")
         self._refresh_toolbar()
         self._populate_cut_tab(segments)
+        self._switch_to_next_tab("切割视频")
 
     def _on_cut_error(self, error_msg: str):
         if hasattr(self, "_cut_dlg") and self._cut_dlg.winfo_exists():
@@ -548,8 +588,9 @@ class App:
                 progress_cb=self._on_split_progress,
                 cancel_check=lambda: self._cancel_requested,
             )
-        except Exception as e:
-            self.root.after(0, lambda: self._on_split_error(str(e)))
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_split_error(_err))
             return
         self.root.after(0, lambda: self._on_split_done(results))
 
@@ -578,6 +619,7 @@ class App:
                            f"{len(ok)} ok, {len(errors)} errors")
         self._refresh_toolbar()
         self._populate_split_tab(results)
+        self._switch_to_next_tab("拆分音轨")
 
     def _on_split_error(self, error_msg: str):
         if hasattr(self, "_split_dlg") and self._split_dlg.winfo_exists():
@@ -893,6 +935,7 @@ class App:
                            f"{len(ok)} ok, {len(errors)} errors")
         self._refresh_toolbar()
         self._populate_transcribe_tab(results)
+        self._switch_to_next_tab("转换文字")
 
         # Check if there are errors to report
         if errors:
@@ -1008,15 +1051,28 @@ class App:
         src_lang = src_name_map.get(src_lang_code, "Japanese")
 
         # ── read engine selection ────────────────────────────────
-        engine = getattr(self, "_tl_engine_var", tk.StringVar(value="hy-mt+polish")).get()
+        engine = getattr(self, "_tl_engine_var", tk.StringVar(value="hy-mt2+polish")).get()
         _engine_labels = {
-            "hy-mt": "Hy-MT", "ollama": "Ollama 直翻", "hy-mt+polish": "Hy-MT + 润色",
+            "hy-mt2": "Hy-MT2", "hy-mt2+polish": "Hy-MT2 + 润色",
+            "hy-mt": "Hy-MT1.5", "ollama": "Ollama 直翻", "hy-mt+polish": "Hy-MT + 润色",
         }
         engine_label = _engine_labels.get(engine, engine)
 
+        # ── determine Hy-MT model path ──────────────────────────
+        _hymt_path = config.HYMT2_MODEL_PATH
+        if engine in ("hy-mt", "hy-mt+polish"):
+            _hymt_path = config.TRANSLATION_MODEL_PATH  # Hy-MT1.5
+        # For engine == "ollama" we don't need Hy-MT at all
+
+        # ── read Ollama model (user-selected) ───────────────────
+        ollama_model = getattr(self, "_tl_ollama_model_var", None)
+        ollama_model = ollama_model.get() if ollama_model else config.OLLAMA_MODEL
+
         self.log.mark_step("文本翻译", "running")
         self.log.add_entry("文本翻译", "start",
-                           f"{src_lang}→{target_lang} engine={engine} segs={len(segments)}")
+                           f"{src_lang}→{target_lang} engine={engine}"
+                           f"{' model=' + ollama_model if engine != 'hy-mt' and engine != 'hy-mt2' else ''}"
+                           f" segs={len(segments)}")
         self._refresh_toolbar()
         self._cancel_requested = False
 
@@ -1069,16 +1125,16 @@ class App:
 
         threading.Thread(
             target=self._run_translate,
-            args=(segments, target_lang, src_lang, total, engine),
+            args=(segments, target_lang, src_lang, total, engine, ollama_model, _hymt_path),
             daemon=True,
         ).start()
 
     def _on_cancel_translate(self):
         self._cancel_requested = True
 
-    def _run_translate(self, segments, target_lang, src_lang, total, engine="hy-mt+polish"):
-        # ── Hy-MT + Ollama polish (two-stage) ───────────────────
-        if engine == "hy-mt+polish":
+    def _run_translate(self, segments, target_lang, src_lang, total, engine="hy-mt2+polish", ollama_model=None, hymt_path=None):
+        # ── Hy-MT2 + Ollama polish (two-stage) ──────────────────
+        if engine in ("hy-mt+polish", "hy-mt2+polish"):
             from ai_movie.translator import translate, polish_ollama
             try:
                 # Stage 1: accurate translation via Hy-MT
@@ -1086,6 +1142,7 @@ class App:
                     segments,
                     target_lang=target_lang,
                     src_lang=src_lang,
+                    model_path=hymt_path,
                     progress_cb=self._on_tl_progress,
                     cancel_check=lambda: self._cancel_requested,
                 )
@@ -1094,14 +1151,16 @@ class App:
                 # Stage 2: colloquial polish via Ollama
                 results = polish_ollama(
                     results,
+                    model=ollama_model,
                     progress_cb=self._on_tl_progress,
                     segment_cb=lambda idx, text: self._on_tl_segment(segments, idx, text),
                     cancel_check=lambda: self._cancel_requested,
                 )
-            except Exception as e:
-                self.root.after(0, lambda: self._on_translate_error(str(e)))
+            except Exception as exc:
+                _err = str(exc)
+                self.root.after(0, lambda: self._on_translate_error(_err))
                 return
-            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine))
+            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine, ollama_model))
 
         # ── Ollama direct translation ──────────────────────────
         elif engine == "ollama":
@@ -1111,16 +1170,18 @@ class App:
                     segments,
                     target_lang=target_lang,
                     src_lang=src_lang,
+                    model=ollama_model,
                     progress_cb=self._on_tl_progress,
                     segment_cb=lambda idx, text: self._on_tl_segment(segments, idx, text),
                     cancel_check=lambda: self._cancel_requested,
                 )
-            except Exception as e:
-                self.root.after(0, lambda: self._on_translate_error(str(e)))
+            except Exception as exc:
+                _err = str(exc)
+                self.root.after(0, lambda: self._on_translate_error(_err))
                 return
-            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine))
+            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine, ollama_model))
 
-        # ── Hy-MT only ─────────────────────────────────────────
+        # ── Hy-MT only (Hy-MT2 or Hy-MT1.5) ────────────────────
         else:
             from ai_movie.translator import translate
             try:
@@ -1128,13 +1189,15 @@ class App:
                     segments,
                     target_lang=target_lang,
                     src_lang=src_lang,
+                    model_path=hymt_path,
                     progress_cb=self._on_tl_progress,
                     cancel_check=lambda: self._cancel_requested,
                 )
-            except Exception as e:
-                self.root.after(0, lambda: self._on_translate_error(str(e)))
+            except Exception as exc:
+                _err = str(exc)
+                self.root.after(0, lambda: self._on_translate_error(_err))
                 return
-            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine))
+            self.root.after(0, lambda: self._on_translate_done(results, target_lang, engine, ollama_model))
 
     def _on_tl_progress(self, current: int, total: int):
         self.root.after(0, lambda: self._update_tl_dialog(current, total))
@@ -1166,21 +1229,25 @@ class App:
         except Exception:
             pass
 
-    def _on_translate_done(self, results, target_lang, engine="hy-mt"):
+    def _on_translate_done(self, results, target_lang, engine="hy-mt", ollama_model=None):
         if hasattr(self, "_tl_dlg") and self._tl_dlg.winfo_exists():
             self._tl_dlg.destroy()
 
         self.log.mark_step("文本翻译", "done")
-        self.log.set_step_data("文本翻译", {
+        log_data = {
             "target_lang": target_lang,
             "engine": engine,
             "segments": results,
             "count": len(results),
-        })
+        }
+        if ollama_model:
+            log_data["ollama_model"] = ollama_model
+        self.log.set_step_data("文本翻译", log_data)
         self.log.add_entry("文本翻译", "done",
                            f"{len(results)} segments → {target_lang}")
         self._refresh_toolbar()
         self._populate_translate_tab(results, target_lang)
+        self._switch_to_next_tab("文本翻译")
 
     def _on_translate_error(self, error_msg: str):
         if hasattr(self, "_tl_dlg") and self._tl_dlg.winfo_exists():
@@ -1196,8 +1263,16 @@ class App:
         self._tl_text.delete("1.0", "end")
 
         tl_label = self._tl_lang_var.get()
-        self._tl_text.insert("1.0",
-            f"目标语言: {tl_label}  —  共 {len(segments)} 句\n\n")
+        engine = getattr(self, "_tl_engine_var", None)
+        engine_label = engine.get() if engine else "hy-mt+polish"
+        ollama_model = getattr(self, "_tl_ollama_model_var", None)
+        ollama_model_str = ollama_model.get() if ollama_model else ""
+
+        header = f"目标语言: {tl_label}  |  引擎: {engine_label}"
+        if engine_label not in ("hy-mt", "hy-mt2") and ollama_model_str:
+            header += f"  |  Ollama: {ollama_model_str}"
+        header += f"  |  共 {len(segments)} 句\n\n"
+        self._tl_text.insert("1.0", header)
 
         from collections import defaultdict
         by_source = defaultdict(list)
@@ -1222,10 +1297,28 @@ class App:
 
     def _build_separate_tab(self, tab: ttk.Frame):
         """Tab showing separated vocals + background audio with play buttons."""
+        # ── backend selector ─────────────────────────────────────
+        bar = ttk.Frame(tab, padding=(10, 8))
+        bar.pack(fill="x")
+
+        ttk.Label(bar, text="分离引擎：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 8))
+
+        self._sep_backend_var = tk.StringVar(value="uvr")
+        ttk.Radiobutton(
+            bar, text="Demucs (GPU，稳定)",
+            variable=self._sep_backend_var, value="demucs",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            bar, text="UVR Mel-Band RoiFormer (GPU，需下载模型)",
+            variable=self._sep_backend_var, value="uvr",
+        ).pack(side="left")
+
+        # ── result area ──────────────────────────────────────────
         self._sep_result_frame = ttk.Frame(tab)
         self._sep_result_frame.pack(expand=True, fill="both")
 
-        placeholder = tk.Label(self._sep_result_frame, text="点击工具栏「人声分离」执行。",
+        placeholder = tk.Label(self._sep_result_frame, text="选择引擎后点击工具栏「人声分离」执行。\n默认：Demucs (GPU)",
                                fg="#aaa", font=(config.CJK_FONT, 13))
         placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -1242,6 +1335,7 @@ class App:
             ("自动检测性别", "gender"),
             ("全部女声（中文女）", "female"),
             ("全部男声（中文男）", "male"),
+            ("台湾柔和女声（妩媚）", "style"),
         ]:
             ttk.Radiobutton(mode_bar, text=text,
                             variable=self._tts_mode_var,
@@ -1480,37 +1574,41 @@ class App:
             messagebox.showwarning("提示", "请先加载视频文件。")
             return
 
+        backend = self._sep_backend_var.get()
+        backend_label = {"demucs": "Demucs (GPU)", "uvr": "UVR Mel-Band RoiFormer"}.get(backend, backend)
+
         self.log.mark_step("人声分离", "running")
-        self.log.add_entry("人声分离", "start")
+        self.log.add_entry("人声分离", "start", f"backend={backend}")
         self._refresh_toolbar()
         self._cancel_requested = False
 
         self._sep_dlg = tk.Toplevel(self.root)
-        self._sep_dlg.title("人声分离")
-        self._sep_dlg.geometry("360x140")
+        self._sep_dlg.title(f"人声分离 — {backend_label}")
+        self._sep_dlg.geometry("400x150")
         self._sep_dlg.transient(self.root)
         self._sep_dlg.grab_set()
         self._sep_dlg.resizable(False, False)
 
-        ttk.Label(self._sep_dlg, text="正在分离人声与背景音…",
+        ttk.Label(self._sep_dlg, text=f"正在分离人声与背景音…\n引擎：{backend_label}",
                   font=(config.CJK_FONT, 11)).pack(pady=(12, 8))
-        self._bar_sep = ttk.Progressbar(self._sep_dlg, length=320,
+        self._bar_sep = ttk.Progressbar(self._sep_dlg, length=360,
                                          mode="indeterminate")
         self._bar_sep.pack(padx=20, pady=10)
         self._bar_sep.start(10)
 
-        threading.Thread(target=self._run_separate, args=(ref_audio,), daemon=True).start()
+        threading.Thread(target=self._run_separate, args=(ref_audio, backend), daemon=True).start()
 
-    def _run_separate(self, ref_audio):
+    def _run_separate(self, ref_audio, backend="demucs"):
         import ai_movie.composer as composer
         try:
-            sep = composer.separate_vocals(ref_audio)
-        except Exception as e:
-            self.root.after(0, lambda: self._on_separate_error(str(e)))
+            sep = composer.separate_vocals(ref_audio, backend=backend)
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_separate_error(_err))
             return
-        self.root.after(0, lambda: self._on_separate_done(sep))
+        self.root.after(0, lambda: self._on_separate_done(sep, backend))
 
-    def _on_separate_done(self, sep):
+    def _on_separate_done(self, sep, backend="demucs"):
         if hasattr(self, "_sep_dlg") and self._sep_dlg.winfo_exists():
             self._sep_dlg.destroy()
         self.log.mark_step("人声分离", "done")
@@ -1519,9 +1617,10 @@ class App:
             "background": str(sep["background"]),
         })
         self.log.add_entry("人声分离", "done",
-                           f"vocals={sep['vocals']}, bg={sep['background']}")
+                           f"backend={backend} vocals={sep['vocals']}, bg={sep['background']}")
         self._refresh_toolbar()
         self._populate_separate_tab(sep["vocals"], sep["background"])
+        self._switch_to_next_tab("人声分离")
         messagebox.showinfo("分离完成", f"人声：{sep['vocals']}\n背景音：{sep['background']}")
 
     def _on_separate_error(self, error_msg):
@@ -1566,14 +1665,20 @@ class App:
         ttk.Button(self._gen_dlg, text="取消",
                    command=self._on_cancel_generate).pack(pady=12)
 
-        # Pre-load CosyVoice model on main thread to avoid thread-safety issues
-        import ai_movie.tts as tts_mod
-        tts_mod._load_model()
-
         out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
         voice_mode = getattr(self, "_tts_mode_var", None)
         voice_mode = voice_mode.get() if voice_mode else "gender"
         self._gen_voice_mode = voice_mode
+
+        # Resolve which model will be used.  SFT (CosyVoice-300M) runs
+        # in-process on the main thread; Qwen models (CosyVoice2/3) run in an
+        # isolated subprocess (transformers 4.51.3) — see ai_movie/tts_worker.py.
+        # "台湾柔和女声" needs an instruct2-capable model (CosyVoice3/2), not SFT.
+        import ai_movie.tts as tts_mod
+        prefer = "cosyvoice3" if voice_mode == "style" else None
+        self._gen_choice = tts_mod.resolve_model_choice(prefer)
+        if self._gen_choice == "sft":
+            tts_mod._load_model(prefer=prefer)   # main-thread in-process load
         algo = getattr(self, "_tts_algo_var", None)
         self._gen_algo = algo.get() if algo else "f0_per_seg"
         self._gen_ecapa_result = None   # filled below for ecapa mode
@@ -1584,6 +1689,15 @@ class App:
         elif voice_mode == "male":
             ref_audio, ref_text, ref_method = tts_mod._SFT_MALE_SPK, None, "sft"
             self._lbl_gen_prog.configure(text="固定使用：中文男")
+        elif voice_mode == "style":
+            # Taiwanese / soft female via CosyVoice3 instruct2 (fixed for all segs)
+            ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+                vocals_path, mode="style", cache_dir=out_dir)
+            if self._gen_choice == "sft":
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "提示", "台湾柔和女声需要 CosyVoice3/2 模型，"
+                    "当前仅有 SFT，已退回音色克隆模式。"))
+            self._lbl_gen_prog.configure(text="台湾柔和女声（instruct2）…")
         else:
             ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
                 vocals_path, mode="gender", cache_dir=out_dir)
@@ -1601,6 +1715,13 @@ class App:
         self._gen_idx = 0
         self._gen_results: list[dict] = []
         self._gen_tts_mod = tts_mod
+
+        # Qwen models (CosyVoice2/3, any non-SFT method) synthesize in an
+        # isolated subprocess; batch the whole run there instead of the
+        # in-process per-segment root.after() loop.
+        if ref_method != "sft":
+            self._run_isolated_generate()
+            return
 
         if voice_mode == "gender" and self._gen_algo == "ecapa":
             self._lbl_gen_prog.configure(text="ECAPA：正在分析说话人（约30-60秒）…")
@@ -1631,6 +1752,47 @@ class App:
         """Kick off the per-segment TTS root.after() loop."""
         if not self._cancel_requested:
             self.root.after(0, self._process_next_generate)
+
+    def _run_isolated_generate(self):
+        """Synthesize all segments via the isolated CosyVoice2/3 subprocess.
+
+        Runs in a background thread (the subprocess owns the main-thread
+        requirement); progress and completion are marshalled back onto the
+        Tk main thread with ``root.after``.
+        """
+        tts_mod = self._gen_tts_mod
+        segments = self._gen_segments
+        seg_texts = [(i, s.get("text_translated", "").strip())
+                     for i, s in enumerate(segments)]
+        total = len(segments)
+
+        def _progress(done, _total):
+            self.root.after(0, lambda d=done: (
+                self._bar_gen.configure(value=d),
+                self._lbl_gen_prog.configure(text=f"{d} / {total}（隔离进程合成）"))
+                if hasattr(self, "_gen_dlg") and self._gen_dlg.winfo_exists() else None)
+
+        def _worker():
+            try:
+                items = tts_mod.run_isolated_synthesis(
+                    seg_texts, self._gen_choice,
+                    self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method,
+                    self._gen_output_dir,
+                    progress_cb=_progress,
+                    cancel_check=lambda: self._cancel_requested,
+                )
+                results = []
+                for i, seg in enumerate(segments):
+                    it = items.get(i, {})
+                    r = {**seg, "audio": it.get("audio")}
+                    if it.get("tts_error"):
+                        r["tts_error"] = it["tts_error"]
+                    results.append(r)
+                self.root.after(0, lambda: self._on_generate_done(results))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_generate_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_cancel_generate(self):
         self._cancel_requested = True
@@ -1709,6 +1871,7 @@ class App:
         self.log.add_entry("人声生成", "done", f"{ok}/{len(results)} segments")
         self._refresh_toolbar()
         self._populate_generate_tab(results)
+        self._switch_to_next_tab("人声生成")
         messagebox.showinfo("生成完成", f"语音生成完成：{ok}/{len(results)} 个片段")
 
     def _on_generate_error(self, error_msg):
@@ -1757,8 +1920,9 @@ class App:
             mixed_path = out_dir / "final_audio.wav"
             # Pass full segment dicts — mix_audio uses start/end for time alignment
             composer.mix_audio(gen_results, bg_path, mixed_path)
-        except Exception as e:
-            self.root.after(0, lambda: self._on_remix_error(str(e)))
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_remix_error(_err))
             return
         self.root.after(0, lambda: self._on_remix_done(mixed_path))
 
@@ -1770,6 +1934,7 @@ class App:
         self.log.add_entry("重新混音", "done", str(mixed_path))
         self._refresh_toolbar()
         self._populate_remix_tab(mixed_path)
+        self._switch_to_next_tab("重新混音")
         messagebox.showinfo("混音完成", f"混音完成：\n{mixed_path}")
 
     def _on_remix_error(self, error_msg):
@@ -1860,14 +2025,27 @@ class App:
         audio from the original source file.  Use this for Demucs
         background separation so the background length matches the
         full video.
+
+        The audio is saved to a stable workspace path so Demucs outputs
+        (vocals.wav / background.wav) land in a known location and are
+        not overwritten by other projects.
         """
         if self.log.video_path:
-            import tempfile
-            tmp = Path(tempfile.mktemp(suffix=".wav"))
-            subprocess.run([
-                "ffmpeg", "-y", "-i", self.log.video_path,
-                "-vn", "-ar", "16000", "-ac", "1", str(tmp),
-            ], check=True, capture_output=True)
+            out_dir = ensure_dir(WORKSPACE_DIR / "separated")
+            # Use video hash to avoid cross-project contamination
+            import hashlib
+            vid_hash = hashlib.md5(str(self.log.video_path).encode()).hexdigest()[:8]
+            tmp = out_dir / f"full_audio_{vid_hash}.wav"
+
+            # Only re-extract if the file doesn't exist or is stale
+            if not tmp.exists():
+                # Keep native sample rate for Demucs quality — don't downsample!
+                # Demucs needs 44100 Hz for best separation; 16000 Hz loses
+                # critical high-frequency content that distinguishes music.
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", self.log.video_path,
+                    "-vn", "-ac", "1", str(tmp),
+                ], check=True, capture_output=True)
             return tmp
         return None
 
@@ -1933,7 +2111,7 @@ class App:
         import ai_movie.composer as composer
         try:
             self._update_syn_stage("Step 1/3: 分离人声与背景音…")
-            sep = composer.separate_vocals(ref_audio)
+            sep = composer.separate_vocals(ref_audio, backend=self._sep_backend_var.get())
             if self._cancel_requested:
                 return
             self.log.mark_step("人声分离", "done")
@@ -1941,8 +2119,9 @@ class App:
                 "vocals": str(sep["vocals"]), "background": str(sep["background"])})
             self.root.after(0, lambda: self._populate_separate_tab(
                 str(sep["vocals"]), str(sep["background"])))
-        except Exception as e:
-            self.root.after(0, lambda: self._on_synthesize_error(str(e)))
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_synthesize_error(_err))
             return
         # Stage 2 must run on main thread
         self.root.after(0, lambda: self._start_syn_tts(segments, sep))
@@ -1953,10 +2132,16 @@ class App:
             return
         import ai_movie.tts as tts_mod
         self._update_syn_stage("Step 2/3: 合成语音…")
-        tts_mod._load_model()
-        out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
         mode = getattr(self, "_tts_mode_var", None)
         mode = mode.get() if mode else "gender"
+        self._gen_voice_mode = mode  # per-segment loop reads this
+        # 台湾柔和女声 uses instruct2 (CosyVoice3/2 only), not SFT.
+        # SFT loads in-process; Qwen models synthesize in an isolated subprocess.
+        prefer = "cosyvoice3" if mode == "style" else None
+        self._gen_choice = tts_mod.resolve_model_choice(prefer)
+        if self._gen_choice == "sft":
+            tts_mod._load_model(prefer=prefer)
+        out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
         ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
             sep["vocals"], mode=mode, cache_dir=out_dir
         )
@@ -1970,7 +2155,45 @@ class App:
         self._syn_idx = 0
         self._syn_results: list[dict] = []
         self._syn_tts_mod = tts_mod
+        if ref_method != "sft":
+            self._run_isolated_syn_tts()
+            return
         self.root.after(50, self._process_next_syn_segment)
+
+    def _run_isolated_syn_tts(self):
+        """合成音轨: batch Qwen (CosyVoice2/3) synthesis via the subprocess."""
+        tts_mod = self._syn_tts_mod
+        segments = self._syn_segments
+        seg_texts = [(i, s.get("text_translated", "").strip())
+                     for i, s in enumerate(segments)]
+        total = len(segments)
+
+        def _progress(done, _total):
+            self.root.after(0, lambda d=done: self._update_syn_stage(
+                f"Step 2/3: 合成语音…（隔离进程 {d}/{total}）"))
+
+        def _worker():
+            try:
+                items = tts_mod.run_isolated_synthesis(
+                    seg_texts, self._gen_choice,
+                    self._syn_vocals_ref, self._syn_ref_text, self._syn_ref_method,
+                    self._syn_output_dir,
+                    progress_cb=_progress,
+                    cancel_check=lambda: self._cancel_requested,
+                )
+                results = []
+                for i, seg in enumerate(segments):
+                    it = items.get(i, {})
+                    r = {**seg, "audio": it.get("audio")}
+                    if it.get("tts_error"):
+                        r["tts_error"] = it["tts_error"]
+                    results.append(r)
+                self._syn_results = results
+                self.root.after(0, self._finish_syn_tts)
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_synthesize_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _process_next_syn_segment(self):
         """Main-thread TTS loop for 合成音轨 (mirrors _process_next_generate)."""
@@ -2044,8 +2267,9 @@ class App:
                 return
             self.log.mark_step("重新混音", "done")
             self.log.set_step_data("重新混音", {"mixed_audio": str(mixed_path)})
-        except Exception as e:
-            self.root.after(0, lambda: self._on_synthesize_error(str(e)))
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_synthesize_error(_err))
             return
         self.root.after(0, lambda: self._on_synthesize_done(results, mixed_path))
 
@@ -2057,6 +2281,7 @@ class App:
         self.log.set_step_data("合成音轨", {"mixed_audio": str(mixed_path), "ok": ok})
         self.log.add_entry("合成音轨", "done", f"{ok} segments → {mixed_path}")
         self._refresh_toolbar()
+        self._switch_to_next_tab("合成音轨")
         messagebox.showinfo("合成完成",
             f"配音合成完成：{ok}/{len(results)} 个片段\n输出：{mixed_path}")
 
@@ -2078,23 +2303,31 @@ class App:
             messagebox.showwarning("提示", "请先完成「重新混音」或「合成音轨」步骤。")
             return
 
-        # Use the original full video when it was cut into segments;
-        # otherwise use the silent video from the demux step.
-        cut_data = self.log.step_data.get("切割视频", {})
-        has_cuts = bool(cut_data.get("segments"))
-        if has_cuts and self.log.video_path:
-            video_path = Path(self.log.video_path)
+        # Prefer face-enhanced video, then lip-synced video, if available
+        enh_output = self.log.step_data.get("人脸增强", {}).get("output_video")
+        ls_output = self.log.step_data.get("口型匹配", {}).get("output_video")
+        if enh_output and Path(enh_output).exists():
+            video_path = Path(enh_output)
+        elif ls_output and Path(ls_output).exists():
+            video_path = Path(ls_output)
         else:
-            split_data = self.log.step_data.get("拆分音轨", {})
-            split_results = split_data.get("results", [])
-            video_path = None
-            if split_results:
-                for r in split_results:
-                    if "error" not in r:
-                        p = Path(r.get("video", ""))
-                        if p.exists() and p.suffix in (".mp4", ".mkv", ".mov"):
-                            video_path = p
-                            break
+            # Use the original full video when it was cut into segments;
+            # otherwise use the silent video from the demux step.
+            cut_data = self.log.step_data.get("切割视频", {})
+            has_cuts = bool(cut_data.get("segments"))
+            if has_cuts and self.log.video_path:
+                video_path = Path(self.log.video_path)
+            else:
+                split_data = self.log.step_data.get("拆分音轨", {})
+                split_results = split_data.get("results", [])
+                video_path = None
+                if split_results:
+                    for r in split_results:
+                        if "error" not in r:
+                            p = Path(r.get("video", ""))
+                            if p.exists() and p.suffix in (".mp4", ".mkv", ".mov"):
+                                video_path = p
+                                break
         if video_path is None or not video_path.exists():
             messagebox.showwarning("提示", "未找到视频文件。")
             return
@@ -2139,8 +2372,9 @@ class App:
             out_path = out_dir / f"{Path(video_path).stem}_dubbed.mp4"
             composer.compose_video(video_path, audio_path, out_path,
                                    progress_cb=_upd)
-        except Exception as e:
-            self.root.after(0, lambda: self._on_compose_error(str(e)))
+        except Exception as exc:
+            _err = str(exc)
+            self.root.after(0, lambda: self._on_compose_error(_err))
             return
         self.root.after(0, lambda: self._on_compose_done(out_path))
 
@@ -2152,6 +2386,7 @@ class App:
         self.log.add_entry("合成视频", "done", str(out_path))
         self._refresh_toolbar()
         self._populate_compose_tab(out_path)
+        self._switch_to_next_tab("合成视频")
         messagebox.showinfo("合成完成", f"配音视频已生成：\n{out_path}")
 
     def _populate_compose_tab(self, out_path: Path):
@@ -2189,8 +2424,75 @@ class App:
         # Auto-load in left player
         self._load_composed_video(p)
 
+    def _populate_lipsync_tab(self, output_path: Path):
+        """Show finished lip-sync result in the 口型匹配 tab and auto-play in left player."""
+        tab = self._tab_frames.get("口型匹配")
+        if tab is None:
+            return
+        for w in tab.winfo_children():
+            w.destroy()
+
+        f = ttk.Frame(tab, padding=20)
+        f.pack(expand=True)
+
+        tk.Label(f, text="✓ 口型匹配完成", font=(config.CJK_FONT, 14, "bold"),
+                 fg="#155724").pack(pady=(0, 12))
+
+        info_frame = ttk.LabelFrame(f, text="输出文件", padding=10)
+        info_frame.pack(fill="x", pady=(0, 16))
+        p = Path(output_path)
+        size_mb = p.stat().st_size / 1e6 if p.exists() else 0
+
+        # Get video duration
+        try:
+            import cv2
+            cap = cv2.VideoCapture(str(p))
+            if cap.isOpened():
+                frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                dur_sec = frames / fps if fps > 0 else 0
+                dur_str = f"{int(dur_sec // 60)}:{int(dur_sec % 60):02d}  ({fps:.1f} fps)"
+                cap.release()
+            else:
+                dur_str = "—"
+        except Exception:
+            dur_str = "—"
+
+        tk.Label(info_frame, text=str(p), font=(config.MONO_FONT, 8),
+                 fg="#555", wraplength=500).pack(anchor="w")
+        tk.Label(info_frame, text=f"大小：{size_mb:.1f} MB    时长：{dur_str}",
+                 font=(config.CJK_FONT, 9), fg="#666").pack(anchor="w", pady=(4, 0))
+
+        # Driving audio source info
+        ls_data = self.log.step_data.get("口型匹配", {})
+        audio_src = ls_data.get("driving_audio_source", "—")
+        tk.Label(info_frame, text=f"驱动音频：{audio_src}",
+                 font=(config.CJK_FONT, 9), fg="#666").pack(anchor="w", pady=(2, 0))
+
+        btn_frame = ttk.Frame(f)
+        btn_frame.pack()
+        tk.Button(btn_frame, text="▶  在左侧播放", font=(config.CJK_FONT, 11),
+                  command=lambda: self._load_lipsync_video(p)).pack(
+                      side="left", padx=8)
+        tk.Button(btn_frame, text="📂  打开所在目录", font=(config.CJK_FONT, 10),
+                  command=lambda: subprocess.Popen(
+                      ["xdg-open", str(p.parent)])).pack(side="left", padx=8)
+
+        # Auto-load in left player
+        self._load_lipsync_video(p)
+
+    def _load_lipsync_video(self, path: Path):
+        """Load a lip-synced video into the left player."""
+        try:
+            self._on_stop()
+            self.left_player.load(path)
+            self._is_playing = True
+            self._btn_play.configure(text="⏸")
+        except Exception as e:
+            messagebox.showwarning("播放失败", str(e))
+
     def _load_composed_video(self, path: Path):
-        """Load the composed video into the left player."""
+        """Load a composed video into the left player."""
         try:
             self._on_stop()
             self.left_player.load(path)
@@ -2207,23 +2509,1387 @@ class App:
         self._refresh_toolbar()
         messagebox.showerror("合成失败", error_msg)
 
+    # ═══ one-click pipeline ═════════════════════════════════════
+
+    def _on_one_click(self):
+        """Show the one-click pipeline dialog with all step options."""
+        if self.log.video_path is None:
+            messagebox.showwarning("提示", "请先加载视频文件。")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("一键生成 — 流水线配置")
+        dlg.geometry("600x680")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(True, True)
+
+        # ── scrollable canvas ───────────────────────────────────
+        canvas = tk.Canvas(dlg, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(dlg, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        scroll_frame.bind("<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _mw(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _mw)
+        dlg.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        # ── variables ───────────────────────────────────────────
+        vars_dict = {}
+
+        # Pre-compute completed steps so we can uncheck them by default
+        completed_steps = {name for name, status in self.log.steps.items()
+                           if status == "done"}
+
+        def _add_section(title: str, key: str, step_name: str = "", **kw):
+            """Add a collapsible-like section with checkbox."""
+            frm = ttk.LabelFrame(scroll_frame, text="", padding=(10, 6))
+            frm.pack(fill="x", padx=12, pady=4)
+
+            # Auto-uncheck if this step is already done
+            default_enabled = kw.pop("enabled", True)
+            if step_name and step_name in completed_steps:
+                default_enabled = False
+            enabled = tk.BooleanVar(value=default_enabled)
+            vars_dict[f"{key}_enabled"] = enabled
+
+            hdr = ttk.Frame(frm); hdr.pack(fill="x")
+            cb = ttk.Checkbutton(hdr, text=title, variable=enabled)
+            cb.pack(side="left")
+
+            content = ttk.Frame(frm)
+            content.pack(fill="x", padx=(24, 0), pady=(4, 0))
+
+            def _toggle():
+                state = "normal" if enabled.get() else "disabled"
+                for child in content.winfo_children():
+                    try: child.configure(state=state)
+                    except Exception: pass
+            enabled.trace_add("write", lambda *_: _toggle())
+            _toggle()
+
+            return content
+
+        # ── 1. 切割视频 ─────────────────────────────────────────
+        sec1 = _add_section("1. 切割视频（将视频按静音分片）", "cut", step_name="切割视频")
+        ttk.Label(sec1, text="片段时长上限：180 秒", foreground="#888").pack(anchor="w")
+
+        # ── 2. 拆分音轨 ─────────────────────────────────────────
+        sec2 = _add_section("2. 拆分音轨（分离视频轨和音频轨）", "split", step_name="拆分音轨")
+
+        # ── 3. 转换文字 (ASR) ───────────────────────────────────
+        sec3 = _add_section("3. 转换文字（语音识别）", "asr", step_name="转换文字")
+        asr_bar = ttk.Frame(sec3); asr_bar.pack(fill="x", pady=(2, 2))
+        ttk.Label(asr_bar, text="语言：").pack(side="left")
+        asr_lang_var = tk.StringVar(value=LANG_LABELS[0])
+        vars_dict["asr_lang"] = asr_lang_var
+        ttk.Combobox(asr_bar, textvariable=asr_lang_var,
+                     values=LANG_LABELS, state="readonly", width=10).pack(side="left", padx=(4, 12))
+        ttk.Label(asr_bar, text="引擎：").pack(side="left")
+        asr_eng_labels = ["faster-whisper (CPU+VAD)", "openai-whisper (GPU+VAD)", "自动选择"]
+        asr_eng_vals = ["faster-whisper", "openai-whisper", "auto"]
+        asr_eng_var = tk.StringVar(value=asr_eng_labels[1])
+        vars_dict["asr_engine"] = asr_eng_var
+        vars_dict["_asr_eng_map"] = dict(zip(asr_eng_labels, asr_eng_vals))
+        ttk.Combobox(asr_bar, textvariable=asr_eng_var,
+                     values=asr_eng_labels, state="readonly", width=24).pack(side="left")
+
+        # ── 4. 文本翻译 ─────────────────────────────────────────
+        sec4 = _add_section("4. 文本翻译", "translate", step_name="文本翻译")
+        tl_bar1 = ttk.Frame(sec4); tl_bar1.pack(fill="x", pady=(2, 2))
+        ttk.Label(tl_bar1, text="目标语言：").pack(side="left")
+        from ai_movie.translator import TARGET_LANG_LABELS
+        tl_lang_var = tk.StringVar(value=TARGET_LANG_LABELS[0])
+        vars_dict["tl_lang"] = tl_lang_var
+        ttk.Combobox(tl_bar1, textvariable=tl_lang_var,
+                     values=TARGET_LANG_LABELS, state="readonly", width=10).pack(side="left", padx=(4, 12))
+        ttk.Label(tl_bar1, text="引擎：").pack(side="left")
+        tl_eng_labels = ["Hy-MT2 + 润色", "Hy-MT2", "Hy-MT1.5", "Hy-MT1.5 + 润色", "Ollama 直翻"]
+        tl_eng_vals = ["hy-mt2+polish", "hy-mt2", "hy-mt", "hy-mt+polish", "ollama"]
+        tl_eng_var = tk.StringVar(value=tl_eng_labels[0])
+        vars_dict["tl_engine"] = tl_eng_var
+        vars_dict["_tl_eng_map"] = dict(zip(tl_eng_labels, tl_eng_vals))
+        ttk.Combobox(tl_bar1, textvariable=tl_eng_var,
+                     values=tl_eng_labels, state="readonly", width=14).pack(side="left")
+        tl_bar2 = ttk.Frame(sec4); tl_bar2.pack(fill="x", pady=(2, 0))
+        ttk.Label(tl_bar2, text="Ollama 模型（润色/直翻时使用）：").pack(side="left")
+        ollama_model_var = tk.StringVar(value=config.OLLAMA_MODEL)
+        vars_dict["tl_ollama"] = ollama_model_var
+        ttk.Entry(tl_bar2, textvariable=ollama_model_var, width=30).pack(side="left", padx=(4, 0))
+
+        # ── 5. 人声分离 ─────────────────────────────────────────
+        sec5 = _add_section("5. 人声分离（分离人声和背景音）", "separate", step_name="人声分离")
+        sep_bar = ttk.Frame(sec5); sep_bar.pack(fill="x")
+        sep_backend_var = tk.StringVar(value="uvr")
+        vars_dict["sep_backend"] = sep_backend_var
+        ttk.Radiobutton(sep_bar, text="Demucs (GPU，稳定)", variable=sep_backend_var, value="demucs").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(sep_bar, text="UVR Mel-Band RoiFormer (GPU，高质量)", variable=sep_backend_var, value="uvr").pack(side="left")
+
+        # ── 6. 人声生成 (TTS) ───────────────────────────────────
+        sec6 = _add_section("6. 人声生成（TTS 语音合成）", "tts", step_name="人声生成")
+        tts_mode_bar = ttk.Frame(sec6); tts_mode_bar.pack(fill="x")
+        tts_mode_var = tk.StringVar(value="gender")
+        vars_dict["tts_mode"] = tts_mode_var
+        ttk.Label(tts_mode_bar, text="声音：").pack(side="left")
+        for text, val in [("自动检测性别", "gender"), ("全部女声", "female"),
+                          ("全部男声", "male"), ("台湾柔和女声", "style")]:
+            ttk.Radiobutton(tts_mode_bar, text=text, variable=tts_mode_var, value=val).pack(side="left", padx=(6, 2))
+
+        # ── TTS engine selector ─────────────────────────────────
+        tts_eng_bar = ttk.Frame(sec6); tts_eng_bar.pack(fill="x", pady=(4, 0))
+        ttk.Label(tts_eng_bar, text="引擎：", foreground="#555").pack(side="left")
+        import ai_movie.tts as _tts_mod
+        _avail = _tts_mod.get_available_models()
+        tts_eng_labels = [_tts_mod.model_display_name(k) for k in _avail]
+        tts_eng_vals = _avail  # keys: "sft", "cosyvoice3", …
+        tts_eng_var = tk.StringVar(value=tts_eng_labels[0] if tts_eng_labels else "CosyVoice-300M-SFT（内置音色，推荐）")
+        vars_dict["tts_model"] = tts_eng_var
+        vars_dict["_tts_model_map"] = dict(zip(tts_eng_labels, tts_eng_vals))
+        ttk.Combobox(tts_eng_bar, textvariable=tts_eng_var,
+                     values=tts_eng_labels, state="readonly", width=34).pack(side="left", padx=(4, 0))
+
+        tts_algo_bar = ttk.Frame(sec6); tts_algo_bar.pack(fill="x", pady=(2, 0))
+        tts_algo_var = tk.StringVar(value="f0_per_seg")
+        vars_dict["tts_algo"] = tts_algo_var
+        ttk.Label(tts_algo_bar, text="算法：", foreground="#555").pack(side="left")
+        for text, val in [("F0逐片段", "f0_per_seg"), ("F0全局", "f0_global"), ("ECAPA日志", "ecapa")]:
+            ttk.Radiobutton(tts_algo_bar, text=text, variable=tts_algo_var, value=val).pack(side="left", padx=(6, 2))
+
+        # Detection algorithm only applies to "自动检测性别" — grey it out otherwise.
+        def _oc_update_algo_state(*_):
+            state = "normal" if tts_mode_var.get() == "gender" else "disabled"
+            for w in tts_algo_bar.winfo_children():
+                try: w.configure(state=state)
+                except Exception: pass
+        tts_mode_var.trace_add("write", _oc_update_algo_state)
+        _oc_update_algo_state()
+
+        # ── 7. 重新混音 ─────────────────────────────────────────
+        _add_section("7. 重新混音（合成人声 + 背景音）", "remix", step_name="重新混音")
+
+        # ── 8. 口型匹配 ─────────────────────────────────────────
+        sec8 = _add_section("8. 口型匹配（唇形同步）", "lipsync", step_name="口型匹配")
+        ls_bar = ttk.Frame(sec8); ls_bar.pack(fill="x")
+        ttk.Label(ls_bar, text="引擎：").pack(side="left")
+        ls_eng_var = tk.StringVar(value="自动检测")
+        vars_dict["ls_engine"] = ls_eng_var
+        ttk.Combobox(ls_bar, textvariable=ls_eng_var,
+                     values=["自动检测", "MuseTalk (256x256)", "Wav2Lip (96x96)"],
+                     state="readonly", width=22).pack(side="left", padx=(4, 0))
+
+        # ── 9. 人脸增强（可选） ──────────────────────────────────
+        from ai_movie.face_restore import codeformer_available, face_parser_available
+        sec9 = _add_section("9. 人脸增强（CodeFormer 修复嘴部，可选）", "face_enhance",
+                            step_name="人脸增强", enabled=False)
+        fe_bar = ttk.Frame(sec9); fe_bar.pack(fill="x")
+        ttk.Label(fe_bar, text="保真度：").pack(side="left")
+        fe_fidelity_var = tk.DoubleVar(value=0.7)
+        vars_dict["fe_fidelity"] = fe_fidelity_var
+        ttk.Scale(fe_bar, from_=0.0, to=1.0, orient="horizontal", length=120,
+                  variable=fe_fidelity_var).pack(side="left", padx=(4, 0))
+        ttk.Label(fe_bar, text="  每 N 帧检测：").pack(side="left", padx=(8, 0))
+        fe_detevery_var = tk.IntVar(value=4)
+        vars_dict["fe_det_every"] = fe_detevery_var
+        ttk.Spinbox(fe_bar, from_=1, to=15, width=4,
+                    textvariable=fe_detevery_var).pack(side="left", padx=(4, 0))
+        fe_occ_var = tk.BooleanVar(value=face_parser_available())
+        vars_dict["fe_occlusion"] = fe_occ_var
+        ttk.Checkbutton(fe_bar, text="遮挡/误检修正", variable=fe_occ_var).pack(
+            side="left", padx=(10, 0))
+        if not codeformer_available():
+            vars_dict["face_enhance_enabled"].set(False)
+
+        # ── 10. 合成视频 ────────────────────────────────────────
+        _add_section("10. 合成视频（输出最终配音视频）", "compose", step_name="合成视频")
+
+        # ── buttons ─────────────────────────────────────────────
+        btn_frame = ttk.Frame(scroll_frame, padding=(12, 12))
+        btn_frame.pack(fill="x")
+
+        def _start():
+            dlg.destroy()
+            self._start_one_click_pipeline(vars_dict)
+
+        def _cancel():
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="🚀 开始一键生成", command=_start).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="取消", command=_cancel).pack(side="right", padx=4)
+
+        # Center dialog
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 600) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 680) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _start_one_click_pipeline(self, vars_dict: dict):
+        """Kick off the one-click pipeline in a background thread."""
+        self._oc_opts = vars_dict
+        self._oc_cancelled = False
+
+        # Build ordered list of enabled steps
+        steps = []
+        step_names = [
+            ("切割视频", "cut"),
+            ("拆分音轨", "split"),
+            ("转换文字", "asr"),
+            ("文本翻译", "translate"),
+            ("人声分离", "separate"),
+            ("人声生成", "tts"),
+            ("重新混音", "remix"),
+            ("口型匹配", "lipsync"),
+            ("人脸增强", "face_enhance"),
+            ("合成视频", "compose"),
+        ]
+        enabled_steps = []
+        for name, key in step_names:
+            if vars_dict.get(f"{key}_enabled", tk.BooleanVar(value=True)).get():
+                enabled_steps.append((name, key))
+
+        if not enabled_steps:
+            messagebox.showwarning("提示", "请至少启用一个步骤。")
+            return
+
+        total = len(enabled_steps)
+
+        # ── progress dialog ─────────────────────────────────────
+        self._oc_dlg = tk.Toplevel(self.root)
+        self._oc_dlg.title("一键生成 — 执行中")
+        self._oc_dlg.geometry("480x220")
+        self._oc_dlg.transient(self.root)
+        self._oc_dlg.grab_set()
+        self._oc_dlg.protocol("WM_DELETE_WINDOW", self._on_cancel_one_click)
+        self._oc_dlg.resizable(False, False)
+
+        ttk.Label(self._oc_dlg, text="🚀 正在自动执行流水线…",
+                  font=(config.CJK_FONT, 12, "bold")).pack(pady=(16, 8))
+        self._lbl_oc_step = ttk.Label(self._oc_dlg, text=f"步骤 0 / {total}：准备中…",
+                                       font=(config.CJK_FONT, 10))
+        self._lbl_oc_step.pack()
+        self._bar_oc_step = ttk.Progressbar(self._oc_dlg, length=420,
+                                            mode="determinate", maximum=total)
+        self._bar_oc_step.pack(pady=(8, 4))
+        self._lbl_oc_detail = ttk.Label(self._oc_dlg, text="",
+                                         font=(config.CJK_FONT, 9), foreground="#666")
+        self._lbl_oc_detail.pack()
+        self._bar_oc_detail = ttk.Progressbar(self._oc_dlg, length=420,
+                                              mode="indeterminate")
+        self._bar_oc_detail.pack(pady=(4, 12))
+        ttk.Button(self._oc_dlg, text="取消",
+                   command=self._on_cancel_one_click).pack()
+
+        threading.Thread(
+            target=self._run_one_click_pipeline,
+            args=(enabled_steps,),
+            daemon=True,
+        ).start()
+
+    def _on_cancel_one_click(self):
+        self._oc_cancelled = True
+
+    def _run_one_click_pipeline(self, enabled_steps: list[tuple[str, str]]):
+        """Run each enabled step in sequence (background thread)."""
+        total = len(enabled_steps)
+        opts = self._oc_opts
+
+        for i, (step_name, step_key) in enumerate(enabled_steps):
+            if self._oc_cancelled:
+                self.root.after(0, lambda: self._finish_one_click(cancelled=True))
+                return
+
+            self.root.after(0, lambda n=step_name, c=i: (
+                self._lbl_oc_step.configure(text=f"步骤 {c + 1} / {total}：{n}"),
+                self._bar_oc_step.configure(value=c),
+                self._lbl_oc_detail.configure(text="正在执行…"),
+                self._bar_oc_detail.configure(mode="indeterminate"),
+                self._bar_oc_detail.start(10)
+            ))
+
+            try:
+                success = self._execute_one_step(step_name, step_key, opts)
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                self.root.after(0, lambda n=step_name, err=str(e), t=tb: (
+                    self._oc_dlg.destroy() if hasattr(self, "_oc_dlg") and self._oc_dlg.winfo_exists() else None,
+                    self.log.mark_step(n, "failed"),
+                    self.log.add_entry(n, "error", f"{err}\n{t}"),
+                    self._refresh_toolbar(),
+                    messagebox.showerror("一键生成失败", f"步骤「{n}」出错：\n{err}")
+                ))
+                return
+
+            if not success:
+                # Step was skipped or has unmet dependencies
+                continue
+
+            # Auto-save project after each successful step
+            self.root.after(0, lambda: self._auto_save_project())
+
+            # Switch to the completed step's tab
+            _TABBED_STEPS = {"切割视频", "拆分音轨", "转换文字", "文本翻译",
+                             "人声分离", "人声生成", "重新混音",
+                             "口型匹配", "人脸增强", "合成视频"}
+            if step_name in _TABBED_STEPS:
+                self.root.after(0, lambda n=step_name: self._switch_to_tab(n))
+
+            if self._oc_cancelled:
+                self.root.after(0, lambda: self._finish_one_click(cancelled=True))
+                return
+
+        self.root.after(0, lambda: self._finish_one_click(cancelled=False))
+
+    def _execute_one_step(self, step_name: str, step_key: str, opts: dict) -> bool:
+        """Execute a single pipeline step. Returns True on success."""
+        src = Path(self.log.video_path) if self.log.video_path else None
+        if src is None or not src.exists():
+            return False
+
+        # ── 切割视频 ────────────────────────────────────────────
+        if step_key == "cut":
+            self._update_step_status(step_name, "running")
+            segments = cut_video(
+                src, segment_duration=180.0,
+                progress_cb=None,
+                cancel_check=lambda: self._oc_cancelled,
+            )
+            if self._oc_cancelled:
+                return False
+            seg_dir = str(Path(segments[0]["path"]).parent) if segments else ""
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"segments": segments, "output_dir": seg_dir})
+            self.log.add_entry(step_name, "done", f"{len(segments)} 段 → {seg_dir}")
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 拆分音轨 ────────────────────────────────────────────
+        if step_key == "split":
+            cut_data = self.log.step_data.get("切割视频", {})
+            segments = cut_data.get("segments", [])
+            segments = [s for s in segments if Path(s["path"]).exists()]
+            self._update_step_status(step_name, "running")
+            if segments:
+                out_base = Path(segments[0]["path"]).parent.parent / "demuxed"
+            else:
+                out_base = src.parent.parent / "workspace" / src.stem / "demuxed"
+            results = demux_all(
+                src, segments or None, out_base,
+                progress_cb=None,
+                cancel_check=lambda: self._oc_cancelled,
+            )
+            if self._oc_cancelled:
+                return False
+            errors = [r for r in results if "error" in r]
+            ok = [r for r in results if "error" not in r]
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"results": results, "error_count": len(errors)})
+            self.log.add_entry(step_name, "done", f"{len(ok)} ok, {len(errors)} errors")
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 转换文字 (ASR) ──────────────────────────────────────
+        if step_key == "asr":
+            # Collect audio paths
+            split_data = self.log.step_data.get("拆分音轨", {})
+            results = split_data.get("results", [])
+            audio_paths = []
+            if results:
+                for r in results:
+                    if "error" not in r:
+                        p = Path(r["audio"])
+                        if p.exists():
+                            audio_paths.append(p)
+            if not audio_paths:
+                # Fallback: extract audio from original
+                import tempfile
+                tmp = Path(tempfile.mktemp(suffix=".wav"))
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(src),
+                    "-vn", "-ar", "16000", "-ac", "1", str(tmp),
+                ], check=True, capture_output=True)
+                audio_paths.append(tmp)
+
+            lang_label = opts.get("asr_lang", tk.StringVar(value=LANG_LABELS[0])).get()
+            lang_code = LANGUAGES.get(lang_label, "ja")
+            eng_label = opts.get("asr_engine", tk.StringVar()).get()
+            eng_map = opts.get("_asr_eng_map", {"openai-whisper (GPU+VAD)": "openai-whisper"})
+            if isinstance(eng_map, dict):
+                backend = eng_map.get(eng_label, "openai-whisper")
+            else:
+                backend = "openai-whisper"
+
+            self._update_step_status(step_name, "running")
+
+            def _asr_progress(current, total):
+                self.root.after(0, lambda c=current, t=total: (
+                    self._bar_oc_detail.configure(mode="determinate", maximum=t, value=c)
+                    if hasattr(self, "_bar_oc_detail") else None,
+                    self._lbl_oc_detail.configure(text=f"ASR: {c}/{t}")
+                    if hasattr(self, "_lbl_oc_detail") else None,
+                ))
+
+            asr_results = transcribe_all(
+                audio_paths, language=lang_code,
+                backend=backend,
+                segment_cb=None,
+                progress_cb=_asr_progress,
+                file_start_cb=None,
+                file_progress_cb=None,
+                cancel_check=lambda: self._oc_cancelled,
+            )
+            if self._oc_cancelled:
+                return False
+            errors = [r for r in asr_results if "error" in r]
+            ok = [r for r in asr_results if "error" not in r]
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"language": lang_code, "results": asr_results})
+            self.log.add_entry(step_name, "done", f"{len(ok)} ok, {len(errors)} errors")
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 文本翻译 ────────────────────────────────────────────
+        if step_key == "translate":
+            asr_data = self.log.step_data.get("转换文字", {})
+            asr_results = asr_data.get("results", [])
+            if not asr_results:
+                self.root.after(0, lambda: messagebox.showwarning("提示", "无 ASR 结果，跳过翻译。"))
+                return False
+
+            # Build audio offset map (same as _on_translate)
+            cut_data = self.log.step_data.get("切割视频", {})
+            cut_segs = cut_data.get("segments", [])
+            audio_offset_map = {}
+            if cut_segs:
+                index_to_offset = {
+                    s["index"]: s.get("start", (s["index"] - 1) * 180.0)
+                    for s in cut_segs
+                }
+                split_data = self.log.step_data.get("拆分音轨", {})
+                split_results = split_data.get("results", [])
+                for r in split_results:
+                    label = r.get("label", "")
+                    if label.startswith("seg_"):
+                        try:
+                            idx = int(label.rsplit("_", 1)[-1])
+                            offset = index_to_offset.get(idx, 0.0)
+                            audio = r.get("audio", "")
+                            if audio:
+                                audio_offset_map[audio] = offset
+                        except (ValueError, IndexError):
+                            pass
+
+            segments = []
+            for r in asr_results:
+                if "error" in r:
+                    continue
+                src_name = r.get("source", "")
+                offset = audio_offset_map.get(src_name, 0.0)
+                for seg in r.get("segments", []):
+                    segments.append({
+                        "text": seg["text"],
+                        "start": seg["start"] + offset,
+                        "end": seg["end"] + offset,
+                        "source": src_name,
+                    })
+
+            if not segments:
+                return False
+
+            tl_label = opts.get("tl_lang", tk.StringVar(value="汉语 (中文)")).get()
+            from ai_movie.translator import TRANSLATION_TARGET_LANGS
+            target_lang = TRANSLATION_TARGET_LANGS.get(tl_label, "Chinese")
+            src_lang_code = asr_data.get("language", "ja")
+            src_name_map = {"ja": "Japanese", "en": "English", "zh": "Chinese", "ko": "Korean"}
+            src_lang = src_name_map.get(src_lang_code, "Japanese")
+
+            eng_label = opts.get("tl_engine", tk.StringVar(value="Hy-MT2 + 润色")).get()
+            eng_map = opts.get("_tl_eng_map", {"Hy-MT2 + 润色": "hy-mt2+polish"})
+            if isinstance(eng_map, dict):
+                engine = eng_map.get(eng_label, "hy-mt2+polish")
+            else:
+                engine = "hy-mt2+polish"
+
+            ollama_model = opts.get("tl_ollama", tk.StringVar(value=config.OLLAMA_MODEL)).get()
+
+            # Determine Hy-MT path
+            _hymt_path = config.HYMT2_MODEL_PATH
+            if engine in ("hy-mt", "hy-mt+polish"):
+                _hymt_path = config.TRANSLATION_MODEL_PATH
+
+            self._update_step_status(step_name, "running")
+
+            def _tl_progress(current, total):
+                self.root.after(0, lambda c=current, t=total: (
+                    self._bar_oc_detail.configure(mode="determinate", maximum=t, value=c)
+                    if hasattr(self, "_bar_oc_detail") else None,
+                    self._lbl_oc_detail.configure(text=f"翻译: {c}/{t}")
+                    if hasattr(self, "_lbl_oc_detail") else None,
+                ))
+
+            from ai_movie.translator import translate, translate_ollama, polish_ollama
+
+            if engine == "ollama":
+                tl_results = translate_ollama(
+                    segments, target_lang=target_lang, src_lang=src_lang,
+                    model=ollama_model,
+                    progress_cb=_tl_progress,
+                    segment_cb=None,
+                    cancel_check=lambda: self._oc_cancelled,
+                )
+            elif engine in ("hy-mt+polish", "hy-mt2+polish"):
+                tl_results = translate(
+                    segments, target_lang=target_lang, src_lang=src_lang,
+                    model_path=_hymt_path,
+                    progress_cb=_tl_progress,
+                    cancel_check=lambda: self._oc_cancelled,
+                )
+                if not self._oc_cancelled:
+                    tl_results = polish_ollama(
+                        tl_results, model=ollama_model,
+                        progress_cb=_tl_progress,
+                        segment_cb=None,
+                        cancel_check=lambda: self._oc_cancelled,
+                    )
+            else:
+                tl_results = translate(
+                    segments, target_lang=target_lang, src_lang=src_lang,
+                    model_path=_hymt_path,
+                    progress_cb=_tl_progress,
+                    cancel_check=lambda: self._oc_cancelled,
+                )
+
+            if self._oc_cancelled:
+                return False
+
+            self.log.mark_step(step_name, "done")
+            log_data = {"target_lang": target_lang, "engine": engine,
+                        "segments": tl_results, "count": len(tl_results)}
+            if ollama_model:
+                log_data["ollama_model"] = ollama_model
+            self.log.set_step_data(step_name, log_data)
+            self.log.add_entry(step_name, "done", f"{len(tl_results)} segments → {target_lang}")
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 人声分离 ────────────────────────────────────────────
+        if step_key == "separate":
+            if not self.log.video_path:
+                return False
+            import tempfile
+            tmp = Path(tempfile.mktemp(suffix=".wav"))
+            subprocess.run([
+                "ffmpeg", "-y", "-i", self.log.video_path,
+                "-vn", "-ar", "16000", "-ac", "1", str(tmp),
+            ], check=True, capture_output=True)
+            ref_audio = tmp
+
+            backend = opts.get("sep_backend", tk.StringVar(value="uvr")).get()
+            self._update_step_status(step_name, "running")
+
+            import ai_movie.composer as composer
+            sep = composer.separate_vocals(ref_audio, backend=backend)
+
+            if self._oc_cancelled:
+                return False
+
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"vocals": str(sep["vocals"]), "background": str(sep["background"])})
+            self.log.add_entry(step_name, "done", f"backend={backend}")
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 人声生成 (TTS) ──────────────────────────────────────
+        if step_key == "tts":
+            tl_data = self.log.step_data.get("文本翻译", {})
+            segments = tl_data.get("segments", [])
+            sep_data = self.log.step_data.get("人声分离", {})
+            vocals_path_str = sep_data.get("vocals")
+            if not segments or not vocals_path_str:
+                self.root.after(0, lambda: messagebox.showwarning("提示", "缺少翻译或人声分离结果，跳过 TTS。"))
+                return False
+            vocals_path = Path(vocals_path_str)
+
+            import ai_movie.tts as tts_mod
+            voice_mode = opts.get("tts_mode", tk.StringVar(value="gender")).get()
+            algo = opts.get("tts_algo", tk.StringVar(value="f0_per_seg")).get()
+
+            tts_model_label = opts.get("tts_model", tk.StringVar()).get()
+            tts_model_map = opts.get("_tts_model_map", {})
+            tts_model = tts_model_map.get(tts_model_label, "sft")
+            # 台湾柔和女声 uses instruct2, which only CosyVoice3/2 support — force it.
+            if voice_mode == "style":
+                tts_model = "cosyvoice3"
+            # SFT loads in-process; Qwen models synthesize in the isolated subprocess.
+            choice = tts_mod.resolve_model_choice(tts_model)
+            is_sft = (choice == "sft")
+            if is_sft:
+                tts_mod._load_model(prefer=choice)
+
+            out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+
+            self._update_step_status(step_name, "running")
+
+            # Resolve reference audio / method — handle non-SFT fallback
+            if voice_mode == "female":
+                if is_sft:
+                    ref_audio, ref_text, ref_method = tts_mod._SFT_FEMALE_SPK, None, "sft"
+                else:
+                    ref_audio = str(tts_mod._FEMALE_REF_WAV)
+                    ref_text, ref_method = tts_mod._FEMALE_REF_TEXT, "zero_shot"
+            elif voice_mode == "male":
+                if is_sft:
+                    ref_audio, ref_text, ref_method = tts_mod._SFT_MALE_SPK, None, "sft"
+                else:
+                    ref_audio = str(tts_mod._MALE_REF_WAV)
+                    ref_text, ref_method = None, "cross_lingual"
+            elif voice_mode == "style":
+                ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+                    vocals_path, mode="style", cache_dir=out_dir)
+                if is_sft:
+                    self.root.after(0, lambda: self._lbl_oc_detail.configure(
+                        text="⚠ 台湾柔和女声需 CosyVoice3，已退回克隆") if hasattr(self, "_lbl_oc_detail") else None)
+            else:
+                ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+                    vocals_path, mode="gender", cache_dir=out_dir)
+
+            # Qwen models (non-SFT): synthesize the whole batch in the isolated
+            # subprocess (this step already runs in a background thread).
+            if ref_method != "sft":
+                seg_texts = [(i, seg.get("text_translated", "").strip())
+                             for i, seg in enumerate(segments)]
+
+                def _oc_prog(done, total):
+                    self.root.after(0, lambda d=done, t=total: (
+                        self._bar_oc_detail.configure(mode="determinate", maximum=t, value=d)
+                        if hasattr(self, "_bar_oc_detail") else None,
+                        self._lbl_oc_detail.configure(text=f"TTS(隔离): {d}/{t}")
+                        if hasattr(self, "_lbl_oc_detail") else None,
+                    ))
+
+                items = tts_mod.run_isolated_synthesis(
+                    seg_texts, choice, ref_audio, ref_text, ref_method, out_dir,
+                    progress_cb=_oc_prog, cancel_check=lambda: self._oc_cancelled,
+                )
+                tts_results = []
+                for i, seg in enumerate(segments):
+                    it = items.get(i, {})
+                    r = {**seg, "audio": it.get("audio")}
+                    if it.get("tts_error"):
+                        r["tts_error"] = it["tts_error"]
+                    tts_results.append(r)
+                ok = sum(1 for r in tts_results if r.get("audio"))
+                self.log.mark_step(step_name, "done")
+                self.log.set_step_data(step_name, {"results": tts_results, "ok": ok})
+                self.log.add_entry(step_name, "done", f"{ok}/{len(tts_results)} segments")
+                self.root.after(0, self._refresh_toolbar)
+                return True
+
+            # ECAPA pre-compute
+            ecapa_result = None
+            if voice_mode == "gender" and algo == "ecapa":
+                self.root.after(0, lambda: self._lbl_oc_detail.configure(text="ECAPA：分析说话人中…"))
+                ecapa_result = tts_mod.build_ecapa_gender_map(vocals_path)
+
+            # Per-segment TTS loop
+            tts_results = []
+            last_gender = "female"
+            total_tts = len(segments)
+            import soundfile as sf
+
+            for seg_idx, seg in enumerate(segments):
+                if self._oc_cancelled:
+                    return False
+
+                self.root.after(0, lambda i=seg_idx, t=total_tts: (
+                    self._bar_oc_detail.configure(mode="determinate", maximum=t, value=i)
+                    if hasattr(self, "_bar_oc_detail") else None,
+                    self._lbl_oc_detail.configure(text=f"TTS: {i + 1}/{t}")
+                    if hasattr(self, "_lbl_oc_detail") else None,
+                ))
+
+                text = seg.get("text_translated", "").strip()
+                if not text:
+                    tts_results.append({**seg, "audio": None})
+                    continue
+
+                if ref_method == "sft":
+                    if voice_mode == "gender":
+                        if algo == "ecapa" and ecapa_result:
+                            seg_gender = tts_mod.lookup_ecapa_gender(seg, ecapa_result, fallback=last_gender)
+                        elif algo == "f0_global":
+                            seg_gender = tts_mod.detect_gender_global_f0(seg, fallback=last_gender)
+                        else:
+                            seg_gender = tts_mod.detect_gender_from_segment(seg, fallback=last_gender)
+                        last_gender = seg_gender
+                        spk = tts_mod._SFT_FEMALE_SPK if seg_gender == "female" else tts_mod._SFT_MALE_SPK
+                    else:
+                        spk = ref_audio
+                        seg_gender = "female" if spk == tts_mod._SFT_FEMALE_SPK else "male"
+                    seg_ref, seg_ref_text, seg_ref_method = spk, None, "sft"
+                else:
+                    seg_ref, seg_ref_text, seg_ref_method = ref_audio, ref_text, ref_method
+                    seg_gender = "female"
+
+                try:
+                    audio_np = tts_mod.call_tts(tts_mod._model, text, seg_ref, seg_ref_text, seg_ref_method)
+                    out_path = str(out_dir / f"seg_{seg_idx + 1:04d}.wav")
+                    sf.write(out_path, audio_np, tts_mod._model.sample_rate)
+                    tts_results.append({**seg, "audio": out_path, "tts_gender": seg_gender})
+                except Exception as exc:
+                    tts_results.append({**seg, "audio": None, "tts_error": str(exc)})
+
+            ok = sum(1 for r in tts_results if r.get("audio"))
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"results": tts_results, "ok": ok})
+            self.log.add_entry(step_name, "done", f"{ok}/{len(tts_results)} segments")
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 重新混音 ────────────────────────────────────────────
+        if step_key == "remix":
+            gen_data = self.log.step_data.get("人声生成", {})
+            gen_results = gen_data.get("results", [])
+            sep_data = self.log.step_data.get("人声分离", {})
+            bg_path = sep_data.get("background")
+            if not gen_results or not bg_path:
+                self.root.after(0, lambda: messagebox.showwarning("提示", "缺少人声或背景音，跳过混音。"))
+                return False
+
+            self._update_step_status(step_name, "running")
+            import ai_movie.composer as composer
+            out_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
+            mixed_path = out_dir / "final_audio.wav"
+            composer.mix_audio(gen_results, Path(bg_path), mixed_path)
+
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"mixed_audio": str(mixed_path)})
+            self.log.add_entry(step_name, "done", str(mixed_path))
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        # ── 口型匹配 ────────────────────────────────────────────
+        if step_key == "lipsync":
+            gen_data = self.log.step_data.get("人声生成", {})
+            tts_results = gen_data.get("results", [])
+            if not tts_results or not self.log.video_path:
+                self.root.after(0, lambda: messagebox.showwarning("提示", "缺少 TTS 结果，跳过口型匹配。"))
+                return False
+
+            self._update_step_status(step_name, "running")
+
+            ls_choice = opts.get("ls_engine", tk.StringVar(value="自动检测")).get()
+            from ai_movie.lip_sync import musetalk_available, segment_based_lip_sync
+
+            use_musetalk = musetalk_available()
+            if ls_choice == "Wav2Lip (96x96)":
+                use_musetalk = False
+            elif ls_choice == "MuseTalk (256x256)":
+                use_musetalk = True
+
+            backend = "musetalk" if use_musetalk else "wav2lip"
+            out_path = Path(WORKSPACE_DIR) / "lipsync_output.mp4"
+
+            def _ls_progress(cur, total):
+                self.root.after(0, lambda c=cur, t=total: (
+                    self._bar_oc_detail.configure(mode="determinate", maximum=t, value=c)
+                    if hasattr(self, "_bar_oc_detail") else None,
+                    self._lbl_oc_detail.configure(text=f"口型匹配: {c}/{t}")
+                    if hasattr(self, "_lbl_oc_detail") else None,
+                ))
+
+            result = segment_based_lip_sync(
+                video_path=self.log.video_path,
+                tts_results=tts_results,
+                output_path=out_path,
+                backend=backend,
+                progress_cb=_ls_progress,
+                cancel_check=lambda: self._oc_cancelled,
+            )
+
+            if self._oc_cancelled or result is None:
+                return False
+
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"output_video": str(result), "driving_audio_source": "tts_speech_track"})
+            self.log.add_entry(step_name, "done", f"→ {result}")
+            self.root.after(0, self._refresh_toolbar)
+            self.root.after(0, lambda: self._populate_lipsync_tab(result))
+            return True
+
+        # ── 人脸增强（可选） ────────────────────────────────────
+        if step_key == "face_enhance":
+            from ai_movie.face_restore import codeformer_available, restore_video
+            ls_output = self.log.step_data.get("口型匹配", {}).get("output_video")
+            if not codeformer_available() or not ls_output or not Path(ls_output).exists():
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "提示", "缺少 CodeFormer 模型或口型匹配结果，跳过人脸增强。"))
+                return False
+
+            self._update_step_status(step_name, "running")
+            fidelity = float(opts.get("fe_fidelity", tk.DoubleVar(value=0.7)).get())
+            det_every = int(opts.get("fe_det_every", tk.IntVar(value=4)).get())
+            occlusion = bool(opts.get("fe_occlusion", tk.BooleanVar(value=True)).get())
+            out_path = Path(WORKSPACE_DIR) / "lipsync_enhanced.mp4"
+
+            def _fe_progress(done, total):
+                if done == 1 or done == total or done % 15 == 0:
+                    self.root.after(0, lambda c=done, t=total: (
+                        self._bar_oc_detail.configure(mode="determinate", maximum=t, value=c)
+                        if hasattr(self, "_bar_oc_detail") else None,
+                        self._lbl_oc_detail.configure(text=f"人脸增强: {c}/{t}")
+                        if hasattr(self, "_lbl_oc_detail") else None,
+                    ))
+
+            result = restore_video(
+                Path(ls_output), out_path,
+                fidelity_weight=fidelity, det_every=det_every,
+                occlusion_aware=occlusion,
+                progress_cb=_fe_progress,
+                cancel_check=lambda: self._oc_cancelled,
+            )
+            if self._oc_cancelled or result is None:
+                return False
+
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"output_video": str(result)})
+            self.log.add_entry(step_name, "done", f"→ {result}")
+            self.root.after(0, self._refresh_toolbar)
+            self.root.after(0, lambda: self._populate_face_enhance_tab(result))
+            return True
+
+        # ── 合成视频 ────────────────────────────────────────────
+        if step_key == "compose":
+            remix_data = self.log.step_data.get("重新混音", {})
+            audio_path = remix_data.get("mixed_audio")
+            if not audio_path or not Path(audio_path).exists():
+                self.root.after(0, lambda: messagebox.showwarning("提示", "缺少混音结果，跳过合成视频。"))
+                return False
+
+            # Prefer face-enhanced video, then lip-synced video
+            enh_output = self.log.step_data.get("人脸增强", {}).get("output_video")
+            ls_output = self.log.step_data.get("口型匹配", {}).get("output_video")
+            if enh_output and Path(enh_output).exists():
+                video_path = Path(enh_output)
+            elif ls_output and Path(ls_output).exists():
+                video_path = Path(ls_output)
+            else:
+                cut_data = self.log.step_data.get("切割视频", {})
+                has_cuts = bool(cut_data.get("segments"))
+                if has_cuts and self.log.video_path:
+                    video_path = Path(self.log.video_path)
+                else:
+                    split_data = self.log.step_data.get("拆分音轨", {})
+                    split_results = split_data.get("results", [])
+                    video_path = None
+                    if split_results:
+                        for r in split_results:
+                            if "error" not in r:
+                                p = Path(r.get("video", ""))
+                                if p.exists() and p.suffix in (".mp4", ".mkv", ".mov"):
+                                    video_path = p
+                                    break
+            if video_path is None or not video_path.exists():
+                self.root.after(0, lambda: messagebox.showwarning("提示", "未找到视频文件，跳过合成。"))
+                return False
+
+            self._update_step_status(step_name, "running")
+
+            import ai_movie.composer as composer
+            out_dir = ensure_dir(WORKSPACE_DIR / "output")
+            out_path = out_dir / f"{Path(video_path).stem}_dubbed.mp4"
+
+            def _cmp_progress(msg):
+                self.root.after(0, lambda m=msg: (
+                    self._lbl_oc_detail.configure(text=m)
+                    if hasattr(self, "_lbl_oc_detail") else None,
+                ))
+
+            composer.compose_video(video_path, Path(audio_path), out_path, progress_cb=_cmp_progress)
+
+            self.log.mark_step(step_name, "done")
+            self.log.set_step_data(step_name, {"output_video": str(out_path)})
+            self.log.add_entry(step_name, "done", str(out_path))
+            self.root.after(0, self._refresh_toolbar)
+            return True
+
+        return False
+
+    def _update_step_status(self, step_name: str, status: str):
+        """Update step status from background thread — must be called via root.after."""
+        def _inner():
+            self.log.mark_step(step_name, status)
+            self.log.add_entry(step_name, "start" if status == "running" else status)
+            self._refresh_toolbar()
+        self.root.after(0, _inner)
+
+    def _finish_one_click(self, cancelled: bool):
+        """Clean up after the one-click pipeline finishes."""
+        if hasattr(self, "_oc_dlg") and self._oc_dlg.winfo_exists():
+            self._oc_dlg.destroy()
+        if cancelled:
+            self._auto_save_project()
+            messagebox.showinfo("已取消", "一键生成已取消。\n已完成步骤的状态已保存。")
+        else:
+            self._auto_save_project()
+            done_count = sum(1 for v in self.log.steps.values() if v == "done")
+            messagebox.showinfo("一键生成完成",
+                f"🎉 流水线执行完成！\n已完成 {done_count}/{len(STEP_NAMES)} 个步骤。\n"
+                f"请在「合成视频」标签查看输出。")
+            # Switch to compose tab
+            self._switch_to_tab("合成视频")
+
     # ═══ remaining toolbar stubs ════════════════════════════════
 
     def _on_anchor_person(self):
         self.log.mark_step("人物锚定", "running"); self.log.add_entry("人物锚定", "start"); self._refresh_toolbar()
         self.log.mark_step("人物锚定", "done"); self.log.add_entry("人物锚定", "done", "placeholder"); self._refresh_toolbar()
+        self._switch_to_next_tab("人物锚定")
 
     def _on_lip_sync(self):
-        self.log.mark_step("口型匹配", "running"); self.log.add_entry("口型匹配", "start"); self._refresh_toolbar()
-        self.log.mark_step("口型匹配", "done"); self.log.add_entry("口型匹配", "done", "placeholder"); self._refresh_toolbar()
+        """Run lip-sync on speech segments only (segment-based).
+
+        Only video portions that have TTS speech are processed.
+        Silent segments and face-less segments pass through unchanged.
+        """
+        # ── Get TTS speech segments ──────────────────────────────
+        gen_data = self.log.step_data.get("人声生成", {})
+        tts_results = gen_data.get("results", [])
+        if not tts_results:
+            messagebox.showwarning("提示", "请先完成「人声生成」步骤。")
+            return
+
+        # ── Use the original video ─────────────────────────────────
+        video_path = Path(self.log.video_path) if self.log.video_path else None
+        if video_path is None or not video_path.exists():
+            messagebox.showwarning("提示", "未找到原始视频文件。")
+            return
+
+        self.log.mark_step("口型匹配", "running")
+        self.log.add_entry("口型匹配", "start")
+        self._refresh_toolbar()
+        self._cancel_requested = False
+
+        # ── Read backend from tab selector ─────────────────────────
+        ls_choice = getattr(self, "_ls_backend_var", tk.StringVar(value="自动检测")).get()
+        if ls_choice == "Wav2Lip (96x96)":
+            backend = "wav2lip"
+        elif ls_choice == "MuseTalk (256x256)":
+            backend = "musetalk"
+        else:
+            from ai_movie.lip_sync import musetalk_available
+            backend = "musetalk" if musetalk_available() else "wav2lip"
+        backend_label = "MuseTalk (256×256)" if backend == "musetalk" else "Wav2Lip (96×96)"
+
+        # Count speech segments
+        speech_count = sum(
+            1 for s in tts_results
+            if s.get("audio") and Path(str(s["audio"])).exists()
+        )
+
+        # ── Two-level progress dialog ──────────────────────────────
+        self._ls_dlg = tk.Toplevel(self.root)
+        self._ls_dlg.title(f"口型匹配 ({backend_label})")
+        self._ls_dlg.geometry("450x280")
+        self._ls_dlg.transient(self.root)
+        self._ls_dlg.grab_set()
+        self._ls_dlg.protocol("WM_DELETE_WINDOW", self._on_cancel_lip_sync)
+        self._ls_dlg.resizable(False, False)
+
+        ttk.Label(self._ls_dlg, text=f"正在运行口型匹配 ({backend_label})…\n"
+                  f"仅处理有语音的片段（{speech_count} 个语音段）",
+                  font=(config.CJK_FONT, 11)).pack(pady=(12, 8))
+
+        # Level 1: segment-level (determinate from start)
+        f1 = ttk.Frame(self._ls_dlg); f1.pack(fill="x", padx=20, pady=(4, 2))
+        ttk.Label(f1, text="片段进度：").pack(side="left")
+        self._lbl_ls_prog = ttk.Label(f1, text=f"0 / {max(speech_count, 1)}")
+        self._lbl_ls_prog.pack(side="right")
+        self._bar_ls = ttk.Progressbar(
+            self._ls_dlg, length=360,
+            mode="determinate", maximum=max(speech_count, 1),
+        )
+        self._bar_ls.pack(padx=20)
+
+        # Level 2: intra-segment batch progress (indeterminate → determinate)
+        f2 = ttk.Frame(self._ls_dlg); f2.pack(fill="x", padx=20, pady=(10, 2))
+        ttk.Label(f2, text="处理进度：").pack(side="left")
+        self._lbl_ls_inner_prog = ttk.Label(f2, text="等待中…")
+        self._lbl_ls_inner_prog.pack(side="right")
+        self._bar_ls_inner = ttk.Progressbar(
+            self._ls_dlg, length=360, mode="indeterminate",
+        )
+        self._bar_ls_inner.pack(padx=20)
+        self._bar_ls_inner.start(10)
+
+        ttk.Button(self._ls_dlg, text="取消",
+                   command=self._on_cancel_lip_sync).pack(pady=12)
+
+        # Switch to lip-sync tab
+        for idx in range(self._notebook.index("end")):
+            if self._notebook.tab(idx, "text") == "口型匹配":
+                self._notebook.select(idx)
+                break
+
+        # ── Run segment-based lip sync (background thread) ────────
+        # Face enhancement is handled by the separate «人脸增强» step.
+        threading.Thread(
+            target=self._run_segment_lip_sync,
+            args=(str(video_path), tts_results, backend),
+            daemon=True,
+        ).start()
+
+    def _run_segment_lip_sync(self, video_path: str, tts_results: list[dict], backend: str):
+        import traceback as _tb
+        from ai_movie.lip_sync import segment_based_lip_sync
+        out_path = Path(WORKSPACE_DIR) / "lipsync_output.mp4"
+        try:
+            result = segment_based_lip_sync(
+                video_path=video_path,
+                tts_results=tts_results,
+                output_path=out_path,
+                backend=backend,
+                progress_cb=lambda cur, total: self.root.after(
+                    0, lambda c=cur, t=total: self._update_lip_sync_progress(c, t)),
+                detail_progress_cb=lambda cur, total: self.root.after(
+                    0, lambda c=cur, t=total: self._update_lip_sync_detail_progress(c, t)),
+                cancel_check=lambda: self._cancel_requested,
+            )
+        except Exception as e:
+            tb = _tb.format_exc()
+            print(f"[LipSync ERROR] {tb}", file=sys.stderr)
+            err_msg = f"{type(e).__name__}: {e}"
+            self.root.after(0, lambda msg=err_msg: self._on_lip_sync_error(msg))
+            return
+        if result is None:
+            self.root.after(0, lambda: self._on_lip_sync_cancelled())
+            return
+        self.root.after(0, lambda: self._on_lip_sync_done(result))
+
+    def _on_cancel_lip_sync(self):
+        self._cancel_requested = True
+
+    def _run_lip_sync(self, video_path: str, audio_path: str):
+        import traceback as _tb
+        from ai_movie.lip_sync import wav2lip_sync
+        out_path = Path(WORKSPACE_DIR) / "lipsync_output.mp4"
+        try:
+            result = wav2lip_sync(
+                video_path=video_path,
+                audio_path=audio_path,
+                output_path=out_path,
+                resize_factor=2,
+                progress_cb=lambda cur, total: self.root.after(
+                    0, lambda c=cur, t=total: self._update_lip_sync_progress(c, t)),
+                cancel_check=lambda: self._cancel_requested,
+            )
+        except Exception as e:
+            tb = _tb.format_exc()
+            print(f"[LipSync ERROR] {tb}", file=sys.stderr)
+            err_msg = f"{type(e).__name__}: {e}\n\n详细日志已写入:\n{out_path.parent / 'wav2lip_debug.log'}"
+            self.root.after(0, lambda msg=err_msg: self._on_lip_sync_error(msg))
+            return
+        if result is None:
+            # Cancelled
+            self.root.after(0, lambda: self._on_lip_sync_cancelled())
+            return
+        self.root.after(0, lambda: self._on_lip_sync_done(result))
+
+    def _run_musetalk(self, video_path: str, audio_path: str):
+        import traceback as _tb
+        from ai_movie.lip_sync import musetalk_sync, _downscale_video as _ds_vid
+        out_path = Path(WORKSPACE_DIR) / "lipsync_output.mp4"
+
+        # Downscale video first to bound frame memory (MuseTalk subprocess
+        # loads ALL frames at native resolution — 540p vs 1080p saves 4× RAM)
+        import tempfile as _tf
+        tmp_dir = Path(_tf.mkdtemp(prefix="musetalk_gui_"))
+        try:
+            scaled_video = tmp_dir / "video_scaled.mp4"
+            _ds_vid(Path(video_path), scaled_video, factor=2)
+        except Exception:
+            # If downscale fails, fall back to original
+            scaled_video = Path(video_path)
+
+        try:
+            result = musetalk_sync(
+                video_path=scaled_video,
+                audio_path=audio_path,
+                output_path=out_path,
+                progress_cb=lambda cur, total: self.root.after(
+                    0, lambda c=cur, t=total: self._update_lip_sync_progress(c, t)),
+                cancel_check=lambda: self._cancel_requested,
+            )
+        except Exception as e:
+            tb = _tb.format_exc()
+            print(f"[MuseTalk ERROR] {tb}", file=sys.stderr)
+            err_msg = f"{type(e).__name__}: {e}"
+            self.root.after(0, lambda msg=err_msg: self._on_lip_sync_error(msg))
+            return
+        finally:
+            import shutil as _sh
+            _sh.rmtree(str(tmp_dir), ignore_errors=True)
+        if result is None:
+            self.root.after(0, lambda: self._on_lip_sync_cancelled())
+            return
+        self.root.after(0, lambda: self._on_lip_sync_done(result))
+
+    def _update_lip_sync_progress(self, cur: int, total: int):
+        """Update the segment-level progress bar from worker thread."""
+        if not hasattr(self, "_ls_dlg") or not self._ls_dlg.winfo_exists():
+            return
+        self._bar_ls.configure(maximum=total, value=cur)
+        self._lbl_ls_prog.configure(text=f"{cur} / {total}")
+
+    def _update_lip_sync_detail_progress(self, cur: int, total: int):
+        """Update the inner batch-level progress bar from worker thread.
+
+        The bar starts in 'indeterminate' mode and is switched to
+        'determinate' on the first callback, after calling stop() to
+        kill the animation (this is what prevents flickering).
+        """
+        if not hasattr(self, "_ls_dlg") or not self._ls_dlg.winfo_exists():
+            return
+        if not hasattr(self, "_bar_ls_inner"):
+            return
+
+        # Stop indeterminate animation on first callback
+        if self._bar_ls_inner.cget("mode") == "indeterminate":
+            try:
+                self._bar_ls_inner.stop()
+            except Exception:
+                pass
+
+        self._bar_ls_inner.configure(
+            mode="determinate", maximum=total, value=cur,
+        )
+        self._lbl_ls_inner_prog.configure(text=f"{cur} / {total}")
+
+    def _on_lip_sync_done(self, result: Path):
+        if hasattr(self, "_ls_dlg") and self._ls_dlg.winfo_exists():
+            self._ls_dlg.destroy()
+        self.log.mark_step("口型匹配", "done")
+        self.log.set_step_data("口型匹配", {
+            "output_video": str(result),
+            "driving_audio_source": "tts_speech_track",
+        })
+        self.log.add_entry("口型匹配", "done",
+                           f"driven by clean TTS vocals → {result}")
+        self._refresh_toolbar()
+        self._populate_lipsync_tab(result)
+        self._switch_to_next_tab("口型匹配")
+        messagebox.showinfo("口型匹配完成",
+            f"口型匹配完成。\n"
+            f"驱动音频: 干净 TTS 人声\n"
+            f"输出: {result}")
+
+    def _on_lip_sync_error(self, error_msg: str):
+        if hasattr(self, "_ls_dlg") and self._ls_dlg.winfo_exists():
+            self._ls_dlg.destroy()
+        self.log.mark_step("口型匹配", "failed")
+        self.log.add_entry("口型匹配", "error", error_msg)
+        self._refresh_toolbar()
+        messagebox.showerror("口型匹配失败", error_msg)
+
+    def _on_lip_sync_cancelled(self):
+        if hasattr(self, "_ls_dlg") and self._ls_dlg.winfo_exists():
+            self._ls_dlg.destroy()
+        self.log.mark_step("口型匹配", "ready")
+        self.log.add_entry("口型匹配", "cancelled")
+        self._refresh_toolbar()
+
+    # ═══ 人脸增强 (standalone CodeFormer pass) ══════════════════
+
+    def _on_face_enhance(self):
+        """Run CodeFormer face enhancement on the lip-sync output.
+
+        Reads the «口型匹配» output video and produces an enhanced copy — so it
+        can be re-run / re-tuned without re-running lip-sync.  The «合成视频»
+        step prefers this enhanced output when present.
+        """
+        from ai_movie.face_restore import codeformer_available
+        if not codeformer_available():
+            messagebox.showwarning(
+                "提示", "未找到 CodeFormer 模型（models/codeformer/codeformer.pth），"
+                "无法进行人脸增强。")
+            return
+
+        ls_data = self.log.step_data.get("口型匹配", {})
+        in_video = ls_data.get("output_video")
+        if not in_video or not Path(in_video).exists():
+            messagebox.showwarning("提示", "请先完成「口型匹配」步骤。")
+            return
+        in_video = Path(in_video)
+
+        fidelity = float(getattr(self, "_fe_fidelity_var", tk.DoubleVar(value=0.7)).get())
+        det_every = int(getattr(self, "_fe_detevery_var", tk.IntVar(value=4)).get())
+        occlusion = bool(getattr(self, "_fe_occlusion_var", tk.BooleanVar(value=True)).get())
+
+        self.log.mark_step("人脸增强", "running")
+        self.log.add_entry("人脸增强", "start",
+                           f"fidelity={fidelity:.2f}, det_every={det_every}, "
+                           f"occlusion={occlusion}")
+        self._refresh_toolbar()
+        self._cancel_requested = False
+
+        # ── progress dialog ─────────────────────────────────────
+        self._fe_dlg = tk.Toplevel(self.root)
+        self._fe_dlg.title("人脸增强 (CodeFormer)")
+        self._fe_dlg.geometry("440x180")
+        self._fe_dlg.transient(self.root)
+        self._fe_dlg.grab_set()
+        self._fe_dlg.resizable(False, False)
+        self._fe_dlg.protocol("WM_DELETE_WINDOW", self._on_cancel_face_enhance)
+
+        ttk.Label(self._fe_dlg, text="正在进行人脸增强…",
+                  font=(config.CJK_FONT, 11)).pack(pady=(14, 4))
+        self._lbl_fe_status = ttk.Label(self._fe_dlg, text="准备中…",
+                                        font=(config.CJK_FONT, 9), foreground="#666")
+        self._lbl_fe_status.pack()
+        self._bar_fe = ttk.Progressbar(self._fe_dlg, length=360, mode="determinate")
+        self._bar_fe.pack(padx=20, pady=10)
+        ttk.Button(self._fe_dlg, text="取消",
+                   command=self._on_cancel_face_enhance).pack(pady=(0, 8))
+
+        self._switch_to_tab("人脸增强")
+
+        threading.Thread(
+            target=self._run_face_enhance,
+            args=(str(in_video), fidelity, det_every, occlusion),
+            daemon=True,
+        ).start()
+
+    def _on_cancel_face_enhance(self):
+        self._cancel_requested = True
+
+    def _run_face_enhance(self, in_video: str, fidelity: float, det_every: int,
+                          occlusion: bool = True):
+        import traceback as _tb
+        from ai_movie import face_restore
+        out_path = Path(WORKSPACE_DIR) / "lipsync_enhanced.mp4"
+
+        # Throttle per-frame progress → the Tk event loop (restore_video calls
+        # progress_cb once per frame; updating on every frame floods `after`).
+        def _progress(done, total):
+            if done == 1 or done == total or done % 15 == 0:
+                self.root.after(0, lambda d=done, t=total: self._update_face_enhance_progress(d, t))
+
+        def _log(msg):
+            self.root.after(0, lambda m=msg: (
+                hasattr(self, "_lbl_fe_status") and self._lbl_fe_status.winfo_exists()
+                and self._lbl_fe_status.configure(text=m)))
+
+        try:
+            result = face_restore.restore_video(
+                in_video, out_path,
+                fidelity_weight=fidelity,
+                det_every=det_every,
+                occlusion_aware=occlusion,
+                progress_cb=_progress,
+                cancel_check=lambda: self._cancel_requested,
+                log_cb=_log,
+            )
+        except Exception as e:
+            tb = _tb.format_exc()
+            print(f"[FaceEnhance ERROR] {tb}", file=sys.stderr)
+            err_msg = f"{type(e).__name__}: {e}"
+            self.root.after(0, lambda msg=err_msg: self._on_face_enhance_error(msg))
+            return
+        if result is None:
+            self.root.after(0, self._on_face_enhance_cancelled)
+            return
+        self.root.after(0, lambda: self._on_face_enhance_done(Path(result)))
+
+    def _update_face_enhance_progress(self, cur: int, total: int):
+        if not hasattr(self, "_fe_dlg") or not self._fe_dlg.winfo_exists():
+            return
+        self._bar_fe.configure(maximum=max(total, 1), value=cur)
+        self._lbl_fe_status.configure(text=f"修复帧 {cur} / {total}")
+
+    def _on_face_enhance_done(self, result: Path):
+        if hasattr(self, "_fe_dlg") and self._fe_dlg.winfo_exists():
+            self._fe_dlg.destroy()
+        self.log.mark_step("人脸增强", "done")
+        self.log.set_step_data("人脸增强", {"output_video": str(result)})
+        self.log.add_entry("人脸增强", "done", f"→ {result}")
+        self._refresh_toolbar()
+        self._populate_face_enhance_tab(result)
+        self._switch_to_next_tab("人脸增强")
+        messagebox.showinfo("人脸增强完成",
+                            f"人脸增强完成。\n输出: {result}\n"
+                            f"「合成视频」将优先使用此增强结果。")
+
+    def _on_face_enhance_error(self, error_msg: str):
+        if hasattr(self, "_fe_dlg") and self._fe_dlg.winfo_exists():
+            self._fe_dlg.destroy()
+        self.log.mark_step("人脸增强", "failed")
+        self.log.add_entry("人脸增强", "error", error_msg)
+        self._refresh_toolbar()
+        messagebox.showerror("人脸增强失败", error_msg)
+
+    def _on_face_enhance_cancelled(self):
+        if hasattr(self, "_fe_dlg") and self._fe_dlg.winfo_exists():
+            self._fe_dlg.destroy()
+        self.log.mark_step("人脸增强", "ready")
+        self.log.add_entry("人脸增强", "cancelled")
+        self._refresh_toolbar()
 
     # ═══ project save / load ═══════════════════════════════════
 
+    def _auto_save_project(self):
+        """Silently save the project (no messagebox). Auto-generates path if needed."""
+        if self._project_path is None:
+            name = self.log.name or "project"
+            path = PROJECTS_DIR / f"{name}.aimovie.json"
+            self._project_path = path
+        self.log.name = self._project_path.stem
+        self.log.save(self._project_path)
+
+    def _on_clear_cache(self):
+        """Scan for and clear workspace cache files."""
+        items = CacheManager.find_cache_items(WORKSPACE_DIR)
+        if not items:
+            messagebox.showinfo("清除缓存", "没有可清除的缓存文件。")
+            return
+
+        total_size = sum(s for _, s in items)
+        preview_lines = [f"  {p}" for p, _ in items[:5]]
+        preview = "\n".join(preview_lines)
+        if len(items) > 5:
+            preview += f"\n  … 以及其他 {len(items) - 5} 项"
+
+        ok = messagebox.askyesno(
+            "确认清除缓存",
+            f"将删除 {len(items)} 个缓存项"
+            f"（约 {CacheManager.format_size(total_size)}）：\n\n"
+            f"{preview}\n\n"
+            f"注意：播放器缓存会在下次播放时自动重建，\n"
+            f"中间项目文件不会被删除。\n\n"
+            f"确定清除？"
+        )
+        if not ok:
+            return
+
+        deleted, freed = CacheManager.clear_cache(WORKSPACE_DIR)
+        messagebox.showinfo(
+            "清除完成",
+            f"已删除 {deleted} 个缓存项，"
+            f"释放 {CacheManager.format_size(freed)} 空间。"
+        )
+
     def _on_save_project(self):
         if self._project_path is None:
+            PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
             path = filedialog.asksaveasfilename(
                 title="保存项目", defaultextension=".aimovie.json",
                 filetypes=PROJECT_FILETYPES,
+                initialdir=str(PROJECTS_DIR),
                 initialfile=f"{self.log.name or 'project'}.aimovie.json",
             )
             if not path:
@@ -2234,7 +3900,11 @@ class App:
         messagebox.showinfo("保存项目", f"项目已保存到:\n{self._project_path}")
 
     def _on_load_project(self):
-        path = filedialog.askopenfilename(title="加载项目", filetypes=PROJECT_FILETYPES)
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = filedialog.askopenfilename(
+            title="加载项目", filetypes=PROJECT_FILETYPES,
+            initialdir=str(PROJECTS_DIR),
+        )
         if not path:
             return
         try:
@@ -2313,6 +3983,20 @@ class App:
             if p.exists():
                 self._populate_remix_tab(p)
 
+        # Restore 口型匹配 tab
+        ls_data = self.log.step_data.get("口型匹配", {})
+        if self.log.steps.get("口型匹配") == "done" and ls_data.get("output_video"):
+            p = Path(ls_data["output_video"])
+            if p.exists():
+                self._populate_lipsync_tab(p)
+
+        # Restore 人脸增强 tab
+        fe_data = self.log.step_data.get("人脸增强", {})
+        if self.log.steps.get("人脸增强") == "done" and fe_data.get("output_video"):
+            p = Path(fe_data["output_video"])
+            if p.exists():
+                self._populate_face_enhance_tab(p)
+
         # Restore 合成视频 tab
         compose_data = self.log.step_data.get("合成视频", {})
         if self.log.steps.get("合成视频") == "done" and compose_data.get("output_video"):
@@ -2367,8 +4051,12 @@ class App:
                 self._build_separate_tab(tab)
             elif name == "人声生成":
                 self._build_generate_tab(tab)
-            elif name in ("重新混音", "合成视频", "切割视频", "人物锚定", "口型匹配"):
+            elif name in ("重新混音", "合成视频", "切割视频", "人物锚定"):
                 self._build_output_tab(tab, name)
+            elif name == "口型匹配":
+                self._build_lipsync_tab(tab)
+            elif name == "人脸增强":
+                self._build_face_enhance_tab(tab)
             else:
                 tk.Label(tab, text="当前为空", fg="#aaa",
                          font=(config.CJK_FONT, 13)).place(relx=0.5, rely=0.5,
@@ -2394,9 +4082,9 @@ class App:
         ttk.Label(bar, text="引擎：",
                   font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 4))
 
-        BACKEND_LABELS = ["faster-whisper (CPU)", "openai-whisper (GPU)", "自动选择"]
+        BACKEND_LABELS = ["faster-whisper (CPU+VAD)", "openai-whisper (GPU+VAD)", "自动选择"]
         BACKEND_VALUES = ["faster-whisper", "openai-whisper", "auto"]
-        self._trans_backend_var = tk.StringVar(value=BACKEND_LABELS[0])
+        self._trans_backend_var = tk.StringVar(value=BACKEND_LABELS[1])  # default: GPU+VAD
         backend_combo = ttk.Combobox(
             bar, textvariable=self._trans_backend_var,
             values=BACKEND_LABELS, state="readonly",
@@ -2427,7 +4115,7 @@ class App:
         self._trans_text.configure(state="normal")
         self._trans_text.insert("1.0", "选择语言和引擎后点击工具栏「转换文字」开始识别。\n"
                                         "默认语言：日本語\n"
-                                        "默认引擎：faster-whisper (CPU，断句更准)")
+                                        "默认引擎：openai-whisper (GPU+VAD，精度更高)")
         self._trans_text.configure(state="disabled")
 
     # ═══ translate tab ════════════════════════════════════════════
@@ -2435,6 +4123,7 @@ class App:
     def _build_translate_tab(self, tab: ttk.Frame):
         """Target language selector + scrollable translation results."""
         from ai_movie.translator import TARGET_LANG_LABELS, TRANSLATION_TARGET_LANGS
+        from ai_movie.config import OLLAMA_MODEL
 
         bar = ttk.Frame(tab, padding=(10, 8))
         bar.pack(fill="x")
@@ -2463,19 +4152,62 @@ class App:
         ttk.Label(bar2, text="翻译引擎：",
                   font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 8))
 
-        self._tl_engine_var = tk.StringVar(value="hy-mt+polish")
+        self._tl_engine_var = tk.StringVar(value="hy-mt2")
         ttk.Radiobutton(
-            bar2, text="Hy-MT1.5-1.8B (本地)",
-            variable=self._tl_engine_var, value="hy-mt",
+            bar2, text="Hy-MT2 (本地，推荐)",
+            variable=self._tl_engine_var, value="hy-mt2",
         ).pack(side="left", padx=(0, 12))
         ttk.Radiobutton(
-            bar2, text="Hy-MT + Ollama 润色",
-            variable=self._tl_engine_var, value="hy-mt+polish",
+            bar2, text="Hy-MT2 + Ollama 润色",
+            variable=self._tl_engine_var, value="hy-mt2+polish",
         ).pack(side="left", padx=(0, 12))
         ttk.Radiobutton(
             bar2, text="Ollama 直翻",
             variable=self._tl_engine_var, value="ollama",
+        ).pack(side="left", padx=(0, 12))
+        # ── legacy / fallback ─────────────────────────────────
+        ttk.Radiobutton(
+            bar2, text="Hy-MT1.5 (轻量)",
+            variable=self._tl_engine_var, value="hy-mt",
         ).pack(side="left")
+
+        # ── Ollama model selector (visible when Ollama is involved) ─
+        self._tl_ollama_bar = ttk.Frame(tab, padding=(10, 4))
+
+        ttk.Label(self._tl_ollama_bar, text="Ollama 模型：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 6))
+
+        self._tl_ollama_model_var = tk.StringVar(value=OLLAMA_MODEL)
+        self._tl_ollama_combo = ttk.Combobox(
+            self._tl_ollama_bar, textvariable=self._tl_ollama_model_var,
+            values=[OLLAMA_MODEL], state="readonly",
+            font=(config.CJK_FONT, 10), width=28,
+        )
+        self._tl_ollama_combo.pack(side="left", padx=(0, 8))
+
+        self._tl_ollama_refresh_btn = tk.Button(
+            self._tl_ollama_bar, text="🔄 刷新模型列表",
+            font=(config.CJK_FONT, 9),
+            command=self._on_refresh_ollama_models,
+        )
+        self._tl_ollama_refresh_btn.pack(side="left")
+
+        self._tl_ollama_status = ttk.Label(
+            self._tl_ollama_bar, text="",
+            font=(config.CJK_FONT, 8), foreground="#888",
+        )
+        self._tl_ollama_status.pack(side="left", padx=(8, 0))
+
+        # Show/hide Ollama bar based on engine selection
+        def _update_ollama_bar(*_):
+            engine = self._tl_engine_var.get()
+            if engine in ("hy-mt", "hy-mt2"):
+                self._tl_ollama_bar.pack_forget()
+            else:
+                self._tl_ollama_bar.pack(fill="x", after=bar2)
+
+        self._tl_engine_var.trace_add("write", _update_ollama_bar)
+        _update_ollama_bar()  # initial state: hy-mt2 → hide ollama bar
 
         # Scrollable result area
         result_frame = ttk.Frame(tab)
@@ -2500,6 +4232,184 @@ class App:
             "源语言自动从「转换文字」步骤获取。\n"
             "默认目标语言：汉语 (中文)")
         self._tl_text.configure(state="disabled")
+
+    def _on_refresh_ollama_models(self):
+        """Fetch models from Ollama and populate the combobox."""
+        from ai_movie.translator import fetch_ollama_models
+
+        self._tl_ollama_refresh_btn.configure(state="disabled", text="⏳ 获取中…")
+        self._tl_ollama_status.configure(text="")
+
+        def _fetch():
+            models = fetch_ollama_models()
+            self.root.after(0, lambda: self._update_ollama_models(models))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _update_ollama_models(self, models: list[str]):
+        """Populate the Ollama model combobox with fetched models."""
+        self._tl_ollama_refresh_btn.configure(state="normal", text="🔄 刷新模型列表")
+
+        if not models:
+            self._tl_ollama_status.configure(
+                text="⚠ 无法连接 Ollama，请检查服务是否启动",
+                foreground="#c00",
+            )
+            return
+
+        current = self._tl_ollama_model_var.get()
+        self._tl_ollama_combo.configure(values=models)
+
+        # Keep current selection if it's in the new list, otherwise pick first
+        if current in models:
+            self._tl_ollama_model_var.set(current)
+        else:
+            self._tl_ollama_model_var.set(models[0])
+
+        self._tl_ollama_status.configure(
+            text=f"✓ 共 {len(models)} 个模型可用",
+            foreground="#155724",
+        )
+
+    def _build_lipsync_tab(self, tab: ttk.Frame):
+        """Backend selector bar + placeholder result area for lip-sync step.
+
+        Mirrors the structure of _build_transcribe_tab.  The result area
+        is replaced on completion by _populate_lipsync_tab.
+        """
+        # ── Backend selector ────────────────────────────────────────
+        bar = ttk.Frame(tab, padding=(10, 8))
+        bar.pack(fill="x")
+
+        ttk.Label(bar, text="引擎：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 4))
+
+        LS_BACKEND_LABELS = ["自动检测", "MuseTalk (256x256)", "Wav2Lip (96x96)"]
+        self._ls_backend_var = tk.StringVar(value=LS_BACKEND_LABELS[0])
+        backend_combo = ttk.Combobox(
+            bar, textvariable=self._ls_backend_var,
+            values=LS_BACKEND_LABELS, state="readonly",
+            font=(config.CJK_FONT, 10), width=22,
+        )
+        backend_combo.pack(side="left")
+
+        # Face enhancement is now a separate pipeline step («人脸增强»), run
+        # after lip-sync on its output — so it can be re-run/tuned without
+        # re-running lip-sync.
+        ttk.Label(bar, text="（人脸增强已拆为独立步骤）",
+                  font=(config.CJK_FONT, 9), foreground="#999").pack(side="left", padx=(16, 0))
+
+        # ── Placeholder result area ─────────────────────────────────
+        self._ls_out_text = tk.Text(
+            tab, font=(config.CJK_FONT, 10),
+            wrap="word", state="disabled",
+            bg="#fafafa", relief="flat",
+            padx=20, pady=20, height=8,
+        )
+        self._ls_out_text.pack(expand=True, fill="both", padx=10, pady=10)
+        self._ls_out_text.configure(state="normal")
+        self._ls_out_text.insert("1.0",
+            "选择引擎后点击工具栏「口型匹配」执行。\n"
+            "默认：自动检测（优先使用 MuseTalk）")
+        self._ls_out_text.configure(state="disabled")
+
+    def _build_face_enhance_tab(self, tab: ttk.Frame):
+        """Controls for the standalone CodeFormer face-enhancement step."""
+        from ai_movie.face_restore import codeformer_available, face_parser_available
+        available = codeformer_available()
+        parser_ok = face_parser_available()
+
+        bar = ttk.Frame(tab, padding=(10, 8))
+        bar.pack(fill="x")
+
+        # Fidelity weight (higher = stay closer to input / more faithful).
+        ttk.Label(bar, text="保真度：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 4))
+        self._fe_fidelity_var = tk.DoubleVar(value=0.7)
+        ttk.Scale(bar, from_=0.0, to=1.0, orient="horizontal", length=140,
+                  variable=self._fe_fidelity_var).pack(side="left")
+        self._lbl_fe_fidelity = ttk.Label(bar, text="0.70", width=5,
+                                           font=(config.MONO_FONT, 9))
+        self._lbl_fe_fidelity.pack(side="left", padx=(4, 0))
+        self._fe_fidelity_var.trace_add(
+            "write",
+            lambda *_: self._lbl_fe_fidelity.configure(
+                text=f"{self._fe_fidelity_var.get():.2f}"))
+
+        # Detection subsample: detect every N frames (faces move little).
+        ttk.Label(bar, text="  每 N 帧检测：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(12, 4))
+        self._fe_detevery_var = tk.IntVar(value=4)
+        ttk.Spinbox(bar, from_=1, to=15, width=4,
+                    textvariable=self._fe_detevery_var).pack(side="left")
+
+        # Occlusion / false-detection correction (BiSeNet face parsing):
+        # constrain the paste to real facial pixels and skip frames whose mouth
+        # is covered (e.g. a hand) so no mouth is painted onto the occluder.
+        self._fe_occlusion_var = tk.BooleanVar(value=parser_ok)
+        occ_chk = ttk.Checkbutton(bar, text="遮挡/误检修正",
+                                  variable=self._fe_occlusion_var)
+        occ_chk.pack(side="left", padx=(14, 0))
+
+        if not available:
+            for w in bar.winfo_children():
+                try: w.configure(state="disabled")
+                except Exception: pass
+        if not parser_ok:
+            self._fe_occlusion_var.set(False)
+            occ_chk.configure(state="disabled")
+
+        self._fe_out_text = tk.Text(
+            tab, font=(config.CJK_FONT, 10),
+            wrap="word", state="disabled",
+            bg="#fafafa", relief="flat",
+            padx=20, pady=20, height=8,
+        )
+        self._fe_out_text.pack(expand=True, fill="both", padx=10, pady=10)
+        self._fe_out_text.configure(state="normal")
+        if available:
+            self._fe_out_text.insert("1.0",
+                "对「口型匹配」的输出做 CodeFormer 人脸增强（修复 MuseTalk 重绘的嘴部）。\n\n"
+                "点击工具栏「人脸增强」执行。\n"
+                "· 保真度越高越贴近原脸，越低修复越强但可能漂移（默认 0.70）。\n"
+                "· 人脸检测在 CPU 上运行，避免 ROCm 上的卡顿。\n"
+                "· 完成后「合成视频」会优先使用增强结果。")
+        else:
+            self._fe_out_text.insert("1.0",
+                "未找到 CodeFormer 模型：models/codeformer/codeformer.pth\n"
+                "放入模型后可启用人脸增强。")
+        self._fe_out_text.configure(state="disabled")
+
+    def _populate_face_enhance_tab(self, output_path: Path):
+        """Show the finished face-enhancement result in the 人脸增强 tab."""
+        tab = self._tab_frames.get("人脸增强")
+        if tab is None:
+            return
+        for w in tab.winfo_children():
+            w.destroy()
+
+        f = ttk.Frame(tab, padding=20)
+        f.pack(expand=True)
+        tk.Label(f, text="✓ 人脸增强完成", font=(config.CJK_FONT, 14, "bold"),
+                 fg="#155724").pack(pady=(0, 12))
+
+        info = ttk.LabelFrame(f, text="输出文件", padding=10)
+        info.pack(fill="x", pady=(0, 16))
+        p = Path(output_path)
+        size_mb = p.stat().st_size / 1e6 if p.exists() else 0
+        tk.Label(info, text=str(p), font=(config.MONO_FONT, 8),
+                 fg="#555", wraplength=500).pack(anchor="w")
+        tk.Label(info, text=f"大小：{size_mb:.1f} MB", font=(config.CJK_FONT, 9),
+                 fg="#666").pack(anchor="w", pady=(4, 0))
+
+        btn = ttk.Frame(f)
+        btn.pack()
+        tk.Button(btn, text="▶  在左侧播放", font=(config.CJK_FONT, 11),
+                  command=lambda: self._load_lipsync_video(p)).pack(side="left", padx=8)
+        tk.Button(btn, text="📂  打开所在目录", font=(config.CJK_FONT, 10),
+                  command=lambda: subprocess.Popen(
+                      ["xdg-open", str(p.parent)])).pack(side="left", padx=8)
+        self._load_lipsync_video(p)
 
     def _build_output_tab(self, tab: ttk.Frame, name: str):
         """Simple tab showing the step's output path when done."""

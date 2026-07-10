@@ -15,11 +15,12 @@ STEP_NAMES = [
     "合成音轨",
     "人物锚定",
     "口型匹配",
+    "人脸增强",
     "合成视频",
 ]
 
 # Steps whose completion is NOT required to unlock the next step.
-OPTIONAL_STEPS = {"切割视频", "合成音轨"}
+OPTIONAL_STEPS = {"切割视频", "合成音轨", "人脸增强"}
 
 # Each step's prerequisites (must all be "done" to unlock).
 STEP_DEPS: dict[str, list[str]] = {
@@ -32,7 +33,8 @@ STEP_DEPS: dict[str, list[str]] = {
     "重新混音": ["人声生成"],
     "合成音轨": ["拆分音轨", "文本翻译"],  # one-click shortcut
     "人物锚定": ["文本翻译"],
-    "口型匹配": ["人物锚定"],
+    "口型匹配": ["人声生成"],
+    "人脸增强": ["口型匹配"],   # optional polish pass on the lip-sync output
     "合成视频": ["口型匹配", "重新混音"],
 }
 

@@ -13,6 +13,8 @@ IMPORTANT: CosyVoice uses internal threading for LLM inference and
 must be called from the main thread.
 """
 
+import json
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -29,6 +31,17 @@ _COSYVOICE_SRC = Path(__file__).parent.parent / "models" / "CosyVoice"
 _MATCHA_SRC    = _COSYVOICE_SRC / "third_party" / "Matcha-TTS"
 _SFT_MODEL_DIR = Path(__file__).parent.parent / "models" / "CosyVoice-300M-SFT"
 _ZS_MODEL_DIR  = Path(__file__).parent.parent / "models" / "CosyVoice2-0.5B"
+_CV3_MODEL_DIR = Path(__file__).parent.parent / "models" / "CosyVoice3-0.5B"
+
+# ── isolated-worker paths ─────────────────────────────────────────
+# CosyVoice2/3 use a Qwen2 LLM that only decodes correctly under
+# transformers 4.51.3, which conflicts with the newer transformers the
+# app needs for the Hy-MT2 (hy_v3) translator.  Qwen-based synthesis is
+# therefore run in a subprocess that pins transformers 4.51.3 from
+# ``vendor/tts_transformers``.  SFT (CosyVoice-300M) uses no transformers
+# and keeps running in-process.
+_WORKER_PATH   = Path(__file__).parent / "tts_worker.py"
+_PINNED_TF_DIR = Path(__file__).parent.parent / "vendor" / "tts_transformers"
 
 # ── SFT speaker IDs ───────────────────────────────────────────────
 _SFT_FEMALE_SPK = "中文女"
@@ -40,6 +53,20 @@ _FEMALE_REF_WAV  = _ASSET_DIR / "zero_shot_prompt.wav"
 _FEMALE_REF_TEXT = "希望你以后能够做的比我还好呦。"
 _MALE_REF_WAV    = _ASSET_DIR / "cross_lingual_prompt.wav"
 
+# ── Soft female voice style ──────────────────────────────────────
+# NOTE: instruct2 was ABANDONED for style mode.  On this build (CosyVoice2/3
+# under the pinned transformers 4.51.3, ROCm) instruct2 reliably reads the
+# style instruction aloud ("用台湾女生的口音，温柔甜美地说…") and mixes it into
+# the speech — the instruction-suppression training depends on the model's
+# native transformers version, which we can't use (it conflicts with the
+# Hy-MT2 translator).  Style mode now uses plain zero_shot cloning of a soft
+# female reference wav: no instruction text exists, so nothing can leak.  The
+# voice identity/tone comes entirely from the reference clip — swap
+# _STYLE_REF_WAV / _STYLE_REF_TEXT for a Taiwanese soft-voice clip (with its
+# exact transcript) to get authentic Taiwanese styling.
+_STYLE_REF_WAV  = _FEMALE_REF_WAV          # soft female reference (bundled)
+_STYLE_REF_TEXT = _FEMALE_REF_TEXT         # exact transcript of _STYLE_REF_WAV
+
 # F0 threshold (Hz) separating male from female
 _GENDER_THRESHOLD_HZ = 165.0
 
@@ -49,7 +76,59 @@ _is_sft   = False          # True when CosyVoice-300M-SFT is loaded
 _lock     = threading.Lock()
 
 
-def _load_model():
+def get_available_models() -> list[str]:
+    """Return list of available TTS model keys, SFT-first (recommended)."""
+    models: list[str] = []
+    if _SFT_MODEL_DIR.exists() and (_SFT_MODEL_DIR / "llm.pt").exists():
+        models.append("sft")
+    if _CV3_MODEL_DIR.exists() and (_CV3_MODEL_DIR / "cosyvoice3.yaml").exists():
+        models.append("cosyvoice3")
+    if _ZS_MODEL_DIR.exists() and (_ZS_MODEL_DIR / "cosyvoice2.yaml").exists():
+        models.append("cosyvoice2")
+    return models
+
+
+def resolve_model_choice(prefer: str | None = None) -> str:
+    """Return the model key that :func:`_load_model` would select.
+
+    Same precedence as :func:`_load_model` (SFT > CosyVoice3 > CosyVoice2),
+    but resolved *without* loading anything — used to decide whether a run
+    needs the isolated Qwen worker.
+    """
+    available = get_available_models()
+    if prefer and prefer in available:
+        return prefer
+    for c in ("sft", "cosyvoice3", "cosyvoice2"):
+        if c in available:
+            return c
+    raise RuntimeError(
+        "No CosyVoice model found.  Download at least one model to models/."
+    )
+
+
+_MODEL_DISPLAY = {
+    "sft":       "CosyVoice-300M-SFT（内置音色，推荐）",
+    "cosyvoice3": "CosyVoice3-0.5B（zero-shot 复刻）",
+    "cosyvoice2": "CosyVoice2-0.5B（zero-shot 回退）",
+}
+
+
+def model_display_name(key: str) -> str:
+    """Human-readable label for a model key returned by :func:`get_available_models`."""
+    return _MODEL_DISPLAY.get(key, key)
+
+
+def _load_model(prefer: str | None = None):
+    """Lazy-load a CosyVoice model (thread-safe, idempotent).
+
+    Parameters
+    ----------
+    prefer:
+        - ``"sft"``        — force CosyVoice-300M-SFT (built-in gender speakers).
+        - ``"cosyvoice3"`` — force CosyVoice3-0.5B (zero-shot / cross-lingual).
+        - ``"cosyvoice2"`` — force CosyVoice2-0.5B (zero-shot / cross-lingual).
+        - ``None``         — auto-select: SFT > CosyVoice3 > CosyVoice2.
+    """
     global _model, _is_sft
     if _model is not None:
         return
@@ -61,10 +140,29 @@ def _load_model():
         if str(_MATCHA_SRC) not in sys.path:
             sys.path.insert(0, str(_MATCHA_SRC))
         from cosyvoice.cli.cosyvoice import AutoModel
-        if _SFT_MODEL_DIR.exists() and (_SFT_MODEL_DIR / "llm.pt").exists():
+
+        # Resolve preference
+        available = get_available_models()
+        if prefer and prefer in available:
+            choice = prefer
+        elif "sft" in available:
+            choice = "sft"
+        elif "cosyvoice3" in available:
+            choice = "cosyvoice3"
+        elif "cosyvoice2" in available:
+            choice = "cosyvoice2"
+        else:
+            raise RuntimeError(
+                "No CosyVoice model found.  Download at least one model to models/."
+            )
+
+        if choice == "sft":
             _model  = AutoModel(model_dir=str(_SFT_MODEL_DIR))
             _is_sft = True
-        else:
+        elif choice == "cosyvoice3":
+            _model  = AutoModel(model_dir=str(_CV3_MODEL_DIR), fp16=True)
+            _is_sft = False
+        else:  # cosyvoice2
             _model  = AutoModel(model_dir=str(_ZS_MODEL_DIR))
             _is_sft = False
 
@@ -353,7 +451,7 @@ def trim_reference_audio(reference_audio: str | Path, max_seconds: int = 10) -> 
 
 def prepare_reference(
     vocals_path: str | Path,
-    mode: Literal["gender", "clone"] = "gender",
+    mode: Literal["gender", "clone", "style"] = "gender",
     cache_dir: str | Path | None = None,
 ) -> tuple[str, str | None, str]:
     """Derive the speaker / reference and synthesis method for one session.
@@ -368,7 +466,16 @@ def prepare_reference(
     is a file path to reference audio.
     """
     cache_dir = ensure_dir(Path(cache_dir) if cache_dir else WORKSPACE_DIR / "synthesized")
-    gender    = detect_gender(vocals_path)
+
+    if mode == "style":
+        # Soft female voice via zero_shot cloning of a fixed reference wav.
+        # (instruct2 abandoned — it leaks the style instruction into speech.)
+        if _STYLE_REF_WAV.exists():
+            return str(_STYLE_REF_WAV), _STYLE_REF_TEXT, "zero_shot"
+        # No bundled reference — clone the source speaker instead.
+        return trim_reference_audio(vocals_path), None, "cross_lingual"
+
+    gender = detect_gender(vocals_path)
 
     if mode == "gender":
         if _is_sft:
@@ -386,6 +493,11 @@ def prepare_reference(
     best_seg = str(cache_dir / "ref_best_segment.wav")
     extract_best_speech_segment(vocals_path, best_seg)
     return best_seg, None, "cross_lingual"
+
+
+def _is_cosyvoice3(model) -> bool:
+    """Return True if *model* is a CosyVoice3 instance (avoids circular import)."""
+    return type(model).__name__ == "CosyVoice3"
 
 
 def call_tts(
@@ -408,7 +520,25 @@ def call_tts(
     if method == "sft":
         for gen in model.inference_sft(text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
+    elif method == "instruct2":
+        # spk_or_ref = base-timbre reference wav; ref_text = style instruction.
+        instruct = ref_text or _STYLE_INSTRUCT
+        # CosyVoice3's LLM asserts the <|endofprompt|> token (151646) is present
+        # in the prompt — instruct_text is fed in as prompt_text, so it must
+        # carry the marker or every llm_job thread dies on the assertion.
+        if _is_cosyvoice3(model) and "<|endofprompt|>" not in instruct:
+            instruct = instruct + "<|endofprompt|>"
+        if hasattr(model, "inference_instruct2"):
+            for gen in model.inference_instruct2(text, instruct, spk_or_ref, stream=False):
+                chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
+        else:
+            # SFT / CosyVoice-300M has no instruct2 — clone the timbre instead.
+            for gen in model.inference_cross_lingual(text, spk_or_ref, stream=False):
+                chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     elif method == "zero_shot" and ref_text:
+        # CosyVoice3 requires <|endofprompt|> in prompt_text
+        if _is_cosyvoice3(model) and "<|endofprompt|>" not in ref_text:
+            ref_text = ref_text + "<|endofprompt|>"
         for gen in model.inference_zero_shot(text, ref_text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     else:
@@ -417,13 +547,125 @@ def call_tts(
     return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
 
+def run_isolated_synthesis(
+    seg_texts: list[tuple[int, str]],
+    model_choice: str,
+    ref_audio: str,
+    ref_text: str | None,
+    method: str,
+    output_dir: str | Path,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[int, dict]:
+    """Synthesize Qwen-based (CosyVoice2/3) segments in a pinned subprocess.
+
+    Spawns :mod:`ai_movie.tts_worker` (transformers 4.51.3) and streams its
+    progress.  Returns ``{index: {"audio": path}}`` or ``{index: {"audio":
+    None, "tts_error": msg}}`` for each requested segment.
+
+    Runs on any thread — the heavy CosyVoice work (and its main-thread
+    requirement) lives in the child process.
+    """
+    output_dir = ensure_dir(Path(output_dir))
+    model_dir = _CV3_MODEL_DIR if model_choice == "cosyvoice3" else _ZS_MODEL_DIR
+    job = {
+        "model_dir":  str(model_dir),
+        "ref_audio":  ref_audio,
+        "ref_text":   ref_text,
+        "method":     method,
+        "output_dir": str(output_dir),
+        "fp16":       True,
+        "segments":   [{"index": i, "text": t} for i, t in seg_texts],
+    }
+    job_path = output_dir / "_tts_job.json"
+    with open(job_path, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False)
+
+    total = len(seg_texts)
+    results: dict[int, dict] = {}
+    fatal: str | None = None
+
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(_WORKER_PATH), str(job_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    # CosyVoice + MIOpen write a LOT to stderr.  If we don't drain it, the OS
+    # pipe buffer fills, the child blocks on write(stderr), and we deadlock
+    # waiting on stdout.  Drain stderr in a background thread (keep the tail
+    # for error reporting).
+    stderr_tail: list[str] = []
+
+    def _drain_stderr():
+        try:
+            for eline in proc.stderr:
+                stderr_tail.append(eline)
+                if len(stderr_tail) > 200:
+                    del stderr_tail[:100]
+        except Exception:
+            pass
+
+    err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    err_thread.start()
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    ev = None         # worker diagnostics on stdout — ignore
+                if ev is not None:
+                    kind = ev.get("ev")
+                    if kind == "progress":
+                        if progress_cb:
+                            progress_cb(ev["done"], ev["total"])
+                    elif kind == "result":
+                        for k, v in ev.get("items", {}).items():
+                            idx = int(k)
+                            if v.get("audio"):
+                                results[idx] = {"audio": v["audio"]}
+                            else:
+                                results[idx] = {"audio": None}
+                                if v.get("error"):
+                                    results[idx]["tts_error"] = v["error"]
+                    elif kind == "fatal":
+                        fatal = ev.get("error", "unknown worker error")
+            if cancel_check and cancel_check():
+                proc.terminate()
+                break
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        err_thread.join(timeout=2)
+
+    if fatal is not None:
+        for i, _ in seg_texts:
+            results.setdefault(i, {"audio": None, "tts_error": fatal})
+    if proc.returncode not in (0, None) and not results:
+        err = "".join(stderr_tail[-20:]).strip() or f"worker exit {proc.returncode}"
+        for i, _ in seg_texts:
+            results.setdefault(i, {"audio": None, "tts_error": err[-500:]})
+
+    # Ensure every requested segment has an entry.
+    for i, _ in seg_texts:
+        results.setdefault(i, {"audio": None, "tts_error": "worker produced no result"})
+    return results
+
+
 def synthesize(
     segments: list[dict],
     reference_audio: str | Path,
     output_dir: str | Path | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    mode: Literal["gender", "clone"] = "gender",
+    mode: Literal["gender", "clone", "style"] = "gender",
 ) -> list[dict]:
     """Generate Chinese speech for translated segments.
 
@@ -434,13 +676,45 @@ def synthesize(
     mode:
         ``'gender'`` — clear bundled voice matched to detected gender (default).
         ``'clone'``  — voice cloning from the best segment of *reference_audio*.
+        ``'style'``  — Taiwanese / soft female voice via CosyVoice3 instruct2.
+
+    SFT synthesis runs in-process on the calling (main) thread.  Qwen-based
+    synthesis (CosyVoice2/3 — any non-SFT method) is delegated to an
+    isolated subprocess and may therefore be called from any thread.
     """
-    _load_model()
+    # 'style' needs an instruct2-capable model (CosyVoice3 > CosyVoice2);
+    # the SFT model has no instruct2 and would silently fall back.
+    prefer = "cosyvoice3" if mode == "style" else None
+    choice = resolve_model_choice(prefer)
 
     if output_dir is None:
         output_dir = ensure_dir(WORKSPACE_DIR / "synthesized")
     else:
         output_dir = ensure_dir(Path(output_dir))
+
+    # ── Qwen-based models: run in the transformers-4.51.3 subprocess ──
+    if choice != "sft":
+        ref_audio, ref_text, method = prepare_reference(
+            reference_audio, mode=mode, cache_dir=output_dir
+        )
+        seg_texts = [
+            (i, seg.get("text_translated", "").strip())
+            for i, seg in enumerate(segments)
+        ]
+        items = run_isolated_synthesis(
+            seg_texts, choice, ref_audio, ref_text, method,
+            output_dir, progress_cb, cancel_check,
+        )
+        results = list(segments)
+        for i in range(len(results)):
+            it = items.get(i, {})
+            results[i]["audio"] = it.get("audio")
+            if it.get("tts_error"):
+                results[i]["tts_error"] = it["tts_error"]
+        return results
+
+    # ── SFT (CosyVoice-300M): in-process, main thread ──
+    _load_model(prefer=prefer)
 
     ref_audio, ref_text, method = prepare_reference(
         reference_audio, mode=mode, cache_dir=output_dir

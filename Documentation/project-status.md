@@ -1,6 +1,6 @@
 # AI Movie — 项目状态报告
 
-> 更新日期：2026-06-05
+> 更新日期：2026-06-09
 > 平台：Ubuntu 24.04 + AMD Ryzen AI MAX+ 395（Radeon 8060S / ROCm 7.2）
 
 ---
@@ -26,7 +26,7 @@
 | 合成音轨 | `app.py` | ✅ | 一键完成人声分离 + 生成 + 混音 |
 | 合成视频 | `composer.py` | ✅ | FFmpeg 替换音轨（视频流 copy，音频 AAC 192k） |
 | 人物锚定 | `app.py` | 🔲 | 占位 stub（ECAPA 说话人日志已集成到 TTS） |
-| 口型匹配 | `app.py` | 🔲 | 占位 stub |
+| 口型匹配 | `lip_sync.py` | 🟡 | Wav2Lip 模块封装完毕，GUI 集成中 |
 
 ### GUI 功能
 - [x] VLC 嵌入式视频播放器（主窗口 + 弹出窗口均带可拖动进度条）
@@ -85,10 +85,11 @@
 
 ### 🟡 中优先级
 
-4. **Ollama 翻译延迟高**
-   - 每段需单独 HTTP 请求（~2-5 秒/段），大量片段时耗时长
-   - `polish_ollama` 的批量模式部分缓解（每批 10 段，仅 NSFW 片段）
-   - 可进一步优化：增大 batch size、使用 streaming API
+4. ~~**Ollama 翻译延迟高**~~ ✅ 已优化
+   - `translate_ollama`：每段一次 HTTP → JSON 批量翻译（默认 15 句/批），速度提升 ~15x
+   - `polish_ollama`：分隔符正则解析 → JSON 数组校验 + 最多 5 次重试
+   - 新增跨批上下文窗口（3 句），提升对话连贯性
+   - 新增 JSON 格式校验：长度不匹配 / 空输出 / JSON 语法错误自动重试
 
 5. **合成音轨声音质量**
    - Demucs 分离后的背景音可能有轻微 artifacts
@@ -103,7 +104,7 @@
 ### 🔲 低优先级
 
 7. **人物锚定** — GUI 功能未实现，但 ECAPA 说话人日志已集成到 TTS 步骤
-8. **口型匹配** — 未实现，stub 占位
+8. **口型匹配** — Wav2Lip 模块已封装（`lip_sync.py`），驱动信号已修正为干净 TTS 人声
 9. **CLI 入口** — 仅有 GUI 模式，无命令行接口
 10. **端到端测试** — 缺少自动化测试
 
@@ -119,14 +120,15 @@
 | `ai_movie/asr.py` | ~590 | 语音识别（多后端自动选择） | ✅ |
 | `ai_movie/asr_gpu.py` | ~120 | GPU bridge（DirectML，Windows 用） | ✅ |
 | `ai_movie/asr_wsl.py` | ~130 | GPU bridge（WSL+ROCm，Windows 用） | ✅ |
-| `ai_movie/translator.py` | ~640 | 文本翻译（Hy-MT）+ Ollama 翻译/润色 + NSFW 检测 | ✅ |
+| `ai_movie/translator.py` | ~780 | 文本翻译（Hy-MT）+ Ollama JSON 批量翻译/润色 + retry | ✅ |
 | `ai_movie/tts.py` | ~490 | TTS 语音合成 + 三种性别检测算法 + ECAPA 说话人日志 | ✅ |
-| `ai_movie/composer.py` | ~200 | 人声分离 + 混音 + 视频合成 | ✅ |
+| `ai_movie/composer.py` | ~270 | 人声分离 + 混音 + 视频合成 + 干净人声音轨 | ✅ |
+| `ai_movie/lip_sync.py` | ~500 | Wav2Lip 口型匹配（人脸检测 + GAN 推理 + 视频合成） | 🟡 |
 | `ai_movie/project_log.py` | ~130 | 项目日志 + 步骤依赖链 | ✅ |
 | `ai_movie/task_manager.py` | ~80 | 线程安全任务注册 | ✅ |
 | `ai_movie/utils.py` | ~20 | 文件/JSON 工具 | ✅ |
 | `ai_movie/pipeline.py` | ~10 | Pipeline 占位 | 🔲 |
-| `ai_movie/gui/app.py` | ~2640 | 主窗口 + 完整 GUI（含翻译引擎选择等） | ✅ |
+| `ai_movie/gui/app.py` | ~2830 | 主窗口 + 完整 GUI（含翻译引擎选择、Wav2Lip 口型匹配） | ✅ |
 | `ai_movie/gui/player.py` | ~240 | VLC 嵌入播放器 | ✅ |
 | `ai_movie/gui/__init__.py` | ~1 | - | ✅ |
 
