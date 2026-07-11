@@ -2674,19 +2674,10 @@ class App:
         for text, val in [("自动检测性别", "gender"), ("全部女声", "female"),
                           ("全部男声", "male"), ("台湾柔和女声", "style")]:
             ttk.Radiobutton(tts_mode_bar, text=text, variable=tts_mode_var, value=val).pack(side="left", padx=(6, 2))
-
-        # ── TTS engine selector ─────────────────────────────────
-        tts_eng_bar = ttk.Frame(sec6); tts_eng_bar.pack(fill="x", pady=(4, 0))
-        ttk.Label(tts_eng_bar, text="引擎：", foreground="#555").pack(side="left")
-        import ai_movie.tts as _tts_mod
-        _avail = _tts_mod.get_available_models()
-        tts_eng_labels = [_tts_mod.model_display_name(k) for k in _avail]
-        tts_eng_vals = _avail  # keys: "sft", "cosyvoice3", …
-        tts_eng_var = tk.StringVar(value=tts_eng_labels[0] if tts_eng_labels else "CosyVoice-300M-SFT（内置音色，推荐）")
-        vars_dict["tts_model"] = tts_eng_var
-        vars_dict["_tts_model_map"] = dict(zip(tts_eng_labels, tts_eng_vals))
-        ttk.Combobox(tts_eng_bar, textvariable=tts_eng_var,
-                     values=tts_eng_labels, state="readonly", width=34).pack(side="left", padx=(4, 0))
+        # Engine is implied by the voice choice — no separate selector:
+        #   自动检测性别 / 台湾柔和女声 → CosyVoice3; 全部女声 / 全部男声 → SFT.
+        ttk.Label(sec6, text="（引擎自动：自动/台湾=CosyVoice3，全部女/男=SFT内置音色）",
+                  foreground="#999").pack(anchor="w", pady=(2, 0))
 
         tts_algo_bar = ttk.Frame(sec6); tts_algo_bar.pack(fill="x", pady=(2, 0))
         tts_algo_var = tk.StringVar(value="f0_per_seg")
@@ -3169,13 +3160,11 @@ class App:
             voice_mode = opts.get("tts_mode", tk.StringVar(value="gender")).get()
             algo = opts.get("tts_algo", tk.StringVar(value="f0_per_seg")).get()
 
-            tts_model_label = opts.get("tts_model", tk.StringVar()).get()
-            tts_model_map = opts.get("_tts_model_map", {})
-            tts_model = tts_model_map.get(tts_model_label, "sft")
-            # Style AND gender-auto prefer CosyVoice3 (female → soft/Taiwanese
-            # style ref, male → Mandarin). Falls back to SFT if not installed.
-            if voice_mode in ("style", "gender"):
-                tts_model = "cosyvoice3"
+            # Engine is implied by the voice choice — no separate selector:
+            #   自动检测性别 / 台湾柔和女声 → CosyVoice3 (soft/Taiwanese female,
+            #   Mandarin male); 全部女声 / 全部男声 → SFT built-in speaker.
+            # resolve_model_choice() falls back if the preferred model is absent.
+            tts_model = "cosyvoice3" if voice_mode in ("style", "gender") else "sft"
             # SFT loads in-process; Qwen models synthesize in the isolated subprocess.
             choice = tts_mod.resolve_model_choice(tts_model)
             is_sft = (choice == "sft")
