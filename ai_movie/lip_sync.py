@@ -899,6 +899,40 @@ def _cut_video_clip(
     return output_path
 
 
+def _fit_clip_to_duration(src: Path, target_dur: float, fps: float, dst: Path) -> Path:
+    """Re-time *src* so its video duration is exactly *target_dur* seconds.
+
+    MuseTalk emits a few % FEWER frames than its driving audio, so each speech
+    clip is slightly shorter than its timeline slot; concatenated, that drift
+    accumulates and the video runs progressively ahead of the audio.  A tiny
+    ``setpts`` speed adjustment (imperceptible on lip motion) snaps each clip to
+    its slot so the whole timeline stays aligned with the audio.
+    """
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames,r_frame_rate",
+        "-of", "default=nw=1", str(src),   # keeps key=value (order-independent)
+    ], capture_output=True, text=True).stdout
+    vals = dict(l.split("=", 1) for l in probe.splitlines() if "=" in l)
+    cur = target_dur
+    try:
+        nb = int(vals["nb_frames"]); num, den = vals["r_frame_rate"].split("/")
+        cur = nb * float(den) / float(num)
+    except Exception:
+        pass
+    if cur <= 0:
+        cur = target_dur
+    factor = target_dur / cur
+    # setpts stretches the timestamps; the fps filter then resamples to CFR,
+    # duplicating frames as needed so the clip is exactly target_dur long.
+    subprocess.run([
+        "ffmpeg", "-y", "-i", str(src), "-an",
+        "-vf", f"setpts={factor:.6f}*PTS,fps={fps}",
+        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(dst),
+    ], check=True, capture_output=True, text=True)
+    return dst
+
+
 def _cut_audio_clip(
     audio_path: Path,
     start: float,
@@ -1402,6 +1436,15 @@ def segment_based_lip_sync(
                 except Exception as rexc:
                     _log(f"[{idx+1}/{total_segments}] CodeFormer restore FAILED: {rexc} "
                          f"— using un-restored lip-sync clip")
+            # ── Snap the clip to its exact slot duration so the concatenated
+            #    video stays aligned with the audio (MuseTalk runs a few % short)
+            fitted_clip = tmp_dir / f"{clip_name}_fit.mp4"
+            try:
+                _fit_clip_to_duration(final_clip, seg_end - seg_start, ms_fps, fitted_clip)
+                if fitted_clip.exists():
+                    final_clip = fitted_clip
+            except Exception as fexc:
+                _log(f"[{idx+1}/{total_segments}] duration-fit skipped: {fexc}")
             processed_map[(seg_start, seg_end)] = final_clip
             _log(f"[{idx+1}/{total_segments}] Lip-sync OK")
         except Exception as exc:
