@@ -926,10 +926,16 @@ def _cut_audio_clip(
 def _concatenate_videos(
     clip_paths: list[Path],
     output_path: Path,
+    fps: float | None = None,
 ) -> Path:
-    """Concatenate video clips using FFmpeg concat demuxer.
+    """Concatenate video clips, forcing a uniform constant frame rate.
 
-    Falls back to re-encoding if stream copy fails (e.g. codec mismatch).
+    Do NOT stream-copy (``-c copy``): the clips can differ slightly in frame
+    rate / timebase (MuseTalk output vs re-encoded gaps), and concatenating
+    heterogeneous timestamps with ``-c copy`` yields a broken presentation
+    timeline — the container reports a wrong fps/duration and the video plays
+    faster than (and desyncs from) the audio.  Re-encode with ``-fps_mode cfr``
+    at a single fps so every frame gets a correct, uniform timestamp.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     filelist = output_path.parent / f"{output_path.stem}_concat.txt"
@@ -937,30 +943,30 @@ def _concatenate_videos(
         for p in clip_paths:
             f.write(f"file '{p.absolute()}'\n")
 
-    # Try stream copy first
+    r = fps or _probe_fps(clip_paths[0])
     result = subprocess.run([
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(filelist),
-        "-c", "copy",
-        str(output_path),
-    ], capture_output=True, text=True)
-
-    if result.returncode == 0:
-        filelist.unlink(missing_ok=True)
-        return output_path
-
-    # Fallback: re-encode
-    _log("Concat stream-copy failed; re-encoding instead.")
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(filelist),
+        "-fps_mode", "cfr", "-r", f"{r}",
         "-c:v", "libx264", "-crf", "18",
         "-pix_fmt", "yuv420p",
+        "-video_track_timescale", "30000",
         "-c:a", "aac", "-b:a", "192k",
         str(output_path),
-    ], capture_output=True, text=True, check=True)
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        # Older ffmpeg without -fps_mode: fall back to -vsync cfr.
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(filelist),
+            "-vsync", "cfr", "-r", f"{r}",
+            "-c:v", "libx264", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            str(output_path),
+        ], check=True, capture_output=True, text=True)
 
     filelist.unlink(missing_ok=True)
     return output_path
@@ -1426,9 +1432,9 @@ def segment_based_lip_sync(
                         reencode=True, fps=gap_fps)
         all_clips.append(gap_clip)
 
-    # ── Concatenate all clips ────────────────────────────────────
-    _log(f"Concatenating {len(all_clips)} clips")
-    _concatenate_videos(all_clips, output_path)
+    # ── Concatenate all clips (uniform CFR to keep A/V in sync) ──
+    _log(f"Concatenating {len(all_clips)} clips at {ms_fps} fps")
+    _concatenate_videos(all_clips, output_path, fps=ms_fps)
 
     # ── Clean up ─────────────────────────────────────────────────
     shutil.rmtree(str(tmp_dir), ignore_errors=True)
