@@ -938,37 +938,38 @@ def _concatenate_videos(
     at a single fps so every frame gets a correct, uniform timestamp.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filelist = output_path.parent / f"{output_path.stem}_concat.txt"
-    with open(filelist, "w") as f:
-        for p in clip_paths:
-            f.write(f"file '{p.absolute()}'\n")
-
     r = fps or _probe_fps(clip_paths[0])
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(filelist),
-        "-fps_mode", "cfr", "-r", f"{r}",
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-video_track_timescale", "30000",
-        "-c:a", "aac", "-b:a", "192k",
-        str(output_path),
-    ], capture_output=True, text=True)
-    if result.returncode != 0:
-        # Older ffmpeg without -fps_mode: fall back to -vsync cfr.
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(filelist),
-            "-vsync", "cfr", "-r", f"{r}",
-            "-c:v", "libx264", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            str(output_path),
-        ], check=True, capture_output=True, text=True)
 
-    filelist.unlink(missing_ok=True)
+    # The clips are heterogeneous: MuseTalk output keeps the SOURCE fps/timebase
+    # (it ignores --fps), while gap clips are freshly re-encoded.  The concat
+    # DEMUXER requires a matching timebase across inputs — feeding it mismatched
+    # timebases yields non-monotonic timestamps, and a single -fps_mode cfr pass
+    # then DROPS frames, so the video ends up far shorter than the audio (severe
+    # A/V desync with local freeze/fast).  Normalize EVERY clip to one identical
+    # CFR fps + timebase first, then a plain -c copy concat is exact.
+    norm_dir = Path(tempfile.mkdtemp(prefix="cf_concat_"))
+    try:
+        norm: list[Path] = []
+        for i, p in enumerate(clip_paths):
+            q = norm_dir / f"n{i:05d}.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(p),
+                "-r", f"{r}", "-fps_mode", "cfr",
+                "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                "-video_track_timescale", "90000", "-an", str(q),
+            ], check=True, capture_output=True, text=True)
+            norm.append(q)
+
+        filelist = norm_dir / "list.txt"
+        with open(filelist, "w") as f:
+            for q in norm:
+                f.write(f"file '{q.absolute()}'\n")
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist),
+            "-c", "copy", str(output_path),
+        ], check=True, capture_output=True, text=True)
+    finally:
+        shutil.rmtree(norm_dir, ignore_errors=True)
     return output_path
 
 
@@ -1193,6 +1194,7 @@ def segment_based_lip_sync(
     max_segment_duration: float = 12.0,
     resize_factor: int | None = None,
     face_restore: bool = False,
+    occlusion_gate: bool = False,
     anchor_gender: str | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
@@ -1364,6 +1366,22 @@ def segment_based_lip_sync(
                     cancel_check=cancel_check,
                 )
             final_clip = lipsync_clip
+            # ── Optional occlusion gate: keep original frames where the mouth
+            #    is covered (hand) so MuseTalk's mouth isn't pasted on it ──
+            if occlusion_gate:
+                gated_clip = tmp_dir / f"{clip_name}_gated.mp4"
+                try:
+                    from ai_movie import face_restore as _fr
+                    _fr.occlusion_gate_video(
+                        orig_clip, final_clip, gated_clip,
+                        cancel_check=cancel_check, log_cb=_log,
+                    )
+                    if gated_clip.exists():
+                        final_clip = gated_clip
+                        _log(f"[{idx+1}/{total_segments}] occlusion-gate OK")
+                except Exception as gexc:
+                    _log(f"[{idx+1}/{total_segments}] occlusion-gate FAILED: {gexc} "
+                         f"— using un-gated lip-sync clip")
             # ── Optional CodeFormer restore of the regenerated face ──
             if face_restore:
                 restored_clip = tmp_dir / f"{clip_name}_restored.mp4"

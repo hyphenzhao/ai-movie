@@ -469,3 +469,184 @@ def restore_video(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return out_video
+
+
+def occlusion_gate_video(
+    orig_video: str | Path,
+    lipsync_video: str | Path,
+    out_video: str | Path,
+    *,
+    det_device: str = "cpu",
+    det_every: int = 4,
+    det_max_width: int = 640,
+    face_det_batch_size: int = 8,
+    conf_thresh: float = 0.9,
+    occlusion_lip_thresh: float = 0.004,
+    min_occluded_run: int = 6,
+    parse_device: str | None = None,
+    chunk_size: int = 600,
+    cancel_check: Callable[[], bool] | None = None,
+    log_cb: Callable[[str], None] | None = None,
+) -> Path:
+    """Keep the ORIGINAL frame wherever the mouth is occluded / no face found.
+
+    MuseTalk pastes a generated mouth onto each original frame.  When the mouth
+    is covered (e.g. a hand) it paints a mouth onto the occluder.  This picks,
+    per frame, between the lip-synced frame (mouth visible) and the original
+    frame (mouth occluded or no confident face), using the BiSeNet lip-presence
+    gate.  Audio is taken from *lipsync_video*.  If the parser is unavailable
+    the lip-synced video is passed through unchanged.
+
+    ``min_occluded_run``: the BiSeNet lip check misfires on isolated frames
+    (head turns, motion blur, wide-open mouths), so a frame is only reverted to
+    the original when it is part of a **run** of at least this many consecutive
+    occluded frames — a real hand-over-mouth lasts many frames, sporadic misses
+    do not.  This keeps normal lip-sync intact.
+    """
+    orig_video, lipsync_video, out_video = Path(orig_video), Path(lipsync_video), Path(out_video)
+    if not face_parser_available():
+        out_video.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(lipsync_video), str(out_video))
+        return out_video
+
+    from ai_movie.lip_sync import _detect_faces
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    parse_dev = parse_device or device
+    parser = _load_face_parser(parse_dev)
+
+    capO = cv2.VideoCapture(str(orig_video))
+    capL = cv2.VideoCapture(str(lipsync_video))
+    if not capO.isOpened() or not capL.isOpened():
+        raise RuntimeError("occlusion_gate: cannot open input video(s)")
+    fps = capL.get(cv2.CAP_PROP_FPS) or 25.0
+    total = min(int(capO.get(cv2.CAP_PROP_FRAME_COUNT)),
+                int(capL.get(cv2.CAP_PROP_FRAME_COUNT)))
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="cf_occgate_"))
+    tmp_avi = tmp_dir / "gated.avi"
+    writer = None
+    processed = 0
+    reverted = 0
+    try:
+        while processed < total:
+            if cancel_check and cancel_check():
+                capO.release(); capL.release()
+                if writer is not None:
+                    writer.release()
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return out_video
+            ow, lw = [], []
+            for _ in range(min(chunk_size, total - processed)):
+                okO, fO = capO.read(); okL, fL = capL.read()
+                if not (okO and okL):
+                    break
+                ow.append(fO); lw.append(fL)
+            if not ow:
+                break
+            H, W = lw[0].shape[:2]
+            if writer is None:
+                writer = cv2.VideoWriter(str(tmp_avi), cv2.VideoWriter_fourcc(*"FFV1"), fps, (W, H))
+                if not writer.isOpened():
+                    writer = cv2.VideoWriter(str(tmp_avi), cv2.VideoWriter_fourcc(*"MJPG"), fps, (W, H))
+
+            # Detect faces on the ORIGINAL frames (CPU), subsampled + interpolated.
+            det_scale = det_max_width / W if W > det_max_width else 1.0
+            n = len(ow)
+            key_idx = list(range(0, n, max(1, det_every)))
+            if key_idx[-1] != n - 1:
+                key_idx.append(n - 1)
+
+            def _prep(f):
+                if det_scale == 1.0:
+                    return f
+                dw, dh = int(round(W * det_scale)), int(round(H * det_scale))
+                return cv2.resize(f, (dw, dh), interpolation=cv2.INTER_AREA)
+
+            fr = _detect_faces([_prep(ow[i]) for i in key_idx], device=det_device,
+                               batch_size=face_det_batch_size, pads=(0, 0, 0, 0),
+                               nosmooth=False, return_scores=True)
+            inv = 1.0 / det_scale
+            key_boxes = [(b[0] * inv, b[1] * inv, b[2] * inv, b[3] * inv) for _, b, _s in fr]
+            key_valid = [s >= conf_thresh for _, _b, s in fr]
+            boxes = _resolve_boxes(key_idx, key_boxes, key_valid, n, det_every)
+
+            # First pass: per-frame occluded flag (no confident face OR mouth
+            # has essentially no visible lip pixels).
+            occluded = [False] * n
+            for i in range(n):
+                box = boxes[i]
+                if box is None:
+                    occluded[i] = True
+                    continue
+                y1, y2, x1, x2 = box
+                bw, bh = x2 - x1, y2 - y1
+                if bw > 8 and bh > 8:
+                    S = int(max(bw, bh) * 1.4)
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    sx = max(0, min(cx - S // 2, W - 1))
+                    sy = max(0, min(cy - S // 2, H - 1))
+                    S = min(S, W - sx, H - sy)
+                    if S > 8:
+                        par = _parse_crop(ow[i][sy:sy + S, sx:sx + S], parser, parse_dev)
+                        par = cv2.resize(par, (S, S), interpolation=cv2.INTER_NEAREST)
+                        region_sel = _lower_face_mask(S) > 0.5
+                        lip_px = int((np.isin(par, _LIP_CLASSES) & region_sel).sum())
+                        occluded[i] = lip_px < occlusion_lip_thresh * S * S
+
+            # Second pass: only revert frames in a SUSTAINED occluded run
+            # (filters out sporadic BiSeNet misses on normal talking frames).
+            revert = [False] * n
+            j = 0
+            while j < n:
+                if occluded[j]:
+                    k = j
+                    while k < n and occluded[k]:
+                        k += 1
+                    if k - j >= min_occluded_run:
+                        for m in range(j, k):
+                            revert[m] = True
+                    j = k
+                else:
+                    j += 1
+
+            for i in range(n):
+                writer.write(ow[i] if revert[i] else lw[i])
+                if revert[i]:
+                    reverted += 1
+                processed += 1
+
+            del ow, lw, boxes
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if log_cb:
+                log_cb(f"occlusion-gate: {processed}/{total} frames "
+                       f"({reverted} kept original)")
+
+        capO.release(); capL.release()
+        if writer is not None:
+            writer.release()
+
+        out_video.parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run([
+            "ffmpeg", "-y", "-i", str(tmp_avi), "-i", str(lipsync_video),
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_video),
+        ], capture_output=True, text=True)
+        if res.returncode != 0:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(tmp_avi),
+                "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", str(out_video),
+            ], check=True, capture_output=True, text=True)
+        if log_cb:
+            log_cb(f"occlusion-gate done: {reverted}/{total} frames kept original")
+    finally:
+        if capO.isOpened():
+            capO.release()
+        if capL.isOpened():
+            capL.release()
+        if writer is not None and writer.isOpened():
+            writer.release()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out_video

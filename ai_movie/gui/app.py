@@ -2708,6 +2708,10 @@ class App:
         for _lbl, _val in [("仅女声", "female"), ("仅男声", "male"), ("全部", "")]:
             ttk.Radiobutton(abar, text=_lbl, value=_val,
                             variable=oc_anchor_var).pack(side="left", padx=4)
+        oc_anchor_occ_var = tk.BooleanVar(value=True)  # default: 遮挡检测开
+        vars_dict["oc_anchor_occ"] = oc_anchor_occ_var
+        ttk.Checkbutton(abar, text="遮挡/误检检测（嘴被挡时不匹配口型）",
+                        variable=oc_anchor_occ_var).pack(side="left", padx=(12, 0))
 
         # ── 8. 口型匹配 ─────────────────────────────────────────
         sec8 = _add_section("8. 口型匹配（唇形同步）", "lipsync", step_name="口型匹配")
@@ -3341,15 +3345,17 @@ class App:
             gen_data = self.log.step_data.get("人声生成", {})
             results = gen_data.get("results", [])
             anchor_gender = opts.get("oc_anchor_gender", tk.StringVar(value="female")).get() or None
+            occlusion_gate = bool(opts.get("oc_anchor_occ", tk.BooleanVar(value=True)).get())
             female = sum(1 for r in results if r.get("tts_gender") == "female" and r.get("audio"))
             male = sum(1 for r in results if r.get("tts_gender") == "male" and r.get("audio"))
             self.log.mark_step(step_name, "done")
             self.log.set_step_data(step_name, {
                 "anchor_gender": anchor_gender,
+                "occlusion_gate": occlusion_gate,
                 "female_segments": female, "male_segments": male,
             })
             self.log.add_entry(step_name, "done",
-                               f"anchor={anchor_gender or '全部'} (♀{female}/♂{male})")
+                               f"anchor={anchor_gender or '全部'} 遮挡检测={occlusion_gate} (♀{female}/♂{male})")
             self.root.after(0, self._refresh_toolbar)
             return True
 
@@ -3383,13 +3389,16 @@ class App:
                     if hasattr(self, "_lbl_oc_detail") else None,
                 ))
 
-            anchor_gender = self.log.step_data.get("人物锚定", {}).get("anchor_gender")
+            anchor_data = self.log.step_data.get("人物锚定", {})
+            anchor_gender = anchor_data.get("anchor_gender")
+            occlusion_gate = bool(anchor_data.get("occlusion_gate", False))
             result = segment_based_lip_sync(
                 video_path=self.log.video_path,
                 tts_results=tts_results,
                 output_path=out_path,
                 backend=backend,
                 anchor_gender=anchor_gender,
+                occlusion_gate=occlusion_gate,
                 progress_cb=_ls_progress,
                 cancel_check=lambda: self._oc_cancelled,
             )
@@ -3553,24 +3562,27 @@ class App:
                      and r.get("audio"))
         male = sum(1 for r in results if r.get("tts_gender") == "male"
                    and r.get("audio"))
-        # Respect an existing toggle if the user set one; default female-only.
+        # Respect existing toggles if set; defaults: female-only + occlusion gate on.
         anchor = getattr(self, "_anchor_gender_var", None)
         anchor_gender = anchor.get() if anchor is not None else "female"
         anchor_gender = anchor_gender or None  # "" → 全部
+        occ = getattr(self, "_anchor_occ_var", None)
+        occlusion_gate = bool(occ.get()) if occ is not None else True
 
         self.log.mark_step("人物锚定", "done")
         self.log.set_step_data("人物锚定", {
             "anchor_gender": anchor_gender,
+            "occlusion_gate": occlusion_gate,
             "female_segments": female,
             "male_segments": male,
         })
         self.log.add_entry("人物锚定", "done",
-                           f"anchor={anchor_gender or '全部'} (♀{female}/♂{male})")
+                           f"anchor={anchor_gender or '全部'} 遮挡检测={occlusion_gate} (♀{female}/♂{male})")
         self._refresh_toolbar()
-        self._populate_anchor_tab(female, male, anchor_gender)
+        self._populate_anchor_tab(female, male, anchor_gender, occlusion_gate)
         self._switch_to_next_tab("人物锚定")
 
-    def _populate_anchor_tab(self, female: int, male: int, anchor_gender):
+    def _populate_anchor_tab(self, female: int, male: int, anchor_gender, occlusion_gate=True):
         tab = self._tab_frames.get("人物锚定")
         if tab is None:
             return
@@ -3584,8 +3596,8 @@ class App:
         info.pack(fill="x", pady=(0, 12))
         tk.Label(info, text=f"女声段：{female}    男声段：{male}",
                  font=(config.CJK_FONT, 10)).pack(anchor="w")
-        cur = anchor_gender or "全部"
-        tk.Label(f, text=f"口型匹配范围：{'仅女声' if anchor_gender=='female' else ('仅男声' if anchor_gender=='male' else '全部')}",
+        tk.Label(f, text=f"口型匹配范围：{'仅女声' if anchor_gender=='female' else ('仅男声' if anchor_gender=='male' else '全部')}"
+                        f"    遮挡检测：{'开' if occlusion_gate else '关'}",
                  font=(config.CJK_FONT, 10), fg="#555").pack(anchor="w")
         bar = ttk.Frame(f); bar.pack(anchor="w", pady=(10, 0))
         ttk.Label(bar, text="修改范围：").pack(side="left")
@@ -3593,6 +3605,9 @@ class App:
         for label, val in [("仅女声", "female"), ("仅男声", "male"), ("全部", "")]:
             ttk.Radiobutton(bar, text=label, value=val,
                             variable=self._anchor_gender_var).pack(side="left", padx=4)
+        self._anchor_occ_var = tk.BooleanVar(value=occlusion_gate)
+        ttk.Checkbutton(bar, text="遮挡/误检检测（嘴被挡时不匹配口型）",
+                        variable=self._anchor_occ_var).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="重新锚定", command=self._on_anchor_person).pack(side="left", padx=(8, 0))
 
     def _on_lip_sync(self):
@@ -3683,15 +3698,17 @@ class App:
         # ── Run segment-based lip sync (background thread) ────────
         # Face enhancement is handled by the separate «人脸增强» step.
         # Person anchoring (人物锚定): restrict lip-sync to a given gender.
-        anchor_gender = self.log.step_data.get("人物锚定", {}).get("anchor_gender")
+        anchor_data = self.log.step_data.get("人物锚定", {})
+        anchor_gender = anchor_data.get("anchor_gender")
+        occlusion_gate = bool(anchor_data.get("occlusion_gate", False))
         threading.Thread(
             target=self._run_segment_lip_sync,
-            args=(str(video_path), tts_results, backend, anchor_gender),
+            args=(str(video_path), tts_results, backend, anchor_gender, occlusion_gate),
             daemon=True,
         ).start()
 
     def _run_segment_lip_sync(self, video_path: str, tts_results: list[dict], backend: str,
-                              anchor_gender: str | None = None):
+                              anchor_gender: str | None = None, occlusion_gate: bool = False):
         import traceback as _tb
         from ai_movie.lip_sync import segment_based_lip_sync
         out_path = Path(WORKSPACE_DIR) / "lipsync_output.mp4"
@@ -3702,6 +3719,7 @@ class App:
                 output_path=out_path,
                 backend=backend,
                 anchor_gender=anchor_gender,
+                occlusion_gate=occlusion_gate,
                 progress_cb=lambda cur, total: self.root.after(
                     0, lambda c=cur, t=total: self._update_lip_sync_progress(c, t)),
                 detail_progress_cb=lambda cur, total: self.root.after(
