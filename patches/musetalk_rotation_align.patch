@@ -1,0 +1,183 @@
+diff --git a/app.py b/app.py
+index 448e641..5dca566 100644
+--- a/app.py
++++ b/app.py
+@@ -70,7 +70,7 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
+     cv2.imwrite(debug_frame_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+     
+     # Get face coordinates
+-    coord_list, frame_list = get_landmark_and_bbox([debug_frame_path], bbox_shift)
++    coord_list, frame_list, _ = get_landmark_and_bbox([debug_frame_path], bbox_shift)
+     bbox = coord_list[0]
+     frame = frame_list[0]
+     
+@@ -261,7 +261,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
+         frame_list = read_imgs(input_img_list)
+     else:
+         print("extracting landmarks...time consuming")
+-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
++        coord_list, frame_list, _ = get_landmark_and_bbox(input_img_list, bbox_shift)
+         with open(crop_coord_save_path, 'wb') as f:
+             pickle.dump(coord_list, f)
+     bbox_shift_text = get_bbox_range(input_img_list, bbox_shift)
+diff --git a/musetalk/utils/preprocessing.py b/musetalk/utils/preprocessing.py
+index 978480c..a54406a 100755
+--- a/musetalk/utils/preprocessing.py
++++ b/musetalk/utils/preprocessing.py
+@@ -45,6 +45,7 @@ def get_bbox_range(img_list,upperbondrange =0):
+     batch_size_fa = 1
+     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+     coords_list = []
++    roll_list = []   # per-frame head roll (deg) for rotation-aligned lip-sync
+     landmarks = []
+     if upperbondrange != 0:
+         print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
+@@ -86,6 +87,7 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
+     batch_size_fa = 1
+     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+     coords_list = []
++    roll_list = []   # per-frame head roll (deg) for rotation-aligned lip-sync
+     landmarks = []
+     if upperbondrange != 0:
+         print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
+@@ -108,8 +110,17 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
+         for j, f in enumerate(bbox):
+             if f is None: # no face in the image
+                 coords_list += [coord_placeholder]
++                roll_list += [0.0]
+                 continue
+-            
++
++            # Head roll (deg) from the eye landmarks (68-pt: R eye 36-41, L eye
++            # 42-47).  Used to rotate the crop upright before generation and to
++            # rotate the generated mouth back on paste — MuseTalk otherwise
++            # crops axis-aligned and blurs/mosaics the mouth on tilted heads.
++            _reye = face_land_mark[36:42].astype(np.float32).mean(0)
++            _leye = face_land_mark[42:48].astype(np.float32).mean(0)
++            roll_angle = float(np.degrees(np.arctan2(_leye[1] - _reye[1], _leye[0] - _reye[0])))
++
+             half_face_coord =  face_land_mark[29]#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
+             range_minus = (face_land_mark[30]- face_land_mark[29])[1]
+             range_plus = (face_land_mark[29]- face_land_mark[28])[1]
+@@ -120,27 +131,29 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
+             half_face_dist = np.max(face_land_mark[:,1]) - half_face_coord[1]
+             min_upper_bond = 0
+             upper_bond = max(min_upper_bond, half_face_coord[1] - half_face_dist)
+-            
++
+             f_landmark = (np.min(face_land_mark[:, 0]),int(upper_bond),np.max(face_land_mark[:, 0]),np.max(face_land_mark[:,1]))
+             x1, y1, x2, y2 = f_landmark
+-            
++
+             if y2-y1<=0 or x2-x1<=0 or x1<0: # if the landmark bbox is not suitable, reuse the bbox
+                 coords_list += [f]
++                roll_list += [roll_angle]
+                 w,h = f[2]-f[0], f[3]-f[1]
+                 print("error bbox:",f)
+             else:
+                 coords_list += [f_landmark]
+-    
++                roll_list += [roll_angle]
++
+     print("********************************************bbox_shift parameter adjustment**********************************************************")
+     print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+     print("*************************************************************************************************************************************")
+-    return coords_list,frames
++    return coords_list,frames,roll_list
+     
+ 
+ if __name__ == "__main__":
+     img_list = ["./results/lyria/00000.png","./results/lyria/00001.png","./results/lyria/00002.png","./results/lyria/00003.png"]
+     crop_coord_path = "./coord_face.pkl"
+-    coords_list,full_frames = get_landmark_and_bbox(img_list)
++    coords_list,full_frames,_ = get_landmark_and_bbox(img_list)
+     with open(crop_coord_path, 'wb') as f:
+         pickle.dump(coords_list, f)
+         
+diff --git a/scripts/inference.py b/scripts/inference.py
+index 428afb9..2f69f4d 100644
+--- a/scripts/inference.py
++++ b/scripts/inference.py
+@@ -153,24 +153,36 @@ def main(args):
+                 with open(crop_coord_save_path, 'rb') as f:
+                     coord_list = pickle.load(f)
+                 frame_list = read_imgs(input_img_list)
++                roll_list = [0.0] * len(coord_list)   # cache has no roll → no alignment
+             else:
+                 print("Extracting landmarks... time-consuming operation")
+-                coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
++                coord_list, frame_list, roll_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+                 with open(crop_coord_save_path, 'wb') as f:
+                     pickle.dump(coord_list, f)
+             
+             print(f"Number of frames: {len(frame_list)}")         
+             
+             # Process each frame
++            ROLL_MIN = 8.0   # deg — below this, skip alignment (avoid needless warp)
+             input_latent_list = []
+-            for bbox, frame in zip(coord_list, frame_list):
++            for bbox, frame, roll in zip(coord_list, frame_list, roll_list):
+                 if bbox == coord_placeholder:
+                     continue
+                 x1, y1, x2, y2 = bbox
+                 if args.version == "v15":
+                     y2 = y2 + args.extra_margin
+                     y2 = min(y2, frame.shape[0])
+-                crop_frame = frame[y1:y2, x1:x2]
++                if abs(roll) >= ROLL_MIN:
++                    # Rotate the frame so the face is upright (around the box
++                    # centre), then crop the SAME box — the generator sees an
++                    # upright mouth instead of a tilted, out-of-distribution one.
++                    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
++                    M = cv2.getRotationMatrix2D((cx, cy), roll, 1.0)
++                    rot = cv2.warpAffine(frame, M, (frame.shape[1], frame.shape[0]),
++                                         flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
++                    crop_frame = rot[y1:y2, x1:x2]
++                else:
++                    crop_frame = frame[y1:y2, x1:x2]
+                 crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
+                 latents = vae.get_latents_for_unet(crop_frame)
+                 input_latent_list.append(latents)
+@@ -178,6 +190,7 @@ def main(args):
+             # Smooth first and last frames
+             frame_list_cycle = frame_list + frame_list[::-1]
+             coord_list_cycle = coord_list + coord_list[::-1]
++            roll_list_cycle = roll_list + roll_list[::-1]
+             input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+             
+             # Batch inference
+@@ -209,6 +222,7 @@ def main(args):
+             print("Padding generated images to original video size")
+             for i, res_frame in enumerate(tqdm(res_frame_list)):
+                 bbox = coord_list_cycle[i%(len(coord_list_cycle))]
++                roll = roll_list_cycle[i%(len(roll_list_cycle))]
+                 ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+                 x1, y1, x2, y2 = bbox
+                 if args.version == "v15":
+@@ -218,6 +232,13 @@ def main(args):
+                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
+                 except:
+                     continue
++                if abs(roll) >= ROLL_MIN:
++                    # Rotate the (upright) generated mouth back to the head's tilt
++                    # so it aligns with the tilted face before axis-aligned paste.
++                    _w, _h = x2 - x1, y2 - y1
++                    Mr = cv2.getRotationMatrix2D((_w / 2.0, _h / 2.0), -roll, 1.0)
++                    res_frame = cv2.warpAffine(res_frame, Mr, (_w, _h),
++                                               flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+                 
+                 # Merge results with version-specific parameters
+                 if args.version == "v15":
+diff --git a/scripts/realtime_inference.py b/scripts/realtime_inference.py
+index 579b050..6c2a347 100644
+--- a/scripts/realtime_inference.py
++++ b/scripts/realtime_inference.py
+@@ -162,7 +162,7 @@ class Avatar:
+         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
+ 
+         print("extracting landmarks...")
+-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
++        coord_list, frame_list, _ = get_landmark_and_bbox(input_img_list, self.bbox_shift)
+         input_latent_list = []
+         idx = -1
+         # maker if the bbox is not sufficient
