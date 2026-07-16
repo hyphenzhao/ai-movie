@@ -84,6 +84,30 @@ _model    = None
 _is_sft   = False          # True when CosyVoice-300M-SFT is loaded
 _lock     = threading.Lock()
 
+# Dedicated SFT model, kept separate from the singleton ``_model`` so the
+# gender-routed path can always synthesize a Mandarin male voice via SFT
+# regardless of what ``_model`` currently holds (CosyVoice3 cross_lingual is
+# broken on this build, so male segments MUST go through SFT).
+_sft_model = None
+_sft_lock  = threading.Lock()
+
+
+def _load_sft_model():
+    """Lazy-load a dedicated CosyVoice-300M-SFT instance (idempotent)."""
+    global _sft_model
+    if _sft_model is not None:
+        return _sft_model
+    with _sft_lock:
+        if _sft_model is not None:
+            return _sft_model
+        if str(_COSYVOICE_SRC) not in sys.path:
+            sys.path.insert(0, str(_COSYVOICE_SRC))
+        if str(_MATCHA_SRC) not in sys.path:
+            sys.path.insert(0, str(_MATCHA_SRC))
+        from cosyvoice.cli.cosyvoice import AutoModel
+        _sft_model = AutoModel(model_dir=str(_SFT_MODEL_DIR))
+    return _sft_model
+
 
 def get_available_models() -> list[str]:
     """Return list of available TTS model keys, SFT-first (recommended)."""
@@ -674,6 +698,81 @@ def run_isolated_synthesis(
     # Ensure every requested segment has an entry.
     for i, _ in seg_texts:
         results.setdefault(i, {"audio": None, "tts_error": "worker produced no result"})
+    return results
+
+
+def run_gender_routed_synthesis(
+    seg_texts: list[tuple[int, str]],
+    seg_genders: dict[int, str],
+    style_ref: tuple[str, str | None, str],
+    output_dir: str | Path,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[int, dict]:
+    """Synthesize per-segment with gender routing.
+
+    Male segments → CosyVoice-300M-SFT ``中文男`` (in-process, reliable Mandarin
+    male).  Female segments → CosyVoice3 with *style_ref* (soft/Taiwanese) in the
+    isolated subprocess.  We route male through SFT because CosyVoice3
+    ``cross_lingual`` fails on this build (a padding/kernel-size RuntimeError), so
+    it can never produce a male voice.
+
+    Parameters
+    ----------
+    seg_texts:   ``[(index, text)]`` for every segment to synthesize.
+    seg_genders: ``{index: 'male' | 'female'}`` (missing/other → treated female).
+    style_ref:   ``(ref_audio, ref_text, method)`` for the CosyVoice3 female voice.
+
+    Returns ``{index: {"audio": path}}`` or ``{index: {"audio": None,
+    "tts_error": msg}}`` for every requested segment (same shape as
+    :func:`run_isolated_synthesis`).
+    """
+    output_dir = ensure_dir(Path(output_dir))
+    results: dict[int, dict] = {}
+
+    male_items = [(i, t) for i, t in seg_texts if seg_genders.get(i) == "male"]
+    fem_items  = [(i, t) for i, t in seg_texts if seg_genders.get(i) != "male"]
+    total = len(seg_texts)
+    done = 0
+
+    # ── male → SFT 中文男 (in-process) ────────────────────────────────
+    if male_items:
+        model = _load_sft_model()
+        for i, text in male_items:
+            if cancel_check and cancel_check():
+                break
+            try:
+                audio = call_tts(model, text, _SFT_MALE_SPK, None, "sft")
+                path = str(output_dir / f"seg_{i + 1:04d}.wav")
+                sf.write(path, audio, model.sample_rate)
+                results[i] = {"audio": path}
+            except Exception as exc:                       # noqa: BLE001
+                results[i] = {"audio": None,
+                              "tts_error": f"{type(exc).__name__}: {exc}"}
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+
+    # ── female → CosyVoice3 style (isolated subprocess) ──────────────
+    if fem_items and not (cancel_check and cancel_check()):
+        base = done
+
+        def _fem_prog(d, _t):
+            if progress_cb:
+                progress_cb(base + d, total)
+
+        items = run_isolated_synthesis(
+            fem_items, "cosyvoice3",
+            style_ref[0], style_ref[1], style_ref[2],
+            output_dir,
+            progress_cb=_fem_prog,
+            cancel_check=cancel_check,
+        )
+        results.update(items)
+
+    # Ensure every requested segment has an entry.
+    for i, _ in seg_texts:
+        results.setdefault(i, {"audio": None, "tts_error": "not synthesized"})
     return results
 
 

@@ -1777,21 +1777,16 @@ class App:
 
         def _worker():
             try:
-                # Gender-auto with CosyVoice3: route each segment's reference by
-                # detected gender (female → soft/Taiwanese style ref, male →
-                # Mandarin) and record the gender for person-anchoring.
-                seg_refs = None
+                # Gender-auto: detect each segment's gender, then route male →
+                # SFT 中文男 (Mandarin, in-process) and female → CosyVoice3
+                # soft/Taiwanese style.  Male goes through SFT because CosyVoice3
+                # cross_lingual is broken on this build (padding/kernel error).
                 seg_genders: dict[int, str] = {}
                 if getattr(self, "_gen_voice_mode", "gender") == "gender":
                     fem_ref = tts_mod.prepare_reference(
                         self._gen_vocals_path, mode="style", cache_dir=self._gen_output_dir)
-                    if tts_mod._MALE_REF_WAV.exists():
-                        male_ref = (str(tts_mod._MALE_REF_WAV), None, "cross_lingual")
-                    else:
-                        male_ref = (tts_mod.trim_reference_audio(self._gen_vocals_path), None, "cross_lingual")
                     algo = getattr(self, "_gen_algo", "f0_per_seg")
                     last = "female"
-                    seg_refs = {}
                     for i, s in enumerate(segments):
                         if algo == "ecapa" and getattr(self, "_gen_ecapa_result", None):
                             g = tts_mod.lookup_ecapa_gender(s, self._gen_ecapa_result, fallback=last)
@@ -1801,16 +1796,20 @@ class App:
                             g = tts_mod.detect_gender_from_segment(s, fallback=last)
                         last = g
                         seg_genders[i] = g
-                        seg_refs[i] = fem_ref if g == "female" else male_ref
 
-                items = tts_mod.run_isolated_synthesis(
-                    seg_texts, self._gen_choice,
-                    self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method,
-                    self._gen_output_dir,
-                    progress_cb=_progress,
-                    cancel_check=lambda: self._cancel_requested,
-                    seg_refs=seg_refs,
-                )
+                    items = tts_mod.run_gender_routed_synthesis(
+                        seg_texts, seg_genders, fem_ref, self._gen_output_dir,
+                        progress_cb=_progress,
+                        cancel_check=lambda: self._cancel_requested,
+                    )
+                else:
+                    items = tts_mod.run_isolated_synthesis(
+                        seg_texts, self._gen_choice,
+                        self._gen_ref_audio, self._gen_ref_text, self._gen_ref_method,
+                        self._gen_output_dir,
+                        progress_cb=_progress,
+                        cancel_check=lambda: self._cancel_requested,
+                    )
                 results = []
                 for i, seg in enumerate(segments):
                     it = items.get(i, {})
@@ -3208,25 +3207,7 @@ class App:
                 seg_texts = [(i, seg.get("text_translated", "").strip())
                              for i, seg in enumerate(segments)]
 
-                # Gender-auto: per-segment reference routing + record gender.
-                oc_seg_refs = None
                 oc_genders: dict[int, str] = {}
-                if voice_mode == "gender":
-                    fem_ref = tts_mod.prepare_reference(vocals_path, mode="style", cache_dir=out_dir)
-                    if tts_mod._MALE_REF_WAV.exists():
-                        male_ref = (str(tts_mod._MALE_REF_WAV), None, "cross_lingual")
-                    else:
-                        male_ref = (tts_mod.trim_reference_audio(str(vocals_path)), None, "cross_lingual")
-                    oc_seg_refs = {}
-                    last = "female"
-                    for i, seg in enumerate(segments):
-                        if algo == "f0_global":
-                            g = tts_mod.detect_gender_global_f0(seg, fallback=last)
-                        else:
-                            g = tts_mod.detect_gender_from_segment(seg, fallback=last)
-                        last = g
-                        oc_genders[i] = g
-                        oc_seg_refs[i] = fem_ref if g == "female" else male_ref
 
                 def _oc_prog(done, total):
                     self.root.after(0, lambda d=done, t=total: (
@@ -3236,11 +3217,29 @@ class App:
                         if hasattr(self, "_lbl_oc_detail") else None,
                     ))
 
-                items = tts_mod.run_isolated_synthesis(
-                    seg_texts, choice, ref_audio, ref_text, ref_method, out_dir,
-                    progress_cb=_oc_prog, cancel_check=lambda: self._oc_cancelled,
-                    seg_refs=oc_seg_refs,
-                )
+                # Gender-auto: detect per-segment gender, then route male → SFT
+                # 中文男 (Mandarin, in-process) / female → CosyVoice3 soft/Taiwanese
+                # style.  Male uses SFT because CosyVoice3 cross_lingual is broken
+                # on this build (padding/kernel-size error → no male voice).
+                if voice_mode == "gender":
+                    fem_ref = tts_mod.prepare_reference(vocals_path, mode="style", cache_dir=out_dir)
+                    last = "female"
+                    for i, seg in enumerate(segments):
+                        if algo == "f0_global":
+                            g = tts_mod.detect_gender_global_f0(seg, fallback=last)
+                        else:
+                            g = tts_mod.detect_gender_from_segment(seg, fallback=last)
+                        last = g
+                        oc_genders[i] = g
+                    items = tts_mod.run_gender_routed_synthesis(
+                        seg_texts, oc_genders, fem_ref, out_dir,
+                        progress_cb=_oc_prog, cancel_check=lambda: self._oc_cancelled,
+                    )
+                else:
+                    items = tts_mod.run_isolated_synthesis(
+                        seg_texts, choice, ref_audio, ref_text, ref_method, out_dir,
+                        progress_cb=_oc_prog, cancel_check=lambda: self._oc_cancelled,
+                    )
                 tts_results = []
                 for i, seg in enumerate(segments):
                     it = items.get(i, {})
