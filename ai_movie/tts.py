@@ -539,6 +539,8 @@ def call_tts(
     spk_or_ref: str,
     ref_text: str | None,
     method: str,
+    *,
+    source_audio: str | None = None,
 ) -> np.ndarray:
     """Run one CosyVoice inference call and return a float32 numpy array.
 
@@ -548,9 +550,21 @@ def call_tts(
         ``'sft'``           — *spk_or_ref* is a speaker ID; uses inference_sft.
         ``'zero_shot'``     — *spk_or_ref* is a reference audio path.
         ``'cross_lingual'`` — *spk_or_ref* is a reference audio path.
+        ``'vc'``            — timbre transfer: content comes from
+                              *source_audio*, timbre from *spk_or_ref*;
+                              *text* is ignored.
     """
     chunks = []
-    if method == "sft":
+    if method == "vc":
+        # The only path that cannot leak the source language: frontend_vc
+        # builds no text and no llm_embedding, and vc_job pushes the source
+        # speech tokens straight past the LLM. Both arguments are file paths —
+        # this fork's frontend calls load_wav() on them itself.
+        if not source_audio:
+            raise ValueError("method 'vc' requires source_audio")
+        for gen in model.inference_vc(source_audio, spk_or_ref, stream=False):
+            chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
+    elif method == "sft":
         for gen in model.inference_sft(text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
     elif method == "instruct2":
@@ -590,6 +604,7 @@ def run_isolated_synthesis(
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     seg_refs: dict[int, tuple[str, str | None, str]] | None = None,
+    seg_sources: dict[int, str] | None = None,
 ) -> dict[int, dict]:
     """Synthesize Qwen-based (CosyVoice2/3) segments in a pinned subprocess.
 
@@ -608,6 +623,8 @@ def run_isolated_synthesis(
         if seg_refs and i in seg_refs:
             r_audio, r_text, r_method = seg_refs[i]
             entry["ref_audio"], entry["ref_text"], entry["method"] = r_audio, r_text, r_method
+        if seg_sources and i in seg_sources:
+            entry["source_audio"] = seg_sources[i]
         return entry
 
     job = {
@@ -774,6 +791,371 @@ def run_gender_routed_synthesis(
     for i, _ in seg_texts:
         results.setdefault(i, {"audio": None, "tts_error": "not synthesized"})
     return results
+
+
+# ── per-speaker voice cloning ─────────────────────────────────────
+#
+# Until now every run used a *fixed* reference clip (the bundled
+# asset/zero_shot_prompt.wav), so the dub sounded like the same stranger
+# regardless of who was talking.  The isolated worker's job JSON has always
+# supported a per-segment reference override (tts_worker.py reads
+# ref_audio/ref_text/method off each segment entry) — it was simply never
+# used.  These helpers fill it in with each speaker's own voice.
+
+def build_seg_refs(
+    segments: list[dict],
+    speaker_refs: dict[str, dict],
+    *,
+    style_ref: tuple[str, str | None, str] | None = None,
+    force_sft: bool = False,
+) -> tuple[dict[int, tuple[str, str | None, str]], dict[str, str]]:
+    """Map segment index → (ref_audio, ref_text, method) by speaker.
+
+    Speakers with no usable reference clip fall back to the bundled voice
+    matching their gender.  Returns ``(seg_refs, mode_by_speaker)`` where
+    mode is ``"clone"`` or ``"builtin"`` for reporting.
+
+    ``force_sft`` routes *every* segment to a built-in CosyVoice speaker ID,
+    ignoring both the cloned references and the bundled zero-shot prompt.
+    This is the only configuration where the source language cannot leak into
+    the output: ``frontend_sft`` feeds the model text + speaker embedding and
+    no ``prompt_text`` at all, whereas zero-shot conditions the LLM on the
+    Japanese reference transcript.  Note the default path is *mixed* — female
+    falls through to a bundled Chinese zero-shot prompt and only male reaches
+    SFT — so "no clone" alone is not enough to get this guarantee.
+    """
+    seg_refs: dict[int, tuple[str, str | None, str]] = {}
+    modes: dict[str, str] = {}
+
+    for i, seg in enumerate(segments):
+        spk = seg.get("speaker") or ""
+        if force_sft:
+            gender = seg.get("gender") or seg.get("tts_gender") or "female"
+            seg_refs[i] = (_SFT_MALE_SPK if gender == "male"
+                           else _SFT_FEMALE_SPK, None, "sft")
+            if spk:
+                modes[spk] = "builtin"
+            continue
+
+        ref = speaker_refs.get(spk) if spk else None
+        if ref and ref.get("ref_audio") and Path(ref["ref_audio"]).exists():
+            seg_refs[i] = (ref["ref_audio"], ref.get("ref_text") or None,
+                           "zero_shot")
+            modes[spk] = "clone"
+            continue
+
+        gender = seg.get("gender") or seg.get("tts_gender") or "female"
+        if gender == "female" and style_ref:
+            seg_refs[i] = style_ref
+        elif _FEMALE_REF_WAV.exists() and gender == "female":
+            seg_refs[i] = (str(_FEMALE_REF_WAV), _FEMALE_REF_TEXT, "zero_shot")
+        else:
+            # Male has no bundled zero-shot reference and CosyVoice3
+            # cross_lingual is broken on this build — route to SFT instead.
+            seg_refs[i] = (_SFT_MALE_SPK if gender == "male"
+                           else _SFT_FEMALE_SPK, None, "sft")
+        if spk:
+            modes.setdefault(spk, "builtin")
+
+    return seg_refs, modes
+
+
+def run_cloned_synthesis(
+    seg_texts: list[tuple[int, str]],
+    seg_refs: dict[int, tuple[str, str | None, str]],
+    output_dir: str | Path,
+    *,
+    model_choice: str = "cosyvoice3",
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[int, dict]:
+    """Synthesize with a per-segment reference voice.
+
+    ``sft`` segments run in-process (CosyVoice-300M needs no transformers);
+    everything else goes through the pinned-transformers worker in one batch.
+    Shapes its result exactly like :func:`run_isolated_synthesis`.
+    """
+    # GPU memory is unified system memory on this box: a resident 83 GB LLM
+    # leaves ~10 MiB and CosyVoice dies with OOM before its first token.
+    try:
+        from ai_movie.translator import free_gpu_for_local_work
+        free_gpu_for_local_work()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+    output_dir = ensure_dir(Path(output_dir))
+    results: dict[int, dict] = {}
+    total = len(seg_texts)
+    done = 0
+
+    sft_items = [(i, t) for i, t in seg_texts
+                 if seg_refs.get(i, (None, None, ""))[2] == "sft"]
+    zs_items = [(i, t) for i, t in seg_texts
+                if seg_refs.get(i, (None, None, ""))[2] != "sft"]
+
+    # ── built-in SFT speakers (in-process) ──────────────────────────
+    if sft_items:
+        model = _load_sft_model()
+        for i, text in sft_items:
+            if cancel_check and cancel_check():
+                break
+            spk = seg_refs[i][0]
+            try:
+                audio = call_tts(model, text, spk, None, "sft")
+                path = str(output_dir / f"seg_{i + 1:04d}.wav")
+                sf.write(path, audio, model.sample_rate)
+                results[i] = {"audio": path, "voice": spk, "mode": "builtin"}
+            except Exception as exc:                    # noqa: BLE001
+                results[i] = {"audio": None,
+                              "tts_error": f"{type(exc).__name__}: {exc}"}
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+
+    # ── cloned / zero-shot voices (isolated subprocess) ─────────────
+    if zs_items and not (cancel_check and cancel_check()):
+        base = done
+
+        def _prog(d, _t):
+            if progress_cb:
+                progress_cb(base + d, total)
+
+        # The job needs a global default even though every segment overrides
+        # it; use the most common reference so a missing override degrades
+        # sensibly rather than crashing the worker.
+        counts: dict[tuple, int] = {}
+        for i, _ in zs_items:
+            counts[seg_refs[i]] = counts.get(seg_refs[i], 0) + 1
+        default_ref = max(counts, key=counts.get)
+
+        items = run_isolated_synthesis(
+            zs_items, model_choice,
+            default_ref[0], default_ref[1], default_ref[2],
+            output_dir, progress_cb=_prog, cancel_check=cancel_check,
+            seg_refs={i: seg_refs[i] for i, _ in zs_items},
+        )
+        for i, r in items.items():
+            r.setdefault("voice", Path(str(seg_refs.get(i, ("",))[0])).name)
+            r.setdefault("mode", "clone")
+            results[i] = r
+
+    for i, _ in seg_texts:
+        results.setdefault(i, {"audio": None, "tts_error": "not synthesized"})
+    return results
+
+
+def run_vc_conversion(
+    segments: list[dict],
+    speaker_refs: dict[str, dict],
+    output_dir: str | Path,
+    *,
+    source_key: str = "audio_fit",
+    model_choice: str = "cosyvoice3",
+    min_seconds: float = 0.7,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[int, dict]:
+    """Re-voice already-synthesized audio in each speaker's own timbre.
+
+    Zero-shot cloning conditions the LLM on the reference *transcript*, which
+    on this material is Japanese — so Japanese leaked into the Chinese output
+    and some references deterministically drove the model into a degenerate
+    mode.  Voice conversion takes the content from ``source_key`` (the
+    built-in-voice audio the pipeline already produced and time-fitted) and
+    only the timbre from the reference, so no text conditioning exists to
+    corrupt.  Measured: 0 kana across 26 probe outputs, and ECAPA similarity
+    to the real speaker rises from ≈0 to 0.44–0.67.  See
+    ``Documentation/vc-gate-result.md``.
+
+    Because the content is the source audio, output duration tracks the input
+    to within one 25 Hz token frame (~40 ms) — small enough that re-running
+    :func:`composer.fit_segments_to_timeline` afterwards restores the original
+    timeline exactly, which is what lets the converted track reuse the
+    built-in-voice version's lip-sync render.
+
+    Segments shorter than *min_seconds* keep their source audio.  Conversion
+    degrades badly on very short input — every catastrophic failure measured
+    (a line coming back as a different language entirely: 「是的」→ "Shut up",
+    「所以呢」→ "That's all you know") was under 0.6 s, and none above it.  A
+    0.3-second interjection keeping the built-in voice is a far smaller defect
+    than the same interjection becoming a different sentence.
+
+    Segments whose speaker has no usable reference also keep their source
+    audio.
+    """
+    try:
+        from ai_movie.translator import free_gpu_for_local_work
+        free_gpu_for_local_work()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+    output_dir = ensure_dir(Path(output_dir))
+    seg_texts: list[tuple[int, str]] = []
+    seg_refs: dict[int, tuple[str, str | None, str]] = {}
+    seg_sources: dict[int, str] = {}
+    results: dict[int, dict] = {}
+
+    for i, seg in enumerate(segments):
+        src = seg.get(source_key) or seg.get("audio")
+        if not src or not Path(src).exists():
+            results[i] = {"audio": None, "tts_error": "no source audio"}
+            continue
+        ref = speaker_refs.get(seg.get("speaker") or "")
+        ref_audio = (ref or {}).get("ref_audio")
+        if not ref_audio or not Path(ref_audio).exists():
+            # Nothing to convert onto — the built-in voice is the fallback.
+            results[i] = {"audio": src, "mode": "builtin", "vc": False}
+            continue
+        try:
+            import soundfile as _sf
+            if _sf.info(str(src)).duration < min_seconds:
+                results[i] = {"audio": src, "mode": "builtin", "vc": False,
+                              "skipped": "too short to convert safely"}
+                continue
+        except Exception:                               # noqa: BLE001
+            pass
+        seg_texts.append((i, seg.get("text_translated") or ""))
+        seg_refs[i] = (ref_audio, None, "vc")
+        seg_sources[i] = str(src)
+
+    if not seg_texts:
+        return results
+
+    default_ref = seg_refs[seg_texts[0][0]]
+    items = run_isolated_synthesis(
+        seg_texts, model_choice,
+        default_ref[0], default_ref[1], default_ref[2],
+        output_dir, progress_cb=progress_cb, cancel_check=cancel_check,
+        seg_refs=seg_refs, seg_sources=seg_sources,
+    )
+    for i, r in items.items():
+        if r.get("audio"):
+            results[i] = {"audio": r["audio"], "mode": "vc", "vc": True,
+                          "voice": Path(seg_refs[i][0]).name}
+        else:
+            # A failed conversion falls back to the source rather than to
+            # silence: the built-in voice is still a usable line.
+            results[i] = {"audio": seg_sources[i], "mode": "builtin",
+                          "vc": False,
+                          "tts_error": r.get("tts_error") or "vc failed"}
+    return results
+
+
+def select_best_reference(
+    speaker_refs: dict[str, dict],
+    *,
+    out_dir: str | Path,
+    probe_text: str = "你好，我们现在开始聊一聊这次的拍摄。",
+    model_choice: str = "cosyvoice3",
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, dict]:
+    """Choose each speaker's reference clip by *measured* clone similarity.
+
+    Heuristic scoring (length, density, loudness) picks a plausible clip but
+    not reliably the best one: on the 390 s reference the top-scoring female
+    clip was a flat recitation of measurements ("20cm 15cm…") that cloned at
+    0.389 similarity, while a clip 100 s away reached 0.615.  Since clone
+    quality is directly measurable, synthesize one short probe per candidate
+    and keep whichever actually sounds most like the speaker.
+
+    Mutates and returns *speaker_refs*.
+    """
+    from ai_movie import diarize as _diarize
+
+    out_dir = ensure_dir(Path(out_dir) / "probe")
+
+    for spk, ref in speaker_refs.items():
+        cands = [ref] + list(ref.get("alternatives") or [])
+        cands = [c for c in cands
+                 if c.get("ref_audio") and Path(c["ref_audio"]).exists()]
+        if len(cands) < 2:
+            continue
+
+        if progress_cb:
+            progress_cb(f"{spk}: 试听 {len(cands)} 个候选参考音…")
+
+        seg_texts = [(i, probe_text) for i in range(len(cands))]
+        seg_refs = {i: (c["ref_audio"], c.get("ref_text") or None, "zero_shot")
+                    for i, c in enumerate(cands)}
+        try:
+            items = run_cloned_synthesis(seg_texts, seg_refs, out_dir,
+                                         model_choice=model_choice)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"[tts] reference probe failed for {spk}: {exc}",
+                  file=sys.stderr)
+            continue
+
+        scored = []
+        for i, c in enumerate(cands):
+            wav = (items.get(i) or {}).get("audio")
+            if not wav or not Path(wav).exists():
+                continue
+            try:
+                sim = _diarize.similarity(c["ref_audio"], wav)
+            except Exception:                           # noqa: BLE001
+                continue
+            scored.append((sim, i, c))
+            if progress_cb:
+                progress_cb(f"  {spk} 候选{i}（{c['duration']}s @{c['start']}s）"
+                            f" 相似度 {sim:.3f}")
+        if not scored:
+            continue
+
+        scored.sort(key=lambda x: -x[0])
+        best_sim, best_i, best_c = scored[0]
+        if best_i != 0:
+            if progress_cb:
+                progress_cb(f"{spk}: 改用候选{best_i}（{best_sim:.3f} > "
+                            f"{scored[-1][0]:.3f}）")
+            keep_alts = ref.get("alternatives")
+            speaker_refs[spk] = {**best_c, "alternatives": keep_alts,
+                                 "gender": ref.get("gender"),
+                                 "probe_similarity": round(best_sim, 3),
+                                 "chosen_by": "probe"}
+        else:
+            ref["probe_similarity"] = round(best_sim, 3)
+            ref["chosen_by"] = "probe"
+    return speaker_refs
+
+
+def verify_clone_quality(
+    segments: list[dict],
+    speaker_refs: dict[str, dict],
+    *,
+    min_similarity: float | None = None,
+) -> dict[str, dict]:
+    """Measure speaker similarity between synthesized audio and each reference.
+
+    Returns ``{speaker: {"similarity", "n", "ok"}}``.  Callers use this to
+    decide whether to re-synthesize a speaker with a built-in voice.
+    """
+    from ai_movie import diarize
+    from ai_movie.config import TTS_CLONE_MIN_SIMILARITY
+
+    if min_similarity is None:
+        min_similarity = TTS_CLONE_MIN_SIMILARITY
+
+    by_spk: dict[str, list[float]] = {}
+    for seg in segments:
+        spk = seg.get("speaker") or ""
+        ref = speaker_refs.get(spk)
+        audio = seg.get("audio")
+        if not spk or not ref or not audio or not Path(audio).exists():
+            continue
+        if len(by_spk.get(spk, [])) >= 8:      # a sample is enough
+            continue
+        try:
+            by_spk.setdefault(spk, []).append(
+                diarize.similarity(ref["ref_audio"], audio))
+        except Exception:                               # noqa: BLE001
+            continue
+
+    out: dict[str, dict] = {}
+    for spk, sims in by_spk.items():
+        med = float(np.median(sims))
+        out[spk] = {"similarity": round(med, 3), "n": len(sims),
+                    "ok": med >= min_similarity}
+    return out
 
 
 def synthesize(

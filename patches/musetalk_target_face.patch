@@ -1,0 +1,257 @@
+--- a/models/musetalk/musetalk/utils/preprocessing.py
++++ b/models/musetalk/musetalk/utils/preprocessing.py
+@@ -82,7 +82,49 @@
+     return text_range
+     
+ 
+-def get_landmark_and_bbox(img_list,upperbondrange =0):
++def _bbox_iou(a, b):
++    """IoU between two (x1, y1, x2, y2) boxes."""
++    ax1, ay1, ax2, ay2 = a[:4]
++    bx1, by1, bx2, by2 = b[:4]
++    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
++    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
++    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
++    inter = iw * ih
++    if inter <= 0:
++        return 0.0
++    union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
++    return float(inter / max(union, 1e-6))
++
++
++def _detections_for_frame(frame):
++    """All faces in one frame as (x1, y1, x2, y2) — not just the top one.
++
++    ``FaceAlignment.get_detections_for_batch`` keeps only ``d[0]``; the
++    underlying detector already returns every face, which is what target-face
++    selection needs.
++    """
++    try:
++        raw = fa.face_detector.detect_from_batch(
++            np.asarray([frame])[..., ::-1].copy())
++    except Exception:
++        return []
++    out = []
++    for d in (raw[0] if raw else []):
++        d = np.clip(np.asarray(d, dtype=np.float32), 0, None)
++        out.append(tuple(int(v) for v in d[:4]))
++    return out
++
++
++def get_landmark_and_bbox(img_list, upperbondrange=0, target_boxes=None):
++    """Landmarks + crop boxes per frame.
++
++    ``target_boxes`` (optional) is a per-frame list of ``[x1,y1,x2,y2]`` (or
++    ``None``) naming *which* face to drive.  Without it the original
++    behaviour is kept exactly: DWPose's first person instance and S3FD's
++    highest-scoring box.  With it, both are re-selected to match the target,
++    which is what makes gender-anchored lip-sync possible in multi-face
++    shots.
++    """
+     frames = read_imgs(img_list)
+     batch_size_fa = 1
+     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+@@ -93,18 +135,75 @@
+         print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
+     else:
+         print('get key_landmark and face bounding boxes with the default value')
++    if target_boxes is not None:
++        print(f'target-face mode: {sum(1 for b in target_boxes if b)} / '
++              f'{len(target_boxes)} frames have a target face')
+     average_range_minus = []
+     average_range_plus = []
++    frame_no = -1
+     for fb in tqdm(batches):
+-        results = inference_topdown(model, np.asarray(fb)[0])
+-        results = merge_data_samples(results)
+-        keypoints = results.pred_instances.keypoints
+-        face_land_mark= keypoints[0][23:91]
++        frame_no += 1
++        target = None
++        if target_boxes is not None:
++            target = target_boxes[frame_no] if frame_no < len(target_boxes) else None
++            if target is None:
++                # This frame is not assigned to the anchored speaker — leave
++                # it untouched (inference.py pastes the original frame).
++                coords_list += [coord_placeholder]
++                roll_list += [0.0]
++                continue
++
++        if target is None:
++            results = inference_topdown(model, np.asarray(fb)[0])
++            results = merge_data_samples(results)
++            keypoints = results.pred_instances.keypoints
++            face_land_mark = keypoints[0][23:91]
++        else:
++            # Restrict pose estimation to the target face.  Without an explicit
++            # bbox, inference_topdown treats the whole frame as one person box
++            # and keypoints[0] is then arbitrary in a multi-face shot.
++            tx1, ty1, tx2, ty2 = [float(v) for v in target[:4]]
++            mx, my = (tx2 - tx1) * 0.15, (ty2 - ty1) * 0.15
++            person_box = np.array([[tx1 - mx, ty1 - my, tx2 + mx, ty2 + my]],
++                                  dtype=np.float32)
++            try:
++                results = inference_topdown(model, np.asarray(fb)[0],
++                                            bboxes=person_box, bbox_format='xyxy')
++                results = merge_data_samples(results)
++                keypoints = results.pred_instances.keypoints
++            except Exception as _exc:
++                print('target-face topdown failed, falling back:', _exc)
++                results = merge_data_samples(
++                    inference_topdown(model, np.asarray(fb)[0]))
++                keypoints = results.pred_instances.keypoints
++            # Pick the instance whose face landmarks sit inside the target box.
++            best_i, best_d = 0, None
++            tcx, tcy = (tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0
++            for i in range(len(keypoints)):
++                fk = keypoints[i][23:91]
++                cx, cy = float(fk[:, 0].mean()), float(fk[:, 1].mean())
++                d = (cx - tcx) ** 2 + (cy - tcy) ** 2
++                if best_d is None or d < best_d:
++                    best_d, best_i = d, i
++            face_land_mark = keypoints[best_i][23:91]
+         face_land_mark = face_land_mark.astype(np.int32)
+-        
++
+         # get bounding boxes by face detetion
+-        bbox = fa.get_detections_for_batch(np.asarray(fb))
+-        
++        if target is None:
++            bbox = fa.get_detections_for_batch(np.asarray(fb))
++        else:
++            cands = _detections_for_frame(np.asarray(fb)[0])
++            best, best_iou = None, 0.0
++            for c in cands:
++                v = _bbox_iou(c, target)
++                if v > best_iou:
++                    best_iou, best = v, c
++            # Fall back to the target box itself; it is already interpolated
++            # upstream, so a missed detection must not become a placeholder
++            # (that would desynchronise latents from paste coordinates).
++            bbox = [best if best is not None and best_iou >= 0.25
++                    else tuple(int(v) for v in target[:4])]
++
+         # adjust the bounding box refer to landmark
+         # Add the bounding box to a tuple and append it to the coordinates list
+         for j, f in enumerate(bbox):
+@@ -145,7 +244,12 @@
+                 roll_list += [roll_angle]
+ 
+     print("********************************************bbox_shift parameter adjustment**********************************************************")
+-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
++    # In target-face mode every frame can legitimately be a placeholder, so
++    # guard the averages instead of dividing by zero.
++    if average_range_minus and average_range_plus:
++        print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
++    else:
++        print(f"Total frame:「{len(frames)}」 no usable face landmarks")
+     print("*************************************************************************************************************************************")
+     return coords_list,frames,roll_list
+     
+--- a/models/musetalk/scripts/inference.py
++++ b/models/musetalk/scripts/inference.py
+@@ -1,5 +1,6 @@
+ import os
+ import cv2
++import json
+ import math
+ import copy
+ import torch
+@@ -147,8 +148,28 @@
+                 audio_padding_length_right=args.audio_padding_length_right,
+             )
+             
++            # Per-frame target face (which person to drive).  Supplied by
++            # ai_movie/faces.py; absent → original "highest-scoring face"
++            # behaviour.
++            # Per-task override first: batching many clips into one run is how
++            # we avoid reloading the UNet/VAE/DWPose (~5 min) for every clip.
++            _tb_path = (inference_config[task_id].get("target_bbox_json")
++                        or getattr(args, "target_bbox_json", None))
++            target_boxes = None
++            if _tb_path:
++                with open(_tb_path, "r", encoding="utf-8") as f:
++                    _tb = json.load(f)
++                _frames = _tb.get("frames", {})
++                _n = len(input_img_list)
++                target_boxes = [_frames.get(str(i)) for i in range(_n)]
++                print(f"target_bbox_json: {sum(1 for b in target_boxes if b)}"
++                      f"/{_n} frames anchored")
++
+             # Preprocess input images
+-            if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
++            # The coordinate cache stores no notion of *which* face was picked,
++            # so it must not be reused in target-face mode.
++            if (os.path.exists(crop_coord_save_path) and args.use_saved_coord
++                    and target_boxes is None):
+                 print("Using saved coordinates")
+                 with open(crop_coord_save_path, 'rb') as f:
+                     coord_list = pickle.load(f)
+@@ -156,17 +177,29 @@
+                 roll_list = [0.0] * len(coord_list)   # cache has no roll → no alignment
+             else:
+                 print("Extracting landmarks... time-consuming operation")
+-                coord_list, frame_list, roll_list = get_landmark_and_bbox(input_img_list, bbox_shift)
++                coord_list, frame_list, roll_list = get_landmark_and_bbox(
++                    input_img_list, bbox_shift, target_boxes=target_boxes)
+                 with open(crop_coord_save_path, 'wb') as f:
+                     pickle.dump(coord_list, f)
+-            
+-            print(f"Number of frames: {len(frame_list)}")         
+-            
++
++            print(f"Number of frames: {len(frame_list)}")
++
+             # Process each frame
+             ROLL_MIN = 8.0   # deg — below this, skip alignment (avoid needless warp)
++            # NOTE: placeholder frames must still occupy a slot in
++            # input_latent_list.  Upstream this loop used `continue`, so a
++            # single face-less frame shifted every later latent relative to
++            # coord_list_cycle / frame_list_cycle at paste time (which index
++            # with i % len(...)), silently pasting each mouth onto the wrong
++            # frame.  We append a stand-in latent and skip the paste instead.
+             input_latent_list = []
++            _last_latents = None
+             for bbox, frame, roll in zip(coord_list, frame_list, roll_list):
+                 if bbox == coord_placeholder:
++                    if _last_latents is None:
++                        _blank = np.zeros((256, 256, 3), dtype=np.uint8)
++                        _last_latents = vae.get_latents_for_unet(_blank)
++                    input_latent_list.append(_last_latents)
+                     continue
+                 x1, y1, x2, y2 = bbox
+                 if args.version == "v15":
+@@ -185,8 +218,9 @@
+                     crop_frame = frame[y1:y2, x1:x2]
+                 crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
+                 latents = vae.get_latents_for_unet(crop_frame)
++                _last_latents = latents
+                 input_latent_list.append(latents)
+-        
++
+             # Smooth first and last frames
+             frame_list_cycle = frame_list + frame_list[::-1]
+             coord_list_cycle = coord_list + coord_list[::-1]
+@@ -224,6 +258,12 @@
+                 bbox = coord_list_cycle[i%(len(coord_list_cycle))]
+                 roll = roll_list_cycle[i%(len(roll_list_cycle))]
+                 ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
++                if bbox == coord_placeholder:
++                    # No target face in this frame — pass the original through
++                    # untouched.  This is how "male speaks, no male on screen"
++                    # ends up leaving the picture bit-identical.
++                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
++                    continue
+                 x1, y1, x2, y2 = bbox
+                 if args.version == "v15":
+                     y2 = y2 + args.extra_margin
+@@ -293,5 +333,9 @@
+     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
+     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
+     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
++    parser.add_argument("--target_bbox_json", type=str, default=None,
++                        help="JSON with {'frames': {frame_index: [x1,y1,x2,y2]}} naming "
++                             "which face to drive per frame; frames absent from the map "
++                             "are passed through unmodified")
+     args = parser.parse_args()
+     main(args)

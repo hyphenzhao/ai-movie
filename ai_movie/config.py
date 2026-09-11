@@ -113,6 +113,85 @@ ASR_VAD_MIN_SPEECH_DURATION_MS = 150
 # Padding (ms) added before/after each detected speech segment.
 ASR_VAD_SPEECH_PAD_MS = 200
 
+# ── ASR segmentation (v2) ─────────────────────────────────────
+# Whisper emits *contiguous* segments inside a VAD chunk (each segment's
+# ``start`` equals the previous segment's ``end``), so the old "merge when
+# gap <= 0.05 s" rule chained a whole chunk into one blob — 44 s segments
+# containing both speakers were routine.  v2 instead re-splits the word
+# stream on punctuation / pauses / speaker turns with a hard duration cap.
+
+# Ask Whisper for word-level timestamps (needed by the sentence splitter).
+# Falls back automatically to segment-level splitting if the ROCm DTW pass
+# fails.
+ASR_WORD_TIMESTAMPS = True
+
+# Whisper's "condition on previous text" causes runaway hallucination loops
+# on Japanese; each VAD chunk is independent anyway.
+ASR_CONDITION_ON_PREVIOUS = False
+
+# Hard caps for one subtitle/dubbing segment.
+ASR_MAX_SEGMENT_DURATION = 8.0     # seconds
+ASR_MAX_SEGMENT_CHARS = 24         # characters (CJK)
+ASR_MIN_SEGMENT_DURATION = 0.4     # shorter fragments get absorbed
+
+# Inter-word silence (s) that forces a sentence break.
+ASR_PAUSE_SPLIT_SEC = 0.45
+
+# Characters that end a sentence / allow a soft break.
+ASR_SENTENCE_END = "。！？!?…♪"
+ASR_SOFT_BREAK = "、，,"
+
+# Domain hint / proper-noun spellings fed to Whisper as ``initial_prompt``.
+#
+# EMPTY BY DEFAULT — measured, not assumed.  A hint of
+# "以下は日本語のインタビュー音声です。話者は複数います。" made large-v3 emit
+# "話者は複数います。" verbatim as the transcript of 8 different low-energy
+# chunks on the reference video.  Whisper treats initial_prompt as decoded
+# context, so on a quiet chunk the likeliest continuation is simply more of
+# the prompt.  Proper nouns are handled downstream by the glossary instead
+# (see ai_movie/glossary.py), which cannot corrupt timings.
+#
+# If you do set one, keep it to a bare comma-separated noun list (no
+# sentences) and re-check the transcript for echoes.
+ASR_INITIAL_PROMPT: dict[str, str] = {}
+
+# ── Speaker diarization ───────────────────────────────────────
+
+# Run speaker diarization as part of 转换文字.
+ASR_DIARIZE = True
+
+# "ecapa" — local models/speechbrain-ecapa (no download, no HF token).
+DIARIZE_BACKEND = "ecapa"
+
+# ECAPA embedding device.  CPU is plenty (192-d embeddings on 1.5 s windows)
+# and avoids ROCm/MIOpen JIT stalls on gfx1151.
+DIARIZE_DEVICE = "cpu"
+
+# Sliding-window embedding geometry (seconds).
+DIARIZE_WINDOW = 1.5
+DIARIZE_PERIOD = 0.75
+
+# Agglomerative-clustering cosine distance threshold when the speaker count
+# is not known (num_speakers=None → auto).
+DIARIZE_AHC_THRESHOLD = 0.55
+
+# Upper bound for automatic speaker-count estimation.
+DIARIZE_MAX_SPEAKERS = 6
+
+# Absolute F0 threshold (Hz) separating male from female.
+DIARIZE_GENDER_HZ = 165.0
+
+# Relative fallback: when every cluster lands on the same side of the
+# absolute threshold but their medians differ by at least this much, label
+# the lowest cluster male and the highest female.  This is what rescues
+# recordings where the absolute threshold is simply wrong (the baseline run
+# tagged all 35 segments "female").
+DIARIZE_GENDER_REL_MIN_HZ = 25.0
+
+# A window further than this cosine distance from every centroid is treated
+# as overlapped/uncertain speech (speaker_conf < 0.5).
+DIARIZE_UNCERTAIN_DIST = 0.35
+
 # ── TTS (Text-to-Speech) settings ──────────────────────────────
 
 # CosyVoice3-0.5B local path (best quality, ~1-2 GB VRAM FP16).
@@ -140,6 +219,94 @@ COSYVOICE_SFT_MODEL_DIR = str(ROOT_DIR / "models" / "CosyVoice-300M-SFT")
 # "cosyvoice2" (lightweight).  Auto-detected from available models.
 TTS_PREFERRED_MODEL = "cosyvoice3"
 
+# ── Voice cloning (per-speaker) ────────────────────────────────
+
+# Reference-clip length bounds (seconds) for zero-shot cloning.
+#
+# Measured on the reference interview (same target sentence, four prompts):
+#   prompt 9.0 s, density 0.62 → output 0.80 s/char, speaker similarity 0.66
+#   prompt 8.2 s, density 0.68 → output 0.65 s/char, similarity 0.69
+#   prompt 5.0 s, density 0.83 → output 0.31 s/char, similarity 0.50
+#   bundled Chinese prompt     → output 0.21 s/char, similarity 0.10
+# Natural Mandarin is ~0.22 s/char.  So prompt *density* controls pacing (a
+# gappy prompt makes the dub drawl) and prompt *length* controls timbre
+# similarity.  5–7 s of dense speech is the usable middle.
+TTS_REF_MIN_DURATION = 4.0
+TTS_REF_MAX_DURATION = 10.0
+# Shorter is better than longer here: a long prompt tends to span several
+# utterances with pauses between them, and zero-shot cloning copies that
+# pacing into every dubbed line.
+TTS_REF_TARGET_DURATION = 6.0
+
+# Minimum fraction of the reference clip that must be speech rather than
+# internal pause (see diarize.speech_density).
+TTS_REF_MIN_DENSITY = 0.55
+
+# A reference span must be at least this voiced (librosa.pyin voiced_flag
+# ratio) — rejects laughter / breath-only spans, which otherwise make every
+# synthesized line breathy.
+TTS_REF_MIN_VOICED_RATIO = 0.6
+
+# Reject the separated-vocals track for a span whose RMS collapsed to below
+# this fraction of the original audio's RMS (Demucs/UVR male suppression).
+TTS_VOCALS_RMS_MIN_RATIO = 0.25
+
+# Minimum ECAPA cosine similarity between a cloned segment and its speaker
+# reference before the clone is accepted.  Calibrated against measurement:
+# a correct clone scores 0.50–0.69 on this material while a *wrong* voice
+# (the bundled prompt) scores 0.10, so 0.40 separates them with margin
+# without rejecting usable clones.
+TTS_CLONE_MIN_SIMILARITY = 0.40
+
+# ── Duration fitting (TTS → time slot) ─────────────────────────
+
+# Fit each synthesized segment into its timeline slot.  Without this the
+# Chinese dub simply overruns and additively mixes into the next line.
+TTS_FIT_TO_SLOT = True
+
+# Speed-up is capped: above ~1.3x Mandarin sounds rushed and MuseTalk's
+# mouth turns mushy.  We never slow speech down (sounds drunk).
+TTS_FIT_MAX_SPEEDUP = 1.25
+TTS_FIT_MIN_SPEEDUP = 0.85
+
+# Escalated cap, used only when staying at TTS_FIT_MAX_SPEEDUP would force us
+# to cut more than TTS_FIT_MAX_TRUNCATE seconds off the end of a line.  The
+# per-speaker rate correction is a *median*, so the slow tail of a speaker's
+# output still overruns; losing words is worse than a slightly faster
+# delivery, so those lines are allowed to speed up further.
+TTS_FIT_MAX_SPEEDUP_HARD = 1.60
+TTS_FIT_MAX_TRUNCATE = 0.30
+
+# Overrun (as a fraction of the slot) tolerated without any stretching —
+# a short tail into following silence sounds natural.
+TTS_FIT_TAIL_TOLERANCE = 0.15
+
+# Extra seconds a segment may borrow from the following silence.
+TTS_FIT_MAX_TAIL = 0.6
+
+# Guard gap (s) kept before the next segment's start.
+TTS_FIT_MIN_GAP = 0.12
+
+# "rubberband" (better quality) with automatic "atempo" fallback.
+TTS_FIT_BACKEND = "rubberband"
+
+# ── Speaking-rate normalisation ────────────────────────────────
+#
+# Zero-shot cloning copies the prompt's *pace* as well as its timbre, and a
+# Japanese prompt makes CosyVoice3 deliver Chinese slowly: measured on the
+# reference interview the clones came out at a median 0.62 s per character
+# against a natural ~0.22.  Capping the per-segment fit at 1.25x can never
+# absorb a 3x rate error, so we first correct the rate globally per speaker —
+# uniformly speeding up uniformly-slow speech restores a normal delivery
+# rather than making it sound rushed — and only then fit each segment.
+TTS_NATURAL_SEC_PER_CHAR = 0.22
+
+# Only correct when the speaker is at least this much slower than natural.
+TTS_RATE_MIN_CORRECTION = 1.20
+
+# Upper bound on the global correction (beyond this something else is wrong).
+TTS_RATE_MAX_CORRECTION = 2.60
+
 # ── Vocal Separation settings ──────────────────────────────────
 
 # Active backend: "demucs" (GPU, reliable) or "uvr" (Mel-Band RoiFormer,
@@ -166,6 +333,61 @@ MUSETALK_FACE_SIZE = 256
 
 # Batch size for MuseTalk inference (lower if OOM).
 MUSETALK_BATCH_SIZE = 4
+
+# Temporal smoothing window (frames) for MuseTalk's per-frame crop box, and
+# an optional unsharp-mask amount on the generated face before it is pasted
+# back (0 = off).  See patches/README.md (musetalk_quality.patch).
+MUSETALK_BOX_SMOOTH = 5
+MUSETALK_SHARPEN = 0.4
+
+# ── Face tracking / person anchoring ───────────────────────────
+
+# Drive lip-sync from a per-frame face plan (which face belongs to which
+# speaker) instead of "whatever S3FD ranked first in this frame".
+LIPSYNC_USE_FACE_PLAN = True
+
+# Face detection runs on CPU: S3FD's conv shapes trigger a multi-minute,
+# silent, uninterruptible MIOpen JIT compile on gfx1151 (see face_restore).
+FACE_DET_DEVICE = "cpu"
+FACE_DET_EVERY = 5          # detect every Nth frame, interpolate between
+FACE_DET_MAX_WIDTH = 640    # downscale before detection
+FACE_DET_CONF = 0.8         # S3FD score threshold
+FACE_TRACK_IOU = 0.3        # IoU to continue a track
+FACE_TRACK_MIN_FRAMES = 8   # discard shorter tracks
+FACE_TRACK_MAX_GAP = 3      # keyframes a track may go unmatched
+
+# insightface genderage.onnx (1.3 MB) — bbox-only attribute model, run via
+# onnxruntime.  "heuristic" disables face gender (all tracks "unknown").
+FACE_GENDER_BACKEND = "insightface"
+FACE_GENDER_MODEL = str(ROOT_DIR / "models" / "insightface" / "genderage.onnx")
+FACE_GENDER_SAMPLES = 24    # frames voted per track
+FACE_GENDER_MIN_CONF = 0.65 # below this the track is "unknown"
+
+# Minimum speaker↔track binding score; below it the speaker gets no face
+# (their segments pass through as original video).
+FACE_BIND_MIN_SCORE = 0.35
+
+# ── Head-pose gate (侧脸直通) ──────────────────────────────────
+# MuseTalk is a frontal-face model: measured on test_2 (540 s drama), the
+# mouth it paints on a head turned 60–75° keeps only ~14% of the source's
+# sharpness (a smear), while 0–45° keeps ~50%.  Frames beyond FACE_YAW_MAX
+# therefore keep the original footage — an unsynced profile mouth is far
+# less visible than a blurred blob.  Yaw comes from insightface's 1k3d68
+# (3-D 68-pt landmarks, onnxruntime on CPU) at every detection keyframe.
+FACE_POSE_MODEL = str(ROOT_DIR / "models" / "insightface" / "1k3d68.onnx")
+FACE_YAW_MAX = 55.0         # deg; |yaw| above this → pass through
+FACE_MIN_WIDTH = 80         # px; faces narrower than this → pass through
+                            # (measured: <80 px stays at 0.45 sharpness even
+                            # after CodeFormer; ≥80 px reaches 0.85–1.0)
+FACE_GATE_SMOOTH = 15       # frames (odd); median filter on the gate so the
+                            # mouth doesn't flip synced/original every few frames
+
+# ── Face enhancement (CodeFormer) defaults ────────────────────
+# Measured on test_2: with the lips protected CodeFormer changes almost
+# nothing (mouth sharpness 44→48); unprotected at w=0.7 it nearly doubles
+# it (44→82, 64→80) while keeping the generated mouth shape.
+FACE_ENHANCE_FIDELITY = 0.7
+FACE_ENHANCE_PROTECT_LIPS = False
 
 # ── Translation settings ──────────────────────────────────────
 
@@ -196,8 +418,59 @@ TRANSLATION_BATCH_SIZE = 8
 TRANSLATION_MAX_NEW_TOKENS = 256
 
 # Number of preceding segments to include as translation context (0 = none).
-# NOTE: context can leak into output with some models — test before enabling.
-TRANSLATION_CONTEXT_SEGMENTS = 0
+# The output is guarded by _extract_translation's echo/explanation detectors
+# plus a context-leak check that retries the segment context-free.
+TRANSLATION_CONTEXT_SEGMENTS = 2
+
+# ── Context-aware / colloquial translation (v2) ────────────────
+
+# Preceding / following segments shown to the LLM engines.
+TRANSLATION_CTX_BEFORE = 4
+TRANSLATION_CTX_AFTER = 2
+
+# Scene framing prepended to every LLM translation prompt.
+TRANSLATION_SCENE_HINT = (
+    "这是一段日语访谈/对话的字幕。请翻译成自然、口语化的简体中文，"
+    "该用俚语、俗语、语气词的地方就用，不要翻译腔，不要书面语。"
+)
+
+# Ollama models used by the new engines.
+OLLAMA_GPTOSS_MODEL = "huihui_ai/gpt-oss-abliterated:120b"
+OLLAMA_SAKURA_MODEL = "quantumcookie/Sakura-qwen2.5-v1.0:14b"
+
+# Approximate resident size (GB) per ollama model — used to decide whether
+# other models must be evicted first.  Hy-MT2-30B (57 GB) and gpt-oss-120b
+# (88 GB) cannot coexist in 122 GB.
+OLLAMA_MODEL_SIZE_GB = {
+    "huihui_ai/gpt-oss-abliterated:120b": 88.0,
+    "dolphin-mixtral:8x22b": 80.0,
+    "dolphin-mixtral:8x7b": 27.0,
+    "quantumcookie/Sakura-qwen2.5-v1.0:14b": 13.0,
+}
+
+# Evict other loaded ollama models before running one bigger than this.
+OLLAMA_EXCLUSIVE_ABOVE_GB = 40.0
+
+# ── Glossary / terminology ─────────────────────────────────────
+
+# User-editable seed glossary, merged over auto-extracted terms
+# (user entries always win).
+GLOSSARY_PATH = str(ROOT_DIR / "asset" / "glossary.json")
+
+# Model used to normalise pinned terms in finished translations.
+#
+# Deliberately NOT the translation model: Sakura is a completion-style
+# translator and cannot follow a correction instruction — asked to fix a name
+# it returned 小卡娜 / 小勘 / 小勘娜.  A general instruct model handles the
+# one-sentence rewrite reliably (4/4 on the reference cases).  Bulk structured
+# output from the same model is unreliable, which is why enforcement is
+# per-sentence.
+GLOSSARY_ENFORCE_MODEL = "dolphin-mixtral:8x7b"
+
+# Auto-extract proper nouns / slang with the LLM before translating.
+GLOSSARY_AUTO_EXTRACT = True
+GLOSSARY_MAX_TERMS = 40
+GLOSSARY_MIN_COUNT = 2
 
 # Supported target languages {label: language-name-for-model}
 TRANSLATION_TARGET_LANGS = {

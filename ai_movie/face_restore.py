@@ -13,6 +13,7 @@ with Wav2Lip for per-frame face boxes.
 """
 
 import gc
+import json
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from typing import Callable
 
 import cv2
 import numpy as np
+
+from ai_movie.config import FACE_ENHANCE_FIDELITY, FACE_ENHANCE_PROTECT_LIPS
 import torch
 
 _ROOT = Path(__file__).parent.parent
@@ -193,7 +196,7 @@ def restore_video(
     in_video: str | Path,
     out_video: str | Path,
     *,
-    fidelity_weight: float = 0.85,
+    fidelity_weight: float = FACE_ENHANCE_FIDELITY,
     face_det_batch_size: int = 8,
     det_max_width: int = 640,
     det_device: str = "cpu",
@@ -201,28 +204,38 @@ def restore_video(
     conf_thresh: float = 0.9,
     occlusion_aware: bool = True,
     occlusion_lip_thresh: float = 0.004,
-    protect_lips: bool = True,
+    protect_lips: bool = FACE_ENHANCE_PROTECT_LIPS,
     parse_device: str | None = None,
     chunk_size: int = 600,
+    frame_filter: Callable[[int], bool] | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> Path | None:
     """Restore faces in *in_video*, writing the result (with original audio) to *out_video*.
 
+    ``frame_filter(global_frame_index) -> bool`` restricts the pass to the
+    frames it returns True for (typically the lip-synced ones from the face
+    plan, see ``frame_filter_from_plan``); every other frame is written through
+    untouched and never detected on — on a 540 s film that is the difference
+    between enhancing 2 800 frames and "restoring" all 16 200, most of them
+    original footage nobody asked to change.
+
     Parameters
     ----------
     fidelity_weight:
         CodeFormer ``w`` in [0, 1].  Higher = stay closer to the input
         (more identity fidelity, less aggressive restoration); lower = more
-        restoration (sharper but can drift).  Default 0.85 keeps the
-        lip-synced mouth shape faithful (a low ``w`` makes CodeFormer's
-        codebook regularize the generated mouth back toward a neutral,
-        original-looking mouth).
+        restoration (sharper but can drift).  Default from config
+        (0.7): measured on test_2 it keeps the generated mouth shape while
+        nearly doubling mouth sharpness; 0.85 was too timid to matter.
     protect_lips:
-        When True (default) the mouth/lip pixels are **excluded** from the
+        When True the mouth/lip pixels are **excluded** from the
         restoration mask, so the generated lip-sync mouth shape is left
         completely untouched and only the surrounding skin/jaw is sharpened.
+        Default from config (False): with the lips protected the pass
+        changed mouth sharpness 44→48 on test_2, i.e. it did not address
+        the soft mouth the user actually sees.
         Requires the BiSeNet parser for accurate lip pixels; without it, a
         central mouth band of the geometric mask is zeroed as a fallback.
     det_max_width:
@@ -321,6 +334,9 @@ def restore_video(
             if not window:
                 break
             H, W = window[0].shape[:2]
+            base = processed
+            keep = ([bool(frame_filter(base + i)) for i in range(len(window))]
+                    if frame_filter is not None else [True] * len(window))
 
             if writer is None:
                 writer = cv2.VideoWriter(str(tmp_avi), cv2.VideoWriter_fourcc(*"FFV1"), fps, (W, H))
@@ -335,8 +351,20 @@ def restore_video(
             # and scaled to full-resolution coordinates.
             det_scale = det_max_width / W if W > det_max_width else 1.0
             n = len(window)
-            key_idx = list(range(0, n, max(1, det_every)))
-            if key_idx[-1] != n - 1:
+            if not any(keep):
+                # Nothing to enhance in this window: pass it through untouched.
+                for frame in window:
+                    writer.write(frame)
+                    processed += 1
+                if progress_cb:
+                    progress_cb(processed, total)
+                continue
+            step = max(1, det_every)
+            key_idx = [i for i in range(0, n, step)
+                       if any(keep[max(0, i - step): i + step + 1])]
+            if not key_idx:
+                key_idx = [next(i for i in range(n) if keep[i])]
+            if key_idx[-1] != n - 1 and keep[n - 1]:
                 key_idx.append(n - 1)
 
             def _prep(f):
@@ -348,7 +376,7 @@ def restore_video(
             det_frames = [_prep(window[i]) for i in key_idx]
             if log_cb:
                 log_cb(f"CodeFormer: detecting faces on {len(det_frames)}/{n} "
-                       f"frames ({det_device})…")
+                       f"frames ({det_device}), {sum(keep)} to enhance…")
             t_det = time.time()
             face_results = _detect_faces(
                 det_frames, device=det_device, batch_size=face_det_batch_size,
@@ -359,6 +387,7 @@ def restore_video(
                          for _, b, _sc in face_results]              # (y1, y2, x1, x2)
             key_valid = [sc >= conf_thresh for _, _b, sc in face_results]
             boxes = _resolve_boxes(key_idx, key_boxes, key_valid, n, det_every)
+            boxes = [b if keep[i] else None for i, b in enumerate(boxes)]
             if log_cb:
                 nvalid = sum(key_valid)
                 log_cb(f"CodeFormer: detection done ({time.time() - t_det:.1f}s), "
@@ -469,6 +498,26 @@ def restore_video(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return out_video
+
+
+def frame_filter_from_plan(plan: dict | str | Path | None) -> Callable[[int], bool] | None:
+    """Build a ``frame_filter`` for ``restore_video`` from a face plan.
+
+    Returns ``None`` (= enhance everything) when no plan is given, so callers
+    can pass the plan path straight through.
+    """
+    if plan is None:
+        return None
+    if isinstance(plan, (str, Path)):
+        try:
+            plan = json.loads(Path(plan).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    frames = plan.get("frames") or {}
+    if not frames:
+        return None
+    keep = {int(k) for k in frames}
+    return lambda i: i in keep
 
 
 def occlusion_gate_video(

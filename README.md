@@ -2,7 +2,7 @@
 
 > **一句话**：加载任意视频，用 AI 将配音替换为中文，同时保留原始音色和背景音。
 
-> 📊 详细状态见 [Documentation/project-status.md](Documentation/project-status.md)
+> 📊 v2 质量升级说明见 [Documentation/v2-quality-upgrade.md](Documentation/v2-quality-upgrade.md)；v1 历史文档在 [Documentation/v1/](Documentation/v1/)
 
 ---
 

@@ -1,0 +1,176 @@
+--- a/models/musetalk/musetalk/utils/audio_processor.py
++++ b/models/musetalk/musetalk/utils/audio_processor.py
+@@ -44,7 +44,18 @@
+         fps=25,
+         audio_padding_length_left=2,
+         audio_padding_length_right=2,
++        num_frames=None,
+     ):
++        """One audio window per video frame.
++
++        ``fps`` may be fractional.  Upstream did ``fps = int(fps)``, which turns
++        an NTSC 29.97 source into 29: ~3.3% too few windows (hence too few
++        generated frames) and an audio→frame mapping that drifts 1 frame every
++        30 — measured as the mouth lagging the voice by 7 frames (230 ms) by
++        the end of a 7 s clip.  ``num_frames`` lets the caller pin the window
++        count to the clip's real frame count so the output is 1:1 with the
++        input video and needs no re-timing afterwards.
++        """
+         audio_feature_length_per_frame = 2 * (audio_padding_length_left + audio_padding_length_right + 1)
+         whisper_feature = []
+         # Process multiple 30s mel input features
+@@ -58,20 +69,29 @@
+         # Trim the last segment to remove padding
+         sr = 16000
+         audio_fps = 50
+-        fps = int(fps)
++        fps = float(fps)
+         whisper_idx_multiplier = audio_fps / fps
+-        num_frames = math.floor((librosa_length / sr) * fps)
++        if num_frames is None:
++            num_frames = math.floor((librosa_length / sr) * fps)
++        num_frames = int(num_frames)
+         actual_length = math.floor((librosa_length / sr) * audio_fps)
+         whisper_feature = whisper_feature[:,:actual_length,...]
+ 
+         # Calculate padding amount
+         padding_nums = math.ceil(whisper_idx_multiplier)
++        # Right padding must also cover the case where the caller pins more
++        # frames than the audio strictly has (a clip's last frame or two).
++        need_right = max(0, math.floor((num_frames - 1) * whisper_idx_multiplier)
++                         + audio_feature_length_per_frame
++                         - (whisper_feature.shape[1] + padding_nums * audio_padding_length_left))
++        right_pad = max(padding_nums * 3 * audio_padding_length_right, need_right)
+         # Add padding at start and end
+         whisper_feature = torch.cat([
+             torch.zeros_like(whisper_feature[:, :padding_nums * audio_padding_length_left]),
+             whisper_feature,
+             # Add extra padding to prevent out of bounds
+-            torch.zeros_like(whisper_feature[:, :padding_nums * 3 * audio_padding_length_right])
++            torch.zeros(whisper_feature.shape[0], right_pad, *whisper_feature.shape[2:],
++                        dtype=whisper_feature.dtype, device=whisper_feature.device),
+         ], 1)
+ 
+         audio_prompts = []
+--- a/models/musetalk/scripts/inference.py
++++ b/models/musetalk/scripts/inference.py
+@@ -19,7 +19,54 @@
+ from musetalk.utils.face_parsing import FaceParsing
+ from musetalk.utils.audio_processor import AudioProcessor
+ from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
+-from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
++from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, _bbox_iou
++
++
++def smooth_coords(coord_list, roll_list, window):
++    """Temporal smoothing of the per-frame crop boxes (and head roll).
++
++    DWPose's landmark box jitters a few pixels frame to frame; because the
++    lower face is regenerated from whatever crop it gets, that jitter turns
++    into the generated mouth "swimming" against the face.  Boxes are averaged
++    over a centred window, but only inside a run of consecutive real boxes
++    whose IoU with the previous one is > 0.5 — never across a cut, a
++    placeholder frame, or a jump to a different face.
++    """
++    n = len(coord_list)
++    if window is None or int(window) <= 1 or n < 3:
++        return list(coord_list), list(roll_list)
++    window = int(window) | 1
++    half = window // 2
++    out, rout = list(coord_list), list(roll_list)
++    i = 0
++    while i < n:
++        if coord_list[i] == coord_placeholder:
++            i += 1
++            continue
++        j = i
++        while (j + 1 < n and coord_list[j + 1] != coord_placeholder
++               and _bbox_iou(coord_list[j], coord_list[j + 1]) > 0.5):
++            j += 1
++        if j - i + 1 >= 3:
++            arr = np.array([coord_list[k] for k in range(i, j + 1)], dtype=np.float64)
++            rarr = np.array([roll_list[k] for k in range(i, j + 1)], dtype=np.float64)
++            for m, k in enumerate(range(i, j + 1)):
++                a, b = max(0, m - half), min(len(arr), m + half + 1)
++                out[k] = tuple(int(round(v)) for v in arr[a:b].mean(0))
++                rout[k] = float(rarr[a:b].mean())
++        i = j + 1
++    return out, rout
++
++
++def unsharp(img, amount, sigma=1.0):
++    if amount <= 0:
++        return img
++    blur = cv2.GaussianBlur(img, (0, 0), sigma)
++    return cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0)
++
++
++_INTERP = {"linear": cv2.INTER_LINEAR, "cubic": cv2.INTER_CUBIC,
++           "lanczos": cv2.INTER_LANCZOS4, "area": cv2.INTER_AREA}
+ 
+ def fast_check_ffmpeg():
+     try:
+@@ -135,7 +182,17 @@
+             else:
+                 raise ValueError(f"{video_path} should be a video file, an image file or a directory of images")
+ 
+-            # Extract audio features
++            # Per-task quality knobs (batching many clips into one process is
++            # how we avoid reloading the models, so they must be per task).
++            _task = inference_config[task_id]
++            box_smooth = int(_task.get("box_smooth", args.box_smooth))
++            sharpen = float(_task.get("sharpen", args.sharpen))
++            paste_interp = _INTERP.get(str(_task.get("paste_interp", args.paste_interp)), cv2.INTER_CUBIC)
++
++            # Extract audio features.  For a video input pin the number of
++            # audio windows to the number of frames: the output is then exactly
++            # 1:1 with the input (no re-timing needed) and a fractional fps
++            # such as 29.97 no longer truncates to 29 (see AudioProcessor).
+             whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
+             whisper_chunks = audio_processor.get_whisper_chunk(
+                 whisper_input_features, 
+@@ -146,6 +203,7 @@
+                 fps=fps,
+                 audio_padding_length_left=args.audio_padding_length_left,
+                 audio_padding_length_right=args.audio_padding_length_right,
++                num_frames=len(input_img_list) if get_file_type(video_path) == "video" else None,
+             )
+             
+             # Per-frame target face (which person to drive).  Supplied by
+@@ -183,6 +241,9 @@
+                     pickle.dump(coord_list, f)
+ 
+             print(f"Number of frames: {len(frame_list)}")
++            if box_smooth > 1:
++                coord_list, roll_list = smooth_coords(coord_list, roll_list, box_smooth)
++                print(f"crop boxes smoothed over {box_smooth} frames")
+ 
+             # Process each frame
+             ROLL_MIN = 8.0   # deg — below this, skip alignment (avoid needless warp)
+@@ -269,7 +330,12 @@
+                     y2 = y2 + args.extra_margin
+                     y2 = min(y2, frame.shape[0])
+                 try:
+-                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
++                    # Cubic (not bilinear) when the 256² render is scaled up to
++                    # a big face; area when scaled down to a small one.
++                    _interp = paste_interp if (x2 - x1) > 256 else cv2.INTER_AREA
++                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1), interpolation=_interp)
++                    if sharpen > 0:
++                        res_frame = unsharp(res_frame, sharpen, sigma=max(1.0, (x2 - x1) / 256.0))
+                 except:
+                     continue
+                 if abs(roll) >= ROLL_MIN:
+@@ -333,6 +399,12 @@
+     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
+     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
+     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
++    parser.add_argument("--box_smooth", type=int, default=5,
++                        help="temporal window (frames) for crop-box smoothing; 0/1 = off")
++    parser.add_argument("--sharpen", type=float, default=0.0,
++                        help="unsharp-mask amount applied to the generated face before paste; 0 = off")
++    parser.add_argument("--paste_interp", type=str, default="cubic", choices=list(_INTERP),
++                        help="interpolation used when the 256² render is scaled UP to the face box")
+     parser.add_argument("--target_bbox_json", type=str, default=None,
+                         help="JSON with {'frames': {frame_index: [x1,y1,x2,y2]}} naming "
+                              "which face to drive per frame; frames absent from the map "

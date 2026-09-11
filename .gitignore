@@ -23,7 +23,13 @@ env/
 # Project: intermediate / output files
 workspace/
 
-# Project: video / audio (keep test_data)
+# Project: test videos + generated results / project files (never committed)
+test_data/
+projects/
+*.bak
+*.log
+
+# Project: video / audio
 *.mp4
 *.mkv
 *.mov
@@ -51,6 +57,9 @@ output_test.aimovie.json
 # Model weights — keep folder structure, ignore contents
 # Each weight directory has its own .gitignore with: *\n!.gitkeep\n!.gitignore
 # ═══════════════════════════════════════════════════════════════
+
+# MuseTalk vendor checkout (git clone; local changes live in patches/)
+models/musetalk/
 
 # Pinned transformers 4.51.3 for CosyVoice2/3 subprocess (rebuild via scripts/setup_tts_transformers.sh)
 vendor/tts_transformers/

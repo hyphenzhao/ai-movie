@@ -12,6 +12,7 @@ ChatML prompt template::
 
 """
 
+import sys
 import threading
 from pathlib import Path
 from typing import Callable
@@ -189,6 +190,16 @@ def _extract_translation(raw: str, original: str = "") -> str:
 
 # ── Ollama output cleaner ────────────────────────────────────────
 
+def _looks_like_context_echo(text: str) -> bool:
+    """Whether the model returned a "「原文」→「译文」" pair instead of a translation.
+
+    Completion-style models continue any pattern they are shown; when the
+    prompt contained context in that shape they reproduce it verbatim.
+    """
+    import re as _re
+    return bool(_re.search(r"[「\"'']..*?[」\"'']\s*(→|->|=>)\s*[「\"'']", text or ""))
+
+
 def _clean_ollama_output(raw: str) -> str:
     """Aggressively strip LLM commentary from Ollama output.
 
@@ -198,6 +209,11 @@ def _clean_ollama_output(raw: str) -> str:
     """
     import re as _re
     text = raw.strip()
+
+    # 0. A context echo carries no translation — drop it so the caller can
+    #    retry or leave the segment empty rather than emit "「A」→「B」".
+    if _looks_like_context_echo(text):
+        return ""
 
     # 1. Strip ChatML tokens (including truncated forms)
     text = _re.sub(r"<\|im_start[\|>]*|<\|im_end[\|>]*|</?im_start>|</?im_end>",
@@ -381,6 +397,165 @@ def translate(
     return results
 
 
+# ── Memory-exclusive engine routing ──────────────────────────────
+#
+# This box has 122 GB of unified memory.  Hy-MT2-30B is 57 GB resident and
+# gpt-oss-120b is 88 GB — they cannot coexist, and neither can Hy-MT2 plus
+# dolphin-mixtral:8x22b (80 GB), which is exactly what the "hy-mt2+polish"
+# engine has been asking for.  Every engine switch must therefore evict the
+# previous one first.
+
+def unload_local_models(model_path: str | None = None) -> None:
+    """Free transformers models held in ``_model_cache``.
+
+    Pass a *model_path* to drop just that one, or ``None`` to drop all.
+    Safe to call when nothing is loaded.
+    """
+    import gc
+
+    with _lock:
+        keys = [model_path] if model_path else list(_model_cache.keys())
+        for k in keys:
+            _model_cache.pop(k, None)
+            _tokenizer_cache.pop(k, None)
+
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+def ollama_loaded(base_url: str | None = None) -> list[dict]:
+    """Return the models Ollama currently holds resident (``GET /api/ps``)."""
+    import json as _json
+    import urllib.request as _urllib
+
+    from ai_movie.config import OLLAMA_BASE_URL
+
+    base_url = base_url or OLLAMA_BASE_URL
+    try:
+        with _urllib.urlopen(f"{base_url.rstrip('/')}/api/ps", timeout=10) as resp:
+            return _json.loads(resp.read().decode("utf-8")).get("models", [])
+    except Exception:                                   # noqa: BLE001
+        return []
+
+
+def ollama_unload(model: str, base_url: str | None = None) -> None:
+    """Evict *model* from Ollama's memory (``keep_alive: 0``)."""
+    import json as _json
+    import urllib.request as _urllib
+
+    from ai_movie.config import OLLAMA_BASE_URL
+
+    base_url = base_url or OLLAMA_BASE_URL
+    payload = _json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
+    req = _urllib.Request(
+        f"{base_url.rstrip('/')}/api/generate", data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with _urllib.urlopen(req, timeout=120):
+            pass
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+def free_gpu_for_local_work(base_url: str | None = None,
+                            log_cb: Callable[[str], None] | None = None) -> None:
+    """Evict every resident Ollama model and transformers model.
+
+    GPU memory here is *unified system memory*: an 83 GB Ollama model leaves
+    about 10 MiB for anything else, so CosyVoice, MuseTalk and CodeFormer all
+    fail with OOM while an LLM is loaded.  Call this before any local GPU
+    stage (TTS, lip-sync, face restore).
+    """
+    for m in ollama_loaded(base_url):
+        name = m.get("name") or m.get("model") or ""
+        if name:
+            (log_cb or (lambda s: print(f"[engine] {s}", flush=True)))(
+                f"evicting ollama model {name} to free GPU")
+            ollama_unload(name, base_url)
+    unload_local_models()
+
+
+def _free_gb() -> float:
+    """Available system memory in GB (0.0 if unreadable)."""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except Exception:                                   # noqa: BLE001
+        pass
+    return 0.0
+
+
+def _model_size_gb(model: str) -> float:
+    from ai_movie.config import OLLAMA_MODEL_SIZE_GB
+    return float(OLLAMA_MODEL_SIZE_GB.get(model, 0.0))
+
+
+class exclusive_engine:
+    """Context manager guaranteeing one heavyweight engine is resident.
+
+    ``kind="ollama"`` evicts every transformers model, plus any *other*
+    Ollama model when the target is large.  ``kind="local"`` evicts all
+    Ollama models before the transformers model loads.
+
+    Usage::
+
+        with exclusive_engine("ollama", ollama_model=OLLAMA_GPTOSS_MODEL):
+            ...
+    """
+
+    def __init__(self, kind: str, *, ollama_model: str | None = None,
+                 base_url: str | None = None,
+                 log_cb: Callable[[str], None] | None = None):
+        self.kind = kind
+        self.ollama_model = ollama_model
+        self.base_url = base_url
+        self.log_cb = log_cb
+
+    def _log(self, msg: str) -> None:
+        if self.log_cb:
+            self.log_cb(msg)
+        else:
+            print(f"[engine] {msg}", flush=True)
+
+    def __enter__(self):
+        from ai_movie.config import OLLAMA_EXCLUSIVE_ABOVE_GB
+
+        before = _free_gb()
+        if self.kind == "ollama":
+            unload_local_models()
+            target = self.ollama_model or ""
+            if _model_size_gb(target) >= OLLAMA_EXCLUSIVE_ABOVE_GB:
+                for m in ollama_loaded(self.base_url):
+                    name = m.get("name") or m.get("model") or ""
+                    if name and name != target:
+                        self._log(f"evicting ollama model {name}")
+                        ollama_unload(name, self.base_url)
+        elif self.kind == "local":
+            for m in ollama_loaded(self.base_url):
+                name = m.get("name") or m.get("model") or ""
+                if name:
+                    self._log(f"evicting ollama model {name}")
+                    ollama_unload(name, self.base_url)
+        after = _free_gb()
+        self._log(f"enter {self.kind}"
+                  f"{'(' + self.ollama_model + ')' if self.ollama_model else ''}: "
+                  f"free {before:.0f}→{after:.0f} GB")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._log(f"exit {self.kind}: free {_free_gb():.0f} GB")
+        return False
+
+
 # ── Ollama translation backend ───────────────────────────────────
 
 # ═══ common Ollama HTTP helper ═══════════════════════════════════
@@ -390,6 +565,8 @@ def _call_ollama_chat(
     messages: list[dict],
     base_url: str,
     timeout: int = 600,
+    options: dict | None = None,
+    think: bool | None = None,
 ) -> str:
     """Send a single chat request to Ollama; return the assistant reply.
 
@@ -412,11 +589,23 @@ def _call_ollama_chat(
     import urllib.request as _urllib
 
     chat_url = f"{base_url.rstrip('/')}/api/chat"
-    payload = _json.dumps({
+    # Bound the generation.  Without num_predict Ollama decodes until the
+    # context limit: measured on this project, Sakura-14b produced 4 099
+    # tokens for a single ~20-token subtitle line, and dolphin-mixtral
+    # degenerated into a repeated "MMFMMF..." pattern.  A cap plus a repeat
+    # penalty turns those hangs into (at worst) a rejected batch that retries.
+    opts = {"num_predict": 512, "temperature": 0.2, "repeat_penalty": 1.15}
+    if options:
+        opts.update(options)
+    body = {
         "model": model,
         "messages": messages,
         "stream": False,
-    }, ensure_ascii=False).encode("utf-8")
+        "options": opts,
+    }
+    if think is not None:
+        body["think"] = think
+    payload = _json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     req = _urllib.Request(
         chat_url, data=payload,
@@ -1108,3 +1297,504 @@ def polish_ollama(
             progress_cb(completed, total)
 
     return results
+
+
+# ── v2: context-aware, glossary-pinned translation ──────────────────
+#
+# The v1 path translated each line in isolation with the prompt
+# "Translate Japanese to Chinese:\n{text}" and TRANSLATION_CONTEXT_SEGMENTS
+# pinned to 0.  That is why the reference run produced 「镰鼬」 for the
+# performer's name and rendered 「目ぐらいかな」 as 「大概就是眼睛吧」: no
+# surrounding dialogue, no speaker, no terminology.  Everything below feeds
+# the model the conversation instead of a fragment.
+
+def build_context_block(
+    segments: list[dict],
+    translations: list[str],
+    idx: int,
+    *,
+    n_before: int | None = None,
+    n_after: int | None = None,
+) -> tuple[str, str]:
+    """Return ``(already_translated_block, upcoming_source_block)``."""
+    from ai_movie.config import TRANSLATION_CTX_AFTER, TRANSLATION_CTX_BEFORE
+
+    n_before = TRANSLATION_CTX_BEFORE if n_before is None else n_before
+    n_after = TRANSLATION_CTX_AFTER if n_after is None else n_after
+
+    before = []
+    for j in range(max(0, idx - n_before), idx):
+        zh = (translations[j] or "").strip() if j < len(translations) else ""
+        if not zh:
+            continue
+        before.append(f"  {_speaker_tag(segments[j])}「{segments[j].get('text','')}」"
+                      f" → 「{zh}」")
+    after = []
+    for j in range(idx, min(len(segments), idx + n_after)):
+        after.append(f"  {_speaker_tag(segments[j])}「{segments[j].get('text','')}」")
+    return "\n".join(before), "\n".join(after)
+
+
+def _speaker_tag(seg: dict) -> str:
+    """``[S0♀]`` style tag so the model keeps pronouns/register consistent."""
+    spk = seg.get("speaker") or ""
+    if not spk:
+        return ""
+    g = seg.get("gender") or seg.get("tts_gender") or ""
+    mark = {"female": "女", "male": "男"}.get(g, "")
+    return f"[{spk}{mark}]"
+
+
+def _llm_translate_batches(
+    segments: list[dict],
+    *,
+    model: str,
+    base_url: str,
+    glossary: dict | None,
+    batch_size: int,
+    scene_hint: str | None,
+    max_retries: int,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Translate with a chat LLM, feeding it a rolling window of context."""
+    from ai_movie.config import TRANSLATION_SCENE_HINT
+    from ai_movie.glossary import (
+        format_for_prompt, protect_terms, restore_terms,
+    )
+
+    scene_hint = scene_hint or TRANSLATION_SCENE_HINT
+    out: list[str] = [""] * len(segments)
+    total = len(segments)
+
+    system = (
+        scene_hint + "\n\n"
+        "规则：\n"
+        "1. 逐句翻译，输入几句就输出几句，不要合并或拆分。\n"
+        "2. 口语化。该用俚语、俗语、语气词就用，不要翻译腔、不要书面语。\n"
+        "3. 同一说话人的自称、称呼、语气要前后一致（我会用 [S0女]/[S1男] 标出说话人）。\n"
+        "4. 保留语气词、笑声、感叹；不要补充原文没有的内容。\n"
+        "5. 遇到术语表里的词，必须按表中的译法翻译。\n"
+        "6. 严格只输出一个 JSON 字符串数组，不要编号、不要解释、不要任何其他文字。"
+    )
+
+    done = 0
+    for start in range(0, total, batch_size):
+        if cancel_check and cancel_check():
+            break
+        batch = segments[start:start + batch_size]
+        texts = [(s.get("text") or "").strip() for s in batch]
+        pins_per = [{} for _ in batch]
+        keep = [i for i, t in enumerate(texts) if t]
+        if not keep:
+            done += len(batch)
+            if progress_cb:
+                progress_cb(done, total)
+            continue
+
+        before, after = build_context_block(segments, out, start)
+        gl = format_for_prompt(glossary or {}, texts)
+
+        parts = []
+        if gl:
+            parts.append(f"【术语表（必须遵守）】{gl}")
+        if before:
+            parts.append("【前文（已翻译，仅供参考，不要重复输出）】\n" + before)
+        parts.append(
+            f"【待翻译】共 {len(keep)} 句，按顺序输出 {len(keep)} 个元素：\n"
+            + "\n".join(f"{n}. {_speaker_tag(batch[i])}{texts[i]}"
+                        for n, i in enumerate(keep)))
+        if after:
+            parts.append("【后文（仅供理解语境，禁止翻译）】\n" + after)
+        user = "\n\n".join(parts)
+
+        translations = None
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                raw = _call_ollama_chat(
+                    model,
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content": user}]
+                    + ([{"role": "user",
+                         "content": f"⚠️ 上次输出被拒绝：{last_err}。"
+                                    f"请重新输出 {len(keep)} 个元素的 JSON 数组。"}]
+                       if last_err else []),
+                    base_url, timeout=1800,
+                    options={"num_predict": 120 * max(4, len(keep)),
+                             "temperature": 0.2},
+                    think=False)
+            except Exception as exc:                    # noqa: BLE001
+                last_err = f"请求失败：{exc}"
+                continue
+            translations, last_err = _parse_json_array(raw, len(keep))
+            if translations is not None:
+                break
+
+        if translations is None:
+            print(f"[translate] batch @{start} failed after {max_retries} "
+                  f"attempts: {last_err}", file=sys.stderr)
+            translations = ["" for _ in keep]
+
+        for n, i in enumerate(keep):
+            out[start + i] = restore_terms(translations[n], pins_per[i])
+
+        done += len(batch)
+        if progress_cb:
+            progress_cb(done, total)
+
+    return out
+
+
+def _sakura_translate(
+    segments: list[dict],
+    *,
+    model: str,
+    base_url: str,
+    glossary: dict | None,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Per-segment translation with SakuraLLM (it cannot do JSON batches).
+
+    Context is snapshotted per batch rather than mutated live: the previous
+    implementation appended to a shared ``ctx_buf`` from inside
+    ``as_completed`` while four workers ran, so every worker saw a different,
+    race-dependent context and reruns were not reproducible.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from ai_movie.config import (
+        OLLAMA_SAKURA_CONCURRENCY, OLLAMA_SAKURA_TIMEOUT,
+        OLLAMA_SAKURA_TRANSLATE_PROMPT,
+    )
+    from ai_movie.glossary import (
+        format_for_prompt, protect_terms, restore_terms,
+    )
+
+    out: list[str] = [""] * len(segments)
+    total = len(segments)
+    ctx: list[tuple[str, str]] = []
+    done = 0
+    chunk = max(1, OLLAMA_SAKURA_CONCURRENCY)
+
+    for start in range(0, total, chunk):
+        if cancel_check and cancel_check():
+            break
+        batch = list(range(start, min(total, start + chunk)))
+        ctx_snapshot = list(ctx[-3:])          # frozen for the whole batch
+
+        def _one(i: int) -> tuple[int, str]:
+            txt = (segments[i].get("text") or "").strip()
+            if not txt:
+                return i, ""
+            pins: dict[str, str] = {}
+            # Sakura is a completion-style translation model.  Context must be
+            # given as real prior chat turns, not as an inline
+            # "「原文」→「译文」" block: given that pattern in the user message
+            # it *continues the pattern* instead of translating, and 6 of 34
+            # segments came back as literal "「A」→「B」" pairs.  Prior turns
+            # are unambiguous — the model can only answer the last one.
+            msgs = [{"role": "system",
+                     "content": OLLAMA_SAKURA_TRANSLATE_PROMPT}]
+            for o, t in ctx_snapshot[-2:]:
+                msgs.append({"role": "user",
+                             "content": f"将以下日文翻译为口语化中文：\n{o}"})
+                msgs.append({"role": "assistant", "content": t})
+
+            gl = format_for_prompt(glossary or {}, [txt])
+            head = f"固定译名：{gl}\n" if gl else ""
+            msgs.append({"role": "user",
+                         "content": f"{head}将以下日文翻译为口语化中文：\n{txt}"})
+            try:
+                raw = _call_ollama_chat(
+                    model, msgs, base_url, timeout=OLLAMA_SAKURA_TIMEOUT,
+                    options={"num_predict": max(64, len(txt) * 4),
+                             "temperature": 0.1})
+                return i, restore_terms(_clean_ollama_output(raw), pins)
+            except Exception as exc:                    # noqa: BLE001
+                print(f"[translate] sakura segment {i} failed: {exc}",
+                      file=sys.stderr)
+                return i, ""
+
+        with ThreadPoolExecutor(max_workers=chunk) as ex:
+            for i, txt in ex.map(_one, batch):
+                out[i] = txt
+
+        for i in batch:                                 # extend context in order
+            src = (segments[i].get("text") or "").strip()
+            if src and out[i]:
+                ctx.append((src, out[i]))
+        ctx = ctx[-12:]
+
+        done += len(batch)
+        if progress_cb:
+            progress_cb(done, total)
+
+    return out
+
+
+def _llm_polish(
+    segments: list[dict],
+    drafts: list[str],
+    *,
+    model: str,
+    base_url: str,
+    glossary: dict | None,
+    batch_size: int = 10,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Rewrite a literal draft into natural, colloquial, coherent Chinese."""
+    from ai_movie.config import TRANSLATION_SCENE_HINT
+    from ai_movie.glossary import format_for_prompt
+
+    out = list(drafts)
+    total = len(segments)
+    system = (
+        TRANSLATION_SCENE_HINT + "\n\n"
+        "我会给你日语原文和一版机器翻译草稿。请逐句润色：\n"
+        "1. 改成自然的中文口语，该用俚语、俗语、语气词就用；去掉翻译腔。\n"
+        "2. 修正机翻的误译、漏译、残留日文。\n"
+        "3. 保持上下文连贯：称呼、自称、语气在整段对话里一致。\n"
+        "4. 不要合并或拆分句子，输入几句就输出几句。\n"
+        "5. 术语表里的词必须按表中译法。\n"
+        "严格只输出一个 JSON 字符串数组，不要任何解释。"
+    )
+
+    done = 0
+    for start in range(0, total, batch_size):
+        if cancel_check and cancel_check():
+            break
+        idxs = [i for i in range(start, min(total, start + batch_size))
+                if (segments[i].get("text") or "").strip()]
+        if not idxs:
+            done += batch_size
+            if progress_cb:
+                progress_cb(min(done, total), total)
+            continue
+
+        before, _ = build_context_block(segments, out, start)
+        gl = format_for_prompt(glossary or {},
+                               [segments[i].get("text", "") for i in idxs])
+        parts = []
+        if gl:
+            parts.append(f"【术语表（必须遵守）】{gl}")
+        if before:
+            parts.append("【前文（已定稿）】\n" + before)
+        parts.append("【待润色】共 %d 句：\n%s" % (
+            len(idxs),
+            "\n".join(f"{n}. {_speaker_tag(segments[i])}原文：{segments[i].get('text','')}"
+                      f"\n   草稿：{out[i]}" for n, i in enumerate(idxs))))
+        user = "\n\n".join(parts)
+
+        polished = None
+        last_err = None
+        for _ in range(3):
+            try:
+                raw = _call_ollama_chat(
+                    model,
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+                    base_url, timeout=1800,
+                    options={"num_predict": 120 * max(4, len(idxs)),
+                             "temperature": 0.2},
+                    think=False)
+            except Exception as exc:                    # noqa: BLE001
+                last_err = str(exc)
+                continue
+            polished, last_err = _parse_json_array(raw, len(idxs))
+            if polished is not None:
+                break
+
+        if polished is None:
+            print(f"[translate] polish batch @{start} kept draft: {last_err}",
+                  file=sys.stderr)
+        else:
+            for n, i in enumerate(idxs):
+                if polished[n].strip():
+                    out[i] = polished[n].strip()
+
+        done += batch_size
+        if progress_cb:
+            progress_cb(min(done, total), total)
+
+    return out
+
+
+def _hymt_translate(
+    segments: list[dict],
+    *,
+    target_lang: str,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Literal draft from the local Hy-MT model (loaded exclusively)."""
+    with exclusive_engine("local"):
+        res = translate(
+            [dict(s) for s in segments], target_lang=target_lang,
+            progress_cb=progress_cb, cancel_check=cancel_check,
+        )
+        out = [(r.get("text_translated") or "").strip() for r in res]
+    unload_local_models()
+    return out
+
+
+# Engine table: (draft_fn_key, polish_model_key or None)
+TRANSLATE_ENGINES = {
+    "sakura":         ("sakura", None),
+    "sakura+gptoss":  ("sakura", "gptoss"),
+    "gptoss":         ("gptoss", None),
+    "hy-mt2":         ("hymt2", None),
+    "hy-mt2+gptoss":  ("hymt2", "gptoss"),
+    "hy-mt2+sakura":  ("hymt2", "sakura"),
+}
+
+ENGINE_LABELS = {
+    "sakura":        "Sakura-14B 直译（快，日→中口语专精）",
+    "sakura+gptoss": "Sakura 直译 + gpt-oss-120B 上下文润色（推荐）",
+    "gptoss":        "gpt-oss-120B 直译（上下文最强，最慢）",
+    "hy-mt2":        "Hy-MT2-30B 直译（原方案）",
+    "hy-mt2+gptoss": "Hy-MT2 直译 + gpt-oss-120B 润色",
+    "hy-mt2+sakura": "Hy-MT2 直译 + Sakura 润色",
+}
+
+
+def enforce_glossary(
+    segments: list[dict],
+    translations: list[str],
+    glossary: dict[str, dict],
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Normalise pinned terms in already-translated lines.
+
+    Three cheaper approaches were measured and all failed on Sakura (see
+    ``glossary.protect_terms``): instructing the model is ignored, rewriting
+    the source makes it re-transliterate, and bracketed placeholders survive
+    in isolation but get dropped once the real prompt is assembled — the
+    performer's name came back as 卡娜 / 加奈 / 卡恩娜 / 小蓝华.
+
+    Rewriting one finished sentence is a much easier task than translating
+    with constraints, and it only runs on the few lines that actually contain
+    a pinned term (9 of 128 on the reference video).  The rewrite is accepted
+    only if it really contains the pin, so this can never make a line worse.
+    """
+    from ai_movie.config import GLOSSARY_ENFORCE_MODEL, OLLAMA_BASE_URL
+
+    if not glossary:
+        return translations
+
+    model = model or GLOSSARY_ENFORCE_MODEL
+    base_url = base_url or OLLAMA_BASE_URL
+    out = list(translations)
+    fixed = attempted = 0
+
+    for i, (seg, zh) in enumerate(zip(segments, translations)):
+        src = (seg.get("text") or "")
+        zh = (zh or "").strip()
+        if not src or not zh:
+            continue
+        need = [(ja, v["zh"]) for ja, v in glossary.items()
+                if v.get("zh") and _glossary_hit(src, ja) and v["zh"] not in zh]
+        if not need:
+            continue
+        attempted += 1
+        pins = "；".join(f"{ja} 必须译作「{t}」" for ja, t in need)
+        prompt = (
+            f"下面这句中文译文里的专有名词译法不对。参考日文原文：{src}\n"
+            f"要求：{pins}。\n"
+            f"请只把名字改正，其余措辞保持不变，只输出改正后的整句，不要解释。\n"
+            f"待改正：{zh}"
+        )
+        try:
+            raw = _call_ollama_chat(
+                model,
+                [{"role": "system",
+                  "content": "你是中文字幕校对助手。只输出改正后的一句中文，不要解释。"},
+                 {"role": "user", "content": prompt}],
+                base_url, timeout=300,
+                options={"num_predict": max(64, len(zh) * 3), "temperature": 0.0})
+        except Exception:                               # noqa: BLE001
+            continue
+        cand = _clean_ollama_output(raw)
+        # Accept only if it actually applied the pin and stayed a sentence.
+        if cand and all(t in cand for _, t in need) and \
+                0.4 <= len(cand) / max(len(zh), 1) <= 2.5:
+            out[i] = cand
+            fixed += 1
+
+    if progress_cb and attempted:
+        progress_cb(f"术语校正：{fixed}/{attempted} 句已统一")
+    return out
+
+
+def _glossary_hit(src: str, ja: str) -> bool:
+    """Whether *ja* occurs in *src* as a real term (see glossary._term_pattern)."""
+    from ai_movie.glossary import _term_pattern
+    return bool(_term_pattern(ja).search(src))
+
+
+def translate_segments(
+    segments: list[dict],
+    *,
+    engine: str = "sakura+gptoss",
+    glossary: dict | None = None,
+    target_lang: str = "Chinese",
+    base_url: str | None = None,
+    batch_size: int = 8,
+    max_retries: int = 4,
+    scene_hint: str | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Translate *segments* with one of :data:`TRANSLATE_ENGINES`.
+
+    Returns one Chinese string per segment (empty string where the source
+    was empty or the engine failed).  Engines are run inside
+    :class:`exclusive_engine` so a 57 GB local model and an 88 GB Ollama
+    model can never be resident at the same time on a 122 GB box.
+    """
+    from ai_movie.config import (
+        OLLAMA_BASE_URL, OLLAMA_GPTOSS_MODEL, OLLAMA_SAKURA_MODEL,
+    )
+
+    if engine not in TRANSLATE_ENGINES:
+        raise ValueError(f"unknown translation engine: {engine!r} "
+                         f"(known: {', '.join(TRANSLATE_ENGINES)})")
+    base_url = base_url or OLLAMA_BASE_URL
+    draft_key, polish_key = TRANSLATE_ENGINES[engine]
+    models = {"gptoss": OLLAMA_GPTOSS_MODEL, "sakura": OLLAMA_SAKURA_MODEL}
+
+    # ── draft ───────────────────────────────────────────────────────
+    if draft_key == "hymt2":
+        drafts = _hymt_translate(segments, target_lang=target_lang,
+                                 progress_cb=progress_cb,
+                                 cancel_check=cancel_check)
+    else:
+        m = models[draft_key]
+        with exclusive_engine("ollama", ollama_model=m, base_url=base_url):
+            if draft_key == "sakura":
+                drafts = _sakura_translate(
+                    segments, model=m, base_url=base_url, glossary=glossary,
+                    progress_cb=progress_cb, cancel_check=cancel_check)
+            else:
+                drafts = _llm_translate_batches(
+                    segments, model=m, base_url=base_url, glossary=glossary,
+                    batch_size=batch_size, scene_hint=scene_hint,
+                    max_retries=max_retries,
+                    progress_cb=progress_cb, cancel_check=cancel_check)
+
+    if not polish_key:
+        return enforce_glossary(segments, drafts, glossary or {},
+                                base_url=base_url)
+
+    # ── polish ──────────────────────────────────────────────────────
+    m = models[polish_key]
+    with exclusive_engine("ollama", ollama_model=m, base_url=base_url):
+        polished = _llm_polish(segments, drafts, model=m, base_url=base_url,
+                               glossary=glossary, progress_cb=progress_cb,
+                               cancel_check=cancel_check)
+    return enforce_glossary(segments, polished, glossary or {},
+                            base_url=base_url)

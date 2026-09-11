@@ -21,11 +21,15 @@ argv[1] : path to a JSON job file with keys::
       "model_dir":  "<CosyVoice2/3 model dir>",
       "ref_audio":  "<reference wav path or speaker id>",
       "ref_text":   "<prompt/instruct text or null>",
-      "method":     "instruct2" | "zero_shot" | "cross_lingual",
+      "method":     "instruct2" | "zero_shot" | "cross_lingual" | "vc",
       "output_dir": "<dir for seg_XXXX.wav files>",
       "fp16":       true,
       "segments":   [{"index": 0, "text": "..."}, ...]
     }
+
+Each segment may override ``ref_audio`` / ``ref_text`` / ``method``.  With
+``"method": "vc"`` it must also carry ``source_audio``: the content comes
+from that wav and only the timbre from ``ref_audio``, so ``text`` is unused.
 
 Emits one JSON object per line on stdout::
 
@@ -150,7 +154,15 @@ def main() -> int:
         else:
             s_audio, s_text, s_method = ref_audio, ref_text, method
         try:
-            audio_np = _synth_clean(text, 1986 + idx * 131, s_audio, s_text, s_method)
+            if s_method == "vc":
+                # Voice conversion is deterministic given its source audio, so
+                # the retry-and-keep-the-longest loop below would only burn
+                # time — and "longest take" is the wrong tie-break anyway.
+                audio_np = call_tts(model, "", s_audio, None, "vc",
+                                    source_audio=seg["source_audio"])
+            else:
+                audio_np = _synth_clean(text, 1986 + idx * 131,
+                                        s_audio, s_text, s_method)
             out_path = str(out_dir / f"seg_{idx + 1:04d}.wav")
             sf.write(out_path, audio_np, model.sample_rate)
             items[str(idx)] = {"audio": out_path}

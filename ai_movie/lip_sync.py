@@ -12,6 +12,7 @@ Usage::
     musetalk_sync("input.mp4", "audio.wav", "output.mp4")
 """
 
+import json
 import shutil
 import subprocess
 import sys
@@ -719,6 +720,10 @@ def _make_tensors(img_batch: np.ndarray, mel_batch: np.ndarray,
 # ── MuseTalk backend (256×256, HQ) ──────────────────────────────────
 
 _MUSETALK_DIR = Path(__file__).parent.parent / "models" / "musetalk"
+try:
+    from ai_movie.config import MUSETALK_BOX_SMOOTH, MUSETALK_SHARPEN
+except ImportError:                                     # pragma: no cover
+    MUSETALK_BOX_SMOOTH, MUSETALK_SHARPEN = 5, 0.0
 
 
 def _find_musetalk_inference_script() -> Path | None:
@@ -763,6 +768,7 @@ def _extract_speech_ranges(
     merge_gap: float = 1.0,
     max_duration: float = 12.0,
     anchor_gender: str | None = None,
+    face_plan: dict | None = None,
 ) -> list[tuple[float, float]]:
     """Extract and merge time ranges where TTS speech audio exists.
 
@@ -793,18 +799,43 @@ def _extract_speech_ranges(
     #    When anchor_gender is set (person-anchoring), only segments whose
     #    speaker matches that gender are lip-synced; the rest pass through as
     #    original video (their dubbed audio still plays via build_speech_track).
-    raw: list[tuple[float, float]] = []
+    #
+    #    With a *face_plan* the filter becomes speaker-aware instead: a
+    #    segment is lip-synced only if its speaker is bound to a face track
+    #    (an unbound speaker — e.g. an off-camera interviewer — must leave
+    #    the picture alone).  The bound track id also becomes a merge key,
+    #    because merging two adjacent ranges belonging to different people
+    #    would put two faces in one MuseTalk call.
+    raw: list[tuple[float, float, object]] = []
     skipped_gender = 0
-    for seg in tts_results:
-        audio = seg.get("audio")
+    skipped_unbound = 0
+    bindings = (face_plan or {}).get("speaker_track") or {}
+    # Per-segment bindings exist when no single track could cover a speaker
+    # (cut-heavy footage fragments one actor into a track per shot); they
+    # take precedence over the global speaker binding for their segment.
+    seg_bindings = (face_plan or {}).get("segment_track") or {}
+
+    for seg_i, seg in enumerate(tts_results):
+        audio = seg.get("audio_fit") or seg.get("audio")
         if not audio or not Path(str(audio)).exists():
+            continue
+        if face_plan is not None:
+            tid = seg_bindings.get(str(seg_i),
+                                   bindings.get(seg.get("speaker") or ""))
+            if tid is None:
+                skipped_unbound += 1
+                continue
+            raw.append((float(seg["start"]), float(seg["end"]), tid))
             continue
         if anchor_gender and seg.get("tts_gender") != anchor_gender:
             skipped_gender += 1
             continue
-        raw.append((float(seg["start"]), float(seg["end"])))
+        raw.append((float(seg["start"]), float(seg["end"]), None))
 
-    if anchor_gender:
+    if face_plan is not None:
+        _log(f"Face-plan anchoring: lip-syncing {len(raw)} segments, "
+             f"{skipped_unbound} segments have no on-screen face → pass through")
+    elif anchor_gender:
         _log(f"Person-anchoring ({anchor_gender}-only): lip-syncing {len(raw)} "
              f"segments, {skipped_gender} other-gender segments pass through")
 
@@ -816,17 +847,29 @@ def _extract_speech_ranges(
 
     # 3. Apply padding and merge overlapping/nearby ranges
     merged: list[tuple[float, float]] = []
-    for s, e in raw:
+    last_key: object = object()
+    for s, e, key in raw:
         s = max(0.0, s - padding_before)
         e = min(video_duration, e + padding_after)
-        if merged and s <= merged[-1][1] + merge_gap:
+        if merged and s <= merged[-1][1] + merge_gap and key == last_key:
             # merge into previous range
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
             merged.append((s, e))
+            last_key = key
 
     # 4. Clamp to video bounds
     merged = [(max(0.0, s), min(video_duration, e)) for s, e in merged]
+
+    # 4b. Adjacent ranges bound to DIFFERENT faces don't merge, but their
+    #     paddings still overlap — and overlapping clips duplicate footage in
+    #     the assembly (measured: +25 frames on a cut-heavy film, pushing the
+    #     picture 0.8 s behind the audio by the end).  Trim each range's start
+    #     to the previous range's end so the timeline stays a partition.
+    for k in range(1, len(merged)):
+        if merged[k][0] < merged[k - 1][1]:
+            merged[k] = (merged[k - 1][1], max(merged[k][1], merged[k - 1][1]))
+
     merged = [(s, e) for s, e in merged if e - s > 0.1]  # skip tiny ranges
 
     # 5. Split oversized segments to limit per-call memory
@@ -852,6 +895,44 @@ def _extract_speech_ranges(
     return chunked
 
 
+def _write_clip_bbox_json(
+    face_plan: dict,
+    start: float,
+    duration: float,
+    fps: float,
+    dst: Path,
+    *,
+    scale: float = 1.0,
+) -> Path | None:
+    """Slice the global face plan down to one clip's local frame indices.
+
+    The clip was cut with ``-ss start``, so its local frame 0 corresponds to
+    global frame ``round(start * fps)``.  Returns ``None`` when the clip has
+    no anchored frames at all — the caller then skips MuseTalk entirely and
+    keeps the original footage, which is both correct and much faster.
+    """
+    frames = face_plan.get("frames") or {}
+    if not frames:
+        return None
+
+    base = int(round(start * fps))
+    n = int(round(duration * fps)) + 2
+    local: dict[str, list[float]] = {}
+    for i in range(n):
+        box = frames.get(str(base + i))
+        if box is None:
+            continue
+        local[str(i)] = [round(float(v) * scale, 1) for v in box]
+
+    if not local:
+        return None
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps({"frames": local, "frame_offset": base}),
+                   encoding="utf-8")
+    return dst
+
+
 def _cut_video_clip(
     video_path: Path,
     start: float,
@@ -859,7 +940,7 @@ def _cut_video_clip(
     output_path: Path,
     *,
     reencode: bool = False,
-    fps: float | None = None,
+    fps: float | str | None = None,
 ) -> Path:
     """Cut a precise clip from *video_path*.
 
@@ -880,7 +961,15 @@ def _cut_video_clip(
             "-pix_fmt", "yuv420p",
         ]
         if fps:
-            cmd += ["-r", f"{fps}"]
+            # Guarantee the clip is EXACTLY round(duration*fps) frames: fps
+            # resamples, tpad clones the last frame past EOF, -vframes caps.
+            # Without this, `-t` cutting yields ±1 frame per clip depending on
+            # where the boundary lands, and those roundings random-walk the
+            # assembled timeline away from the audio.
+            n = _exact_frames(duration, fps)
+            cmd += ["-vf", f"setpts=PTS-STARTPTS,fps={fps},"
+                           f"tpad=stop_mode=clone:stop=-1",
+                    "-vframes", str(n)]
         cmd += ["-an", str(output_path)]
     else:
         cmd = [
@@ -899,7 +988,8 @@ def _cut_video_clip(
     return output_path
 
 
-def _fit_clip_to_duration(src: Path, target_dur: float, fps: float, dst: Path) -> Path:
+def _fit_clip_to_duration(src: Path, target_dur: float,
+                          fps: float | str, dst: Path) -> Path:
     """Re-time *src* so its video duration is exactly *target_dur* seconds.
 
     MuseTalk emits a few % FEWER frames than its driving audio, so each speech
@@ -923,14 +1013,27 @@ def _fit_clip_to_duration(src: Path, target_dur: float, fps: float, dst: Path) -
     if cur <= 0:
         cur = target_dur
     factor = target_dur / cur
-    # setpts stretches the timestamps; the fps filter then resamples to CFR,
-    # duplicating frames as needed so the clip is exactly target_dur long.
+    # setpts stretches the timestamps and fps resamples to CFR — but that
+    # alone lands on round(target*fps)±1 depending on where the stretched
+    # last frame's pts falls.  tpad + -vframes force the exact count.
+    n = _exact_frames(target_dur, fps)
     subprocess.run([
         "ffmpeg", "-y", "-i", str(src), "-an",
-        "-vf", f"setpts={factor:.6f}*PTS,fps={fps}",
+        "-vf", f"setpts={factor:.6f}*PTS,fps={fps},tpad=stop_mode=clone:stop=-1",
+        "-vframes", str(n),
         "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(dst),
     ], check=True, capture_output=True, text=True)
     return dst
+
+
+def _exact_frames(duration: float, fps: float | str) -> int:
+    """round(duration × fps) with *fps* given as float or ``"num/den"``."""
+    if isinstance(fps, str) and "/" in fps:
+        num, _, den = fps.partition("/")
+        rate = float(num) / float(den)
+    else:
+        rate = float(fps)
+    return max(1, int(round(duration * rate)))
 
 
 def _cut_audio_clip(
@@ -960,7 +1063,7 @@ def _cut_audio_clip(
 def _concatenate_videos(
     clip_paths: list[Path],
     output_path: Path,
-    fps: float | None = None,
+    fps: float | str | None = None,
 ) -> Path:
     """Concatenate video clips, forcing a uniform constant frame rate.
 
@@ -986,8 +1089,15 @@ def _concatenate_videos(
         norm: list[Path] = []
         for i, p in enumerate(clip_paths):
             q = norm_dir / f"n{i:05d}.mp4"
+            # setpts=N/(r*TB) STAMPS frames sequentially instead of resampling
+            # by their old timestamps: every input frame gets pts = n/r, none
+            # are dropped or duplicated.  The previous `-r … -fps_mode cfr`
+            # resampled on the old stamps, and on a 2997/100 source that
+            # rounding dropped one frame at a clip boundary — 15 clips lost 8
+            # frames and the picture ended 334 ms ahead of the audio.
             subprocess.run([
                 "ffmpeg", "-y", "-i", str(p),
+                "-vf", f"setpts=N/(({r})*TB)",
                 "-r", f"{r}", "-fps_mode", "cfr",
                 "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
                 "-video_track_timescale", "90000", "-an", str(q),
@@ -1007,6 +1117,159 @@ def _concatenate_videos(
     return output_path
 
 
+def musetalk_sync_batch(
+    tasks: list[dict],
+    *,
+    fps: int = 25,
+    use_float16: bool = True,
+    batch_size: int = 4,
+    extra_margin: int = 10,
+    parsing_mode: str = "jaw",
+    left_cheek_width: int = 100,
+    right_cheek_width: int = 100,
+    audio_padding_length_left: int = 2,
+    audio_padding_length_right: int = 2,
+    box_smooth: int = MUSETALK_BOX_SMOOTH,
+    sharpen: float = MUSETALK_SHARPEN,
+    paste_interp: str = "cubic",
+    timeout: int = 7200,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[int, Path]:
+    """Lip-sync many clips in ONE MuseTalk process.
+
+    Loading the UNet, VAE, Whisper and DWPose takes ~5.5 minutes on this
+    machine, against ~12 seconds of actual inference for a 4-second clip.
+    Calling ``musetalk_sync`` once per speech range therefore spends almost
+    all of its time reloading the same weights — on a 390 s interview that is
+    hours.  MuseTalk's own config format already loops over multiple tasks,
+    so we hand it all the clips at once.
+
+    Parameters
+    ----------
+    tasks:
+        ``[{"video": Path, "audio": Path, "output": Path,
+            "bbox_json": Path | None, "opts": {...} | None}]`` — ``opts``
+        overrides ``box_smooth`` / ``sharpen`` / ``paste_interp`` per clip.
+
+    Returns
+    -------
+    ``{task_index: output_path}`` for the clips that produced a video.
+    Missing keys mean that clip failed; callers fall back to the original.
+    """
+    import yaml
+
+    if not tasks:
+        return {}
+
+    script = _find_musetalk_inference_script()
+    if script is None:
+        raise FileNotFoundError(
+            f"MuseTalk inference script not found under {_MUSETALK_DIR}.")
+    unet_path, unet_cfg = _find_musetalk_unet()
+    if unet_path is None:
+        raise FileNotFoundError(
+            f"MuseTalk UNet checkpoint not found under {_MUSETALK_DIR}/models/.")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="musetalk_batch_"))
+    result_dir = tmp_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    config = {}
+    expected: dict[int, str] = {}
+    for i, t in enumerate(tasks):
+        name = f"task_{i:04d}"
+        entry = {
+            "video_path": str(Path(t["video"]).absolute()),
+            "audio_path": str(Path(t["audio"]).absolute()),
+            "bbox_shift": 0,
+            "result_name": f"{name}.mp4",
+        }
+        if t.get("bbox_json"):
+            entry["target_bbox_json"] = str(Path(t["bbox_json"]).absolute())
+        for k, v in (t.get("opts") or {}).items():
+            entry[k] = v
+        config[name] = entry
+        expected[i] = f"{name}.mp4"
+
+    config_yaml = tmp_dir / "inference.yaml"
+    with open(config_yaml, "w") as f:
+        yaml.dump(config, f)
+
+    cmd = [
+        sys.executable, "-m", "scripts.inference",
+        "--inference_config", str(config_yaml),
+        "--unet_model_path", str(unet_path),
+        "--unet_config", str(unet_cfg),
+        "--version", "v15" if "V15" in str(unet_path).upper() else "v1",
+        "--fps", str(fps),
+        "--batch_size", str(batch_size),
+        "--extra_margin", str(extra_margin),
+        "--parsing_mode", parsing_mode,
+        "--left_cheek_width", str(left_cheek_width),
+        "--right_cheek_width", str(right_cheek_width),
+        "--audio_padding_length_left", str(audio_padding_length_left),
+        "--audio_padding_length_right", str(audio_padding_length_right),
+        "--box_smooth", str(int(box_smooth)),
+        "--sharpen", str(float(sharpen)),
+        "--paste_interp", str(paste_interp),
+        "--result_dir", str(result_dir),
+    ]
+    if use_float16:
+        cmd.append("--use_float16")
+
+    env = {**__import__("os").environ, "PYTHONPATH": str(_MUSETALK_DIR)}
+    _log(f"MuseTalk batch: {len(tasks)} clips in one process "
+         f"(fps={fps}, batch={batch_size}, box_smooth={box_smooth}, "
+         f"sharpen={sharpen}, paste={paste_interp})")
+
+    proc = subprocess.Popen(cmd, cwd=str(_MUSETALK_DIR), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    done = 0
+    output_lines: list[str] = []
+    try:
+        for line in proc.stdout:
+            if cancel_check and cancel_check():
+                proc.terminate()
+                proc.wait(timeout=10)
+                shutil.rmtree(str(tmp_dir), ignore_errors=True)
+                return {}
+            ls = line.strip()
+            if not ls:
+                continue
+            output_lines.append(ls)
+            if "Results saved to" in ls:
+                done += 1
+                _log(f"[MuseTalk] clip {done}/{len(tasks)} done")
+                if progress_cb:
+                    progress_cb(done, len(tasks))
+            elif "Error occurred" in ls or "Traceback" in ls:
+                _log(f"[MuseTalk] {ls}")
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        _log("MuseTalk batch timed out")
+
+    out: dict[int, Path] = {}
+    for i, name in expected.items():
+        found = list(result_dir.glob(f"**/{name}"))
+        if found and found[0].stat().st_size > 0:
+            dst = Path(tasks[i]["output"])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(found[0]), str(dst))
+            out[i] = dst
+    if len(out) < len(tasks):
+        missing = sorted(set(expected) - set(out))
+        _log(f"MuseTalk batch: {len(out)}/{len(tasks)} clips produced output; "
+             f"missing {missing} — those keep the original footage")
+        for ls in output_lines[-15:]:
+            _log(f"[MuseTalk tail] {ls}")
+    shutil.rmtree(str(tmp_dir), ignore_errors=True)
+    return out
+
+
 def musetalk_sync(
     video_path: str | Path,
     audio_path: str | Path,
@@ -1022,6 +1285,7 @@ def musetalk_sync(
     right_cheek_width: int = 100,
     audio_padding_length_left: int = 2,
     audio_padding_length_right: int = 2,
+    target_bbox_json: str | Path | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> Path | None:
@@ -1063,6 +1327,11 @@ def musetalk_sync(
     audio_padding_length_left, audio_padding_length_right:
         Whisper audio context frames on each side (temporal smoothing of
         mouth motion).  Default 2.
+    target_bbox_json:
+        Path to a JSON ``{"frames": {frame_index: [x1,y1,x2,y2]}}`` naming
+        which face to drive in each frame (indices are local to this clip).
+        Frames missing from the map are written through unmodified.  Requires
+        ``patches/musetalk_target_face.patch``.
     progress_cb:
         Called as ``progress_cb(current_step, total_steps)``.
     cancel_check:
@@ -1130,6 +1399,10 @@ def musetalk_sync(
     ]
     if use_float16:
         cmd.append("--use_float16")
+    if target_bbox_json:
+        # Forces MuseTalk to drive a specific face per frame instead of
+        # whichever detection scored highest (patches/musetalk_target_face.patch).
+        cmd += ["--target_bbox_json", str(Path(target_bbox_json).absolute())]
 
     museTalk_dir = str(_MUSETALK_DIR)
     env = {
@@ -1216,6 +1489,167 @@ def musetalk_sync(
     return output_path
 
 
+def _segment_lip_sync_musetalk_batch(
+    speech_ranges: list[tuple[float, float]],
+    working_video: Path,
+    speech_track: Path,
+    tmp_dir: Path,
+    output_path: Path,
+    *,
+    video_path: Path,
+    video_duration: float,
+    target_fps: float,
+    ms_fps: int,
+    face_plan: dict | None,
+    resize_factor: int,
+    occlusion_gate: bool,
+    face_restore: bool,
+    min_gap: float = 0.05,
+    exact_fps: str | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+    detail_progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Path | None:
+    """Cut every speech range, lip-sync them in one MuseTalk process, reassemble."""
+    total = len(speech_ranges)
+    processed_map: dict[tuple[float, float], Path] = {}
+    tasks: list[dict] = []
+    task_range: list[tuple[float, float]] = []
+
+    # ── 1. Cut all clips up front ────────────────────────────────
+    for idx, (seg_start, seg_end) in enumerate(speech_ranges):
+        if cancel_check and cancel_check():
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
+            return None
+        duration = seg_end - seg_start
+        name = f"speech_{idx:04d}"
+        orig_clip = tmp_dir / f"{name}_orig.mp4"
+        audio_clip = tmp_dir / f"{name}_audio.wav"
+
+        # fps=exact_fps so a clip that ends up passing through unmodified
+        # (no on-screen face) still carries its exact whole-frame count into
+        # the concat — lip-synced clips get theirs restored by the duration
+        # fit, but pass-through clips have no later correction point.
+        _cut_video_clip(working_video, seg_start, duration, orig_clip,
+                        reencode=True, fps=exact_fps or ms_fps)
+        _cut_audio_clip(speech_track, seg_start, duration, audio_clip)
+        processed_map[(seg_start, seg_end)] = orig_clip     # default: pass-through
+
+        bbox_json = None
+        if face_plan:
+            bbox_json = _write_clip_bbox_json(
+                face_plan, seg_start, duration, target_fps,
+                tmp_dir / f"{name}_bbox.json", scale=1.0 / resize_factor)
+            if bbox_json is None:
+                _log(f"[{idx+1}/{total}] no target face in "
+                     f"[{seg_start:.1f}s–{seg_end:.1f}s] — original passes through")
+                continue
+
+        tasks.append({"video": orig_clip, "audio": audio_clip,
+                      "output": tmp_dir / f"{name}_lipsync.mp4",
+                      "bbox_json": bbox_json})
+        task_range.append((seg_start, seg_end))
+
+    _log(f"Prepared {len(tasks)} clips for lip-sync "
+         f"({total - len(tasks)} pass through unchanged)")
+
+    # ── 2. One MuseTalk process for all of them ──────────────────
+    results: dict[int, Path] = {}
+    if tasks:
+        results = musetalk_sync_batch(
+            tasks, fps=ms_fps, use_float16=True, batch_size=4,
+            progress_cb=progress_cb, cancel_check=cancel_check)
+        if cancel_check and cancel_check():
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
+            return None
+
+    # ── 3. Per-clip post-processing (gate, restore, duration fit) ─
+    for i, rng in enumerate(task_range):
+        clip = results.get(i)
+        if clip is None:
+            _log(f"clip {i} produced no output — keeping original")
+            continue
+        seg_start, seg_end = rng
+        orig_clip = tasks[i]["video"]
+        final_clip = clip
+
+        if occlusion_gate:
+            gated = tmp_dir / f"speech_{i:04d}_gated.mp4"
+            try:
+                from ai_movie import face_restore as _fr
+                _fr.occlusion_gate_video(orig_clip, final_clip, gated,
+                                         cancel_check=cancel_check, log_cb=_log)
+                if gated.exists():
+                    final_clip = gated
+            except Exception as exc:                    # noqa: BLE001
+                _log(f"clip {i}: occlusion gate failed ({exc}) — un-gated")
+
+        if face_restore:
+            restored = tmp_dir / f"speech_{i:04d}_restored.mp4"
+            try:
+                from ai_movie import face_restore as _fr
+                _fr.restore_video(final_clip, restored,
+                                  cancel_check=cancel_check, log_cb=_log)
+                if restored.exists():
+                    final_clip = restored
+            except Exception as exc:                    # noqa: BLE001
+                _log(f"clip {i}: face restore failed ({exc}) — unrestored")
+
+        fitted = tmp_dir / f"speech_{i:04d}_fit.mp4"
+        try:
+            _fit_clip_to_duration(final_clip, seg_end - seg_start,
+                                  exact_fps or ms_fps, fitted)
+            if fitted.exists():
+                final_clip = fitted
+        except Exception as exc:                        # noqa: BLE001
+            _log(f"clip {i}: duration fit skipped ({exc})")
+
+        processed_map[rng] = final_clip
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ── 4. Reassemble the timeline ───────────────────────────────
+    rate = exact_fps or ms_fps
+    rate_f = (float(rate.split("/")[0]) / float(rate.split("/")[1])
+              if isinstance(rate, str) and "/" in rate else float(rate))
+    all_clips: list[Path] = []
+    dropped_frames = 0
+    cursor = 0.0
+
+    def _maybe_gap(cur: float, until: float) -> None:
+        # Gate on whole FRAMES, not a seconds threshold: boundaries are
+        # frame-quantized, so a one-frame gap (33 ms) is real footage.  The
+        # old `> min_gap` (0.05 s) test silently swallowed every one-frame
+        # gap — 8 frames across this film's 15 boundaries — and everything
+        # after each swallowed frame played that much ahead of the audio
+        # (measured: 334 ms picture lead by the end).
+        nonlocal dropped_frames
+        n = int(round((until - cur) * rate_f))
+        if n >= 1:
+            gap = tmp_dir / f"gap_{cur:.3f}_{until:.3f}.mp4"
+            _cut_video_clip(working_video, cur, until - cur, gap,
+                            reencode=True, fps=rate)
+            all_clips.append(gap)
+        elif until - cur > 1e-6:
+            dropped_frames += 1  # sub-frame residue: harmless, but count it
+
+    for seg_start, seg_end in speech_ranges:
+        _maybe_gap(cursor, seg_start)
+        all_clips.append(processed_map[(seg_start, seg_end)])
+        cursor = seg_end
+    _maybe_gap(cursor, video_duration)
+    if dropped_frames:
+        _log(f"assembly: {dropped_frames} sub-frame gap residues ignored")
+
+    _log(f"Concatenating {len(all_clips)} clips at {rate} fps")
+    _concatenate_videos(all_clips, output_path, fps=rate)
+    shutil.rmtree(str(tmp_dir), ignore_errors=True)
+    _log(f"Segment-based lip-sync DONE: {output_path}")
+    return output_path
+
+
 def segment_based_lip_sync(
     video_path: str | Path,
     tts_results: list[dict],
@@ -1230,6 +1664,7 @@ def segment_based_lip_sync(
     face_restore: bool = False,
     occlusion_gate: bool = False,
     anchor_gender: str | None = None,
+    face_plan: dict | str | Path | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
@@ -1325,6 +1760,19 @@ def segment_based_lip_sync(
     video_duration = float(dur_result.stdout.strip())
 
     # ── Extract speech time ranges ───────────────────────────────
+    if isinstance(face_plan, (str, Path)):
+        face_plan = json.loads(Path(face_plan).read_text(encoding="utf-8"))
+    if face_plan:
+        bound = {k: v for k, v in (face_plan.get("speaker_track") or {}).items()
+                 if v is not None}
+        _log(f"Face plan: {len(face_plan.get('frames') or {})} anchored frames, "
+             f"speakers bound to a face: {bound or 'none'}, "
+             f"per-segment bindings: {len(face_plan.get('segment_track') or {})}")
+        gate = face_plan.get("gate") or {}
+        if gate.get("gated_frames"):
+            _log(f"Face plan gate: {gate['gated_frames']} frames keep the original "
+                 f"footage (|yaw|>{gate.get('yaw_max')}° or width<{gate.get('min_width')}px)")
+
     speech_ranges = _extract_speech_ranges(
         tts_results, video_duration,
         padding_before=padding_before,
@@ -1332,7 +1780,20 @@ def segment_based_lip_sync(
         merge_gap=merge_gap,
         max_duration=max_segment_duration,
         anchor_gender=anchor_gender,
+        face_plan=face_plan,
     )
+
+    # Quantise every boundary to a whole frame.  ffmpeg cuts by duration, so
+    # a boundary at a fractional frame rounds independently for the gap and
+    # the speech clip either side of it; over a dozen clips those roundings
+    # random-walk the picture a few frames away from the audio (measured: up
+    # to 4 frames = 130 ms by the end of the 90 s clip, even though the total
+    # duration still matched).  Snapping first makes every clip an exact whole
+    # number of frames.
+    _q_fps = _probe_fps(video_path)
+    if _q_fps > 0:
+        speech_ranges = [(round(s * _q_fps) / _q_fps, round(e * _q_fps) / _q_fps)
+                         for s, e in speech_ranges]
 
     if not speech_ranges:
         _log("No speech segments found — returning original video.")
@@ -1355,11 +1816,27 @@ def segment_based_lip_sync(
     # (re-timing speech clips → drift/stutter vs the gap clips).  Cut gaps and
     # drive MuseTalk at the source rate so every clip shares one fps.
     target_fps = _probe_fps(working_video)
-    ms_fps = int(round(target_fps))
+    ms_fps = int(round(target_fps))          # MuseTalk's --fps takes an int
+    exact_fps = _probe_fps_exact(working_video)   # container rate: no drift
 
     # ── Process each speech range ────────────────────────────────
     processed_map: dict[tuple[float, float], Path] = {}
     # (start, end) → path to lip-synced or original clip
+
+    # MuseTalk spends ~5.5 minutes loading its models and ~12 seconds doing
+    # the work, so with the batched runner we cut every clip first and hand
+    # them all to a single process.  Wav2Lip keeps the per-clip loop (its
+    # model is already cached in-process).
+    if backend == "musetalk":
+        return _segment_lip_sync_musetalk_batch(
+            speech_ranges, working_video, speech_track, tmp_dir, output_path,
+            video_path=video_path, video_duration=video_duration,
+            target_fps=target_fps, ms_fps=ms_fps, face_plan=face_plan,
+            resize_factor=resize_factor, occlusion_gate=occlusion_gate,
+            face_restore=face_restore, min_gap=0.05, exact_fps=exact_fps,
+            progress_cb=progress_cb, detail_progress_cb=detail_progress_cb,
+            cancel_check=cancel_check,
+        )
 
     for idx, (seg_start, seg_end) in enumerate(speech_ranges):
         if cancel_check and cancel_check():
@@ -1381,6 +1858,24 @@ def segment_based_lip_sync(
         # Cut audio clip
         _cut_audio_clip(speech_track, seg_start, duration, audio_clip)
 
+        # Per-frame target face for this clip (which person to drive).
+        clip_bbox_json = None
+        if face_plan:
+            clip_bbox_json = _write_clip_bbox_json(
+                face_plan, seg_start, duration, target_fps,
+                tmp_dir / f"{clip_name}_bbox.json",
+                scale=1.0 / resize_factor,
+            )
+            if clip_bbox_json is None:
+                # No anchored face anywhere in this range — keep the original
+                # footage rather than letting MuseTalk pick a face for us.
+                _log(f"[{idx+1}/{total_segments}] no target face in range — "
+                     f"passing original through")
+                processed_map[(seg_start, seg_end)] = orig_clip
+                if progress_cb:
+                    progress_cb(idx + 1, total_segments)
+                continue
+
         # Run lip-sync
         try:
             if backend == "musetalk":
@@ -1389,6 +1884,7 @@ def segment_based_lip_sync(
                     fps=ms_fps,
                     use_float16=True,
                     batch_size=4,
+                    target_bbox_json=clip_bbox_json,
                     progress_cb=detail_progress_cb,
                     cancel_check=cancel_check,
                 )
@@ -1517,6 +2013,32 @@ def _probe_fps(video_path: Path) -> float:
         return fps if fps and fps > 0 else 25.0
     except Exception:
         return 25.0
+
+
+def _probe_fps_exact(video_path: Path) -> str:
+    """Frame rate as ffmpeg's exact rational string, e.g. ``"30000/1001"``.
+
+    NTSC sources are 29.97 = 30000/1001, not 30.  Re-encoding them at the
+    rounded integer adds one frame every ~1000, which is a slow A/V drift:
+    measured on the 90 s clip, forcing 30 fps produced 2701 frames against the
+    source's 2697 and shifted the picture a frame ahead of the audio.  Always
+    concatenate at the source's exact rate.
+    """
+    try:
+        out = subprocess.run([
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=nw=1:nk=1", str(video_path),
+        ], capture_output=True, text=True).stdout.strip()
+        if "/" in out:
+            num, _, den = out.partition("/")
+            if float(den or 0) > 0 and float(num) > 0:
+                return f"{int(float(num))}/{int(float(den))}"
+        if out and float(out) > 0:
+            return out
+    except Exception:                                   # noqa: BLE001
+        pass
+    return "25"
 
 
 def _downscale_video(

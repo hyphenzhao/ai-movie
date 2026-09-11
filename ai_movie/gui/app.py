@@ -11,7 +11,8 @@ from PIL import Image, ImageTk
 
 from ai_movie import config
 from ai_movie.cache_manager import CacheManager
-from ai_movie.config import PROJECTS_DIR, WORKSPACE_DIR
+from ai_movie.config import (PROJECTS_DIR, WORKSPACE_DIR, FACE_ENHANCE_FIDELITY,
+                             FACE_ENHANCE_PROTECT_LIPS)
 from ai_movie.cutter import cut_video
 from ai_movie.asr import LANGUAGES, LANG_LABELS, transcribe_all
 from ai_movie.demuxer import demux_all
@@ -838,6 +839,12 @@ class App:
     def _run_asr(self, audio_paths: list[Path], lang_code: str):
         backend_label = self._trans_backend_var.get()
         backend = self._backend_map.get(backend_label, "auto")
+        diarize = bool(getattr(self, "_asr_diarize_var",
+                               tk.BooleanVar(value=True)).get())
+        nspk = int(getattr(self, "_asr_nspk_var", tk.IntVar(value=0)).get() or 0)
+        # Separated vocals give much cleaner pitch and speaker features; the
+        # 人声分离 step may not have run yet, in which case we pass None.
+        vocals = (self.log.step_data.get("人声分离", {}) or {}).get("vocals")
         try:
             results = transcribe_all(
                 audio_paths, language=lang_code,
@@ -847,6 +854,10 @@ class App:
                 file_start_cb=self._on_asr_file_start,
                 file_progress_cb=self._on_asr_file_progress,
                 cancel_check=lambda: self._cancel_requested,
+                diarize=diarize,
+                num_speakers=nspk or None,
+                vocals_path=vocals,
+                status_cb=self._on_asr_status,
             )
         except Exception as e:
             err_msg = str(e)
@@ -855,6 +866,13 @@ class App:
             self.root.after(0, lambda: self._on_asr_error(err_msg))
             return
         self.root.after(0, lambda: self._on_asr_done(results, lang_code))
+
+    def _on_asr_status(self, msg: str):
+        """Coarse stage message from the worker thread (diarization, etc)."""
+        def _apply():
+            if hasattr(self, "_lbl_asr_seg") and self._lbl_asr_seg.winfo_exists():
+                self._lbl_asr_seg.configure(text=msg)
+        self.root.after(0, _apply)
 
     def _on_asr_progress(self, current: int, total: int):
         self.root.after(0, lambda: self._update_asr_dialog(current, total))
@@ -907,7 +925,12 @@ class App:
 
         start = seg["start"]
         ts = f"{int(start // 60)}:{start % 60:04.1f}"
-        line = f"  [{ts}]  {seg['text']}\n"
+        spk = ""
+        if seg.get("speaker"):
+            mark = {"female": "♀", "male": "♂"}.get(
+                seg.get("gender") or seg.get("tts_gender") or "", "?")
+            spk = f"[{seg['speaker']}{mark}] "
+        line = f"  [{ts}]  {spk}{seg['text']}\n"
 
         self._trans_text.configure(state="normal")
         self._trans_text.insert("end", line)
@@ -926,13 +949,25 @@ class App:
         errors = [r for r in results if "error" in r]
         ok = [r for r in results if "error" not in r]
 
-        self.log.mark_step("转换文字", "done" if not errors else "done")
-        self.log.set_step_data("转换文字", {
+        # Diarization lives on the per-file result; lift it to the step so the
+        # TTS and anchoring steps can read it without re-walking the results.
+        diar = next((r.get("diarization") for r in ok if r.get("diarization")),
+                    None)
+        step_data = {
             "language": lang_code,
             "results": results,
-        })
+        }
+        if diar:
+            step_data["diarization"] = diar
+        self.log.mark_step("转换文字", "done" if not errors else "done")
+        self.log.set_step_data("转换文字", step_data)
+        spk_note = ""
+        if diar:
+            spk_note = "，" + "、".join(
+                f"{k}={v.get('gender')}" for k, v in
+                (diar.get("speakers") or {}).items())
         self.log.add_entry("转换文字", "done",
-                           f"{len(ok)} ok, {len(errors)} errors")
+                           f"{len(ok)} ok, {len(errors)} errors{spk_note}")
         self._refresh_toolbar()
         self._populate_transcribe_tab(results)
         self._switch_to_next_tab("转换文字")
@@ -962,8 +997,17 @@ class App:
         lang_label = self._trans_lang_var.get()
         total_segs = sum(len(r.get("segments", [])) for r in results
                          if "error" not in r)
-        self._trans_text.insert("1.0",
-            f"语言: {lang_label}  —  共 {total_segs} 句\n\n")
+        header = f"语言: {lang_label}  —  共 {total_segs} 句"
+        diar = next((r.get("diarization") for r in results
+                     if r.get("diarization")), None)
+        if diar:
+            spk = "、".join(
+                f"{k}={'女' if v.get('gender') == 'female' else '男'}"
+                f"({v.get('total_speech', 0):.0f}s"
+                + (f"/{v['f0_median']:.0f}Hz" if v.get("f0_median") else "") + ")"
+                for k, v in (diar.get("speakers") or {}).items())
+            header += f"  —  说话人: {spk}"
+        self._trans_text.insert("1.0", header + "\n\n")
 
         for r in results:
             source = Path(r["source"]).name
@@ -980,7 +1024,12 @@ class App:
             for seg in segs:
                 start = seg["start"]
                 ts = f"{int(start // 60):d}:{start % 60:04.1f}"
-                self._trans_text.insert("end", f"  [{ts}]  {seg['text']}\n")
+                tag = ""
+                if seg.get("speaker"):
+                    mark = {"female": "♀", "male": "♂"}.get(
+                        seg.get("gender") or seg.get("tts_gender") or "", "?")
+                    tag = f"[{seg['speaker']}{mark}] "
+                self._trans_text.insert("end", f"  [{ts}]  {tag}{seg['text']}\n")
 
             self._trans_text.insert("end", "\n")
 
@@ -1033,12 +1082,20 @@ class App:
             src = r.get("source", "")
             offset = audio_offset_map.get(src, 0.0)
             for seg in r.get("segments", []):
-                segments.append({
+                # Carry the diarization fields through — dropping them here
+                # would silently disable speaker-aware translation, per-speaker
+                # voice cloning and face anchoring further down the pipeline.
+                flat = {
                     "text": seg["text"],
                     "start": seg["start"] + offset,
                     "end": seg["end"] + offset,
                     "source": src,
-                })
+                }
+                for k in ("speaker", "speaker_conf", "gender", "tts_gender",
+                          "asr_conf"):
+                    if seg.get(k) is not None:
+                        flat[k] = seg[k]
+                segments.append(flat)
 
         if not segments:
             messagebox.showwarning("提示", "没有可翻译的文字片段。")
@@ -1133,6 +1190,37 @@ class App:
         self._cancel_requested = True
 
     def _run_translate(self, segments, target_lang, src_lang, total, engine="hy-mt2+polish", ollama_model=None, hymt_path=None):
+        # ── v2 engines: context window + glossary + speaker tags ─
+        from ai_movie.translator import TRANSLATE_ENGINES
+        if engine in TRANSLATE_ENGINES:
+            from ai_movie import glossary as gl
+            from ai_movie.translator import translate_segments
+            try:
+                self.root.after(0, lambda: self._lbl_tl_seg.configure(
+                    text="正在抽取术语表…")
+                    if hasattr(self, "_lbl_tl_seg") else None)
+                gloss = gl.build_glossary(
+                    segments,
+                    progress_cb=lambda m: self.root.after(
+                        0, lambda t=m: self._lbl_tl_seg.configure(text=t)
+                        if hasattr(self, "_lbl_tl_seg") else None))
+                texts = translate_segments(
+                    segments, engine=engine, glossary=gloss,
+                    target_lang=target_lang,
+                    progress_cb=self._on_tl_progress,
+                    cancel_check=lambda: self._cancel_requested,
+                )
+            except Exception as exc:
+                _err = f"{type(exc).__name__}: {exc}"
+                self.root.after(0, lambda: self._on_translate_error(_err))
+                return
+            results = [{**seg, "text_translated": t}
+                       for seg, t in zip(segments, texts)]
+            self._tl_glossary = gloss
+            self.root.after(0, lambda: self._on_translate_done(
+                results, target_lang, engine, ollama_model))
+            return
+
         # ── Hy-MT2 + Ollama polish (two-stage) ──────────────────
         if engine in ("hy-mt+polish", "hy-mt2+polish"):
             from ai_movie.translator import translate, polish_ollama
@@ -1330,8 +1418,9 @@ class App:
         mode_bar.pack(fill="x", side="top")
         ttk.Label(mode_bar, text="声音选择：",
                   font=(config.CJK_FONT, 10)).pack(side="left")
-        self._tts_mode_var = tk.StringVar(value="gender")
+        self._tts_mode_var = tk.StringVar(value="clone")
         for text, val in [
+            ("克隆原声（每个说话人）", "clone"),
             ("自动检测性别", "gender"),
             ("全部女声（中文女）", "female"),
             ("全部男声（中文男）", "male"),
@@ -1678,7 +1767,8 @@ class App:
         # Gender-auto also prefers CosyVoice3 so the female voice can use the
         # soft/Taiwanese style reference (male stays Mandarin). Falls back to
         # SFT (中文女/中文男) automatically when CosyVoice3 isn't installed.
-        prefer = "cosyvoice3" if voice_mode in ("style", "gender") else None
+        prefer = ("cosyvoice3" if voice_mode in ("style", "gender", "clone")
+                  else None)
         self._gen_choice = tts_mod.resolve_model_choice(prefer)
         if self._gen_choice == "sft":
             tts_mod._load_model(prefer=prefer)   # main-thread in-process load
@@ -1686,7 +1776,14 @@ class App:
         self._gen_algo = algo.get() if algo else "f0_per_seg"
         self._gen_ecapa_result = None   # filled below for ecapa mode
 
-        if voice_mode == "female":
+        if voice_mode == "clone":
+            # Per-speaker voice cloning: the reference is resolved per segment
+            # in _run_isolated_generate, so the job-level values are only a
+            # fallback for segments with no speaker label.
+            ref_audio, ref_text, ref_method = tts_mod.prepare_reference(
+                vocals_path, mode="style", cache_dir=out_dir)
+            self._lbl_gen_prog.configure(text="克隆原声：正在提取参考音…")
+        elif voice_mode == "female":
             ref_audio, ref_text, ref_method = tts_mod._SFT_FEMALE_SPK, None, "sft"
             self._lbl_gen_prog.configure(text="固定使用：中文女")
         elif voice_mode == "male":
@@ -1782,7 +1879,51 @@ class App:
                 # soft/Taiwanese style.  Male goes through SFT because CosyVoice3
                 # cross_lingual is broken on this build (padding/kernel error).
                 seg_genders: dict[int, str] = {}
-                if getattr(self, "_gen_voice_mode", "gender") == "gender":
+                mode = getattr(self, "_gen_voice_mode", "gender")
+
+                if mode == "clone":
+                    # Per-speaker cloning: pull one clean reference clip out of
+                    # each diarized speaker's own audio and synthesize every
+                    # segment with its speaker's voice.  Speakers whose clone
+                    # comes out unlike them fall back to the built-in voice.
+                    from ai_movie import diarize as diarize_mod
+
+                    diar = ((self.log.step_data.get("转换文字", {}) or {})
+                            .get("diarization") or {})
+                    refs: dict[str, dict] = {}
+                    if diar.get("speakers"):
+                        src_audio = (self._gen_vocals_path
+                                     or (segments[0].get("source") if segments else None))
+                        orig = None
+                        for r in (self.log.step_data.get("拆分音轨", {})
+                                  or {}).get("results", []):
+                            if r.get("audio"):
+                                orig = r["audio"]
+                                break
+                        refs = diarize_mod.extract_speaker_references(
+                            diar, segments, orig or src_audio,
+                            vocals_path=self._gen_vocals_path,
+                            out_dir=self._gen_output_dir)
+                    if not refs:
+                        self.root.after(0, lambda: self._lbl_gen_prog.configure(
+                            text="未找到说话人参考音，改用内置音色"))
+                    style_ref = (self._gen_ref_audio, self._gen_ref_text,
+                                 self._gen_ref_method)
+                    seg_refs, modes = tts_mod.build_seg_refs(
+                        segments, refs, style_ref=style_ref)
+                    self._gen_speaker_refs = refs
+                    self._gen_voice_modes = modes
+                    for i, s in enumerate(segments):
+                        g = s.get("gender") or s.get("tts_gender")
+                        if g:
+                            seg_genders[i] = g
+                    items = tts_mod.run_cloned_synthesis(
+                        seg_texts, seg_refs, self._gen_output_dir,
+                        model_choice=self._gen_choice,
+                        progress_cb=_progress,
+                        cancel_check=lambda: self._cancel_requested,
+                    )
+                elif mode == "gender":
                     fem_ref = tts_mod.prepare_reference(
                         self._gen_vocals_path, mode="style", cache_dir=self._gen_output_dir)
                     algo = getattr(self, "_gen_algo", "f0_per_seg")
@@ -1897,13 +2038,42 @@ class App:
         if hasattr(self, "_gen_dlg") and self._gen_dlg.winfo_exists():
             self._gen_dlg.destroy()
         ok = sum(1 for r in results if r.get("audio"))
+
+        # Fit each clip into its slot before anything downstream reads it.
+        # Chinese is usually longer than the Japanese it replaces, and until
+        # now an overlong line was simply summed on top of the next one.
+        fit_info = {}
+        from ai_movie.config import TTS_FIT_TO_SLOT
+        if TTS_FIT_TO_SLOT:
+            try:
+                from ai_movie.composer import fit_segments_to_timeline
+                fit_segments_to_timeline(
+                    results, out_dir=WORKSPACE_DIR / "synthesized" / "fitted")
+                ratios = [r.get("fit_ratio", 1.0) for r in results
+                          if r.get("audio_fit")]
+                fit_info = {"fitted": len(ratios),
+                            "stretched": sum(1 for x in ratios if x > 1.0),
+                            "max_ratio": round(max(ratios), 3) if ratios else 1.0}
+            except Exception as exc:                    # noqa: BLE001
+                fit_info = {"error": f"{type(exc).__name__}: {exc}"}
+
+        data = {"results": results, "ok": ok, "fit": fit_info}
+        for key in ("_gen_speaker_refs", "_gen_voice_modes"):
+            val = getattr(self, key, None)
+            if val:
+                data[key.replace("_gen_", "")] = val
         self.log.mark_step("人声生成", "done")
-        self.log.set_step_data("人声生成", {"results": results, "ok": ok})
+        self.log.set_step_data("人声生成", data)
         self.log.add_entry("人声生成", "done", f"{ok}/{len(results)} segments")
         self._refresh_toolbar()
         self._populate_generate_tab(results)
         self._switch_to_next_tab("人声生成")
-        messagebox.showinfo("生成完成", f"语音生成完成：{ok}/{len(results)} 个片段")
+        extra = ""
+        if fit_info.get("stretched"):
+            extra = (f"\n时长适配：{fit_info['stretched']} 段加速"
+                     f"（最大 {fit_info['max_ratio']}×）")
+        messagebox.showinfo("生成完成",
+                            f"语音生成完成：{ok}/{len(results)} 个片段{extra}")
 
     def _on_generate_error(self, error_msg):
         if hasattr(self, "_gen_dlg") and self._gen_dlg.winfo_exists():
@@ -2632,6 +2802,16 @@ class App:
         vars_dict["_asr_eng_map"] = dict(zip(asr_eng_labels, asr_eng_vals))
         ttk.Combobox(asr_bar, textvariable=asr_eng_var,
                      values=asr_eng_labels, state="readonly", width=24).pack(side="left")
+        asr_diar_var = tk.BooleanVar(value=True)
+        vars_dict["asr_diarize"] = asr_diar_var
+        ttk.Checkbutton(asr_bar, text="说话人分离",
+                        variable=asr_diar_var).pack(side="left", padx=(12, 4))
+        asr_nspk_var = tk.IntVar(value=0)
+        vars_dict["asr_nspk"] = asr_nspk_var
+        ttk.Label(asr_bar, text="人数：").pack(side="left")
+        ttk.Spinbox(asr_bar, from_=0, to=6, width=3,
+                    textvariable=asr_nspk_var).pack(side="left")
+        ttk.Label(asr_bar, text="(0=自动)", foreground="#888").pack(side="left", padx=(2, 0))
 
         # ── 4. 文本翻译 ─────────────────────────────────────────
         sec4 = _add_section("4. 文本翻译", "translate", step_name="文本翻译")
@@ -2643,9 +2823,13 @@ class App:
         ttk.Combobox(tl_bar1, textvariable=tl_lang_var,
                      values=TARGET_LANG_LABELS, state="readonly", width=10).pack(side="left", padx=(4, 12))
         ttk.Label(tl_bar1, text="引擎：").pack(side="left")
-        tl_eng_labels = ["Hy-MT2 + 润色", "Hy-MT2", "Hy-MT1.5", "Hy-MT1.5 + 润色", "Ollama 直翻"]
-        tl_eng_vals = ["hy-mt2+polish", "hy-mt2", "hy-mt", "hy-mt+polish", "ollama"]
-        tl_eng_var = tk.StringVar(value=tl_eng_labels[1])  # default: 仅 Hy-MT2
+        tl_eng_labels = ["Sakura 直译", "Sakura + gpt-oss 润色", "gpt-oss 直译",
+                         "Hy-MT2 + 润色", "Hy-MT2", "Hy-MT1.5",
+                         "Hy-MT1.5 + 润色", "Ollama 直翻"]
+        tl_eng_vals = ["sakura", "sakura+gptoss", "gptoss",
+                       "hy-mt2+polish", "hy-mt2", "hy-mt",
+                       "hy-mt+polish", "ollama"]
+        tl_eng_var = tk.StringVar(value=tl_eng_labels[0])
         vars_dict["tl_engine"] = tl_eng_var
         vars_dict["_tl_eng_map"] = dict(zip(tl_eng_labels, tl_eng_vals))
         ttk.Combobox(tl_bar1, textvariable=tl_eng_var,
@@ -2655,6 +2839,8 @@ class App:
         ollama_model_var = tk.StringVar(value=config.OLLAMA_MODEL)
         vars_dict["tl_ollama"] = ollama_model_var
         ttk.Entry(tl_bar2, textvariable=ollama_model_var, width=30).pack(side="left", padx=(4, 0))
+        ttk.Label(tl_bar2, text="（新引擎 sakura/gptoss 忽略此项）",
+                  foreground="#888").pack(side="left", padx=(8, 0))
 
         # ── 5. 人声分离 ─────────────────────────────────────────
         sec5 = _add_section("5. 人声分离（分离人声和背景音）", "separate", step_name="人声分离")
@@ -2667,10 +2853,11 @@ class App:
         # ── 6. 人声生成 (TTS) ───────────────────────────────────
         sec6 = _add_section("6. 人声生成（TTS 语音合成）", "tts", step_name="人声生成")
         tts_mode_bar = ttk.Frame(sec6); tts_mode_bar.pack(fill="x")
-        tts_mode_var = tk.StringVar(value="gender")
+        tts_mode_var = tk.StringVar(value="clone")
         vars_dict["tts_mode"] = tts_mode_var
         ttk.Label(tts_mode_bar, text="声音：").pack(side="left")
-        for text, val in [("自动检测性别", "gender"), ("全部女声", "female"),
+        for text, val in [("克隆原声", "clone"), ("自动检测性别", "gender"),
+                          ("全部女声", "female"),
                           ("全部男声", "male"), ("台湾柔和女声", "style")]:
             ttk.Radiobutton(tts_mode_bar, text=text, variable=tts_mode_var, value=val).pack(side="left", padx=(6, 2))
         # Engine is implied by the voice choice — no separate selector:
@@ -2724,11 +2911,14 @@ class App:
 
         # ── 9. 人脸增强（可选） ──────────────────────────────────
         from ai_movie.face_restore import codeformer_available, face_parser_available
-        sec9 = _add_section("9. 人脸增强（CodeFormer 修复嘴部，可选）", "face_enhance",
-                            step_name="人脸增强", enabled=False)
+        # On by default since 2026-09: MuseTalk's mouth keeps ~50% of the
+        # source sharpness even on frontal faces, and this pass (lips
+        # unprotected, w=0.7) measured 44→82 / 64→80 on test_2.
+        sec9 = _add_section("9. 人脸增强（CodeFormer 修复嘴部清晰度）", "face_enhance",
+                            step_name="人脸增强", enabled=codeformer_available())
         fe_bar = ttk.Frame(sec9); fe_bar.pack(fill="x")
         ttk.Label(fe_bar, text="保真度：").pack(side="left")
-        fe_fidelity_var = tk.DoubleVar(value=0.85)
+        fe_fidelity_var = tk.DoubleVar(value=FACE_ENHANCE_FIDELITY)
         vars_dict["fe_fidelity"] = fe_fidelity_var
         ttk.Scale(fe_bar, from_=0.0, to=1.0, orient="horizontal", length=110,
                   variable=fe_fidelity_var).pack(side="left", padx=(4, 0))
@@ -2737,7 +2927,7 @@ class App:
         vars_dict["fe_det_every"] = fe_detevery_var
         ttk.Spinbox(fe_bar, from_=1, to=15, width=3,
                     textvariable=fe_detevery_var).pack(side="left", padx=(4, 0))
-        fe_protect_var = tk.BooleanVar(value=True)
+        fe_protect_var = tk.BooleanVar(value=FACE_ENHANCE_PROTECT_LIPS)
         vars_dict["fe_protect_lips"] = fe_protect_var
         ttk.Checkbutton(fe_bar, text="保护嘴唇", variable=fe_protect_var).pack(
             side="left", padx=(8, 0))
@@ -2978,6 +3168,10 @@ class App:
                     if hasattr(self, "_lbl_oc_detail") else None,
                 ))
 
+            # Diarization needs the separated vocals for clean pitch; the
+            # one-click order runs 人声分离 after 转换文字, so this is usually
+            # None on a first pass and the original mixdown is used instead.
+            _vocals = (self.log.step_data.get("人声分离", {}) or {}).get("vocals")
             asr_results = transcribe_all(
                 audio_paths, language=lang_code,
                 backend=backend,
@@ -2986,6 +3180,14 @@ class App:
                 file_start_cb=None,
                 file_progress_cb=None,
                 cancel_check=lambda: self._oc_cancelled,
+                diarize=bool(opts.get("asr_diarize",
+                                      tk.BooleanVar(value=True)).get()),
+                num_speakers=(int(opts.get("asr_nspk",
+                                           tk.IntVar(value=0)).get() or 0) or None),
+                vocals_path=_vocals,
+                status_cb=lambda m: self.root.after(
+                    0, lambda t=m: self._lbl_oc_detail.configure(text=t)
+                    if hasattr(self, "_lbl_oc_detail") else None),
             )
             if self._oc_cancelled:
                 return False
@@ -3035,12 +3237,18 @@ class App:
                 src_name = r.get("source", "")
                 offset = audio_offset_map.get(src_name, 0.0)
                 for seg in r.get("segments", []):
-                    segments.append({
+                    # Same as _on_translate: keep the diarization fields.
+                    flat = {
                         "text": seg["text"],
                         "start": seg["start"] + offset,
                         "end": seg["end"] + offset,
                         "source": src_name,
-                    })
+                    }
+                    for k in ("speaker", "speaker_conf", "gender",
+                              "tts_gender", "asr_conf"):
+                        if seg.get(k) is not None:
+                            flat[k] = seg[k]
+                    segments.append(flat)
 
             if not segments:
                 return False
@@ -3052,12 +3260,12 @@ class App:
             src_name_map = {"ja": "Japanese", "en": "English", "zh": "Chinese", "ko": "Korean"}
             src_lang = src_name_map.get(src_lang_code, "Japanese")
 
-            eng_label = opts.get("tl_engine", tk.StringVar(value="Hy-MT2 + 润色")).get()
-            eng_map = opts.get("_tl_eng_map", {"Hy-MT2 + 润色": "hy-mt2+polish"})
+            eng_label = opts.get("tl_engine", tk.StringVar(value="Sakura 直译")).get()
+            eng_map = opts.get("_tl_eng_map", {"Sakura 直译": "sakura"})
             if isinstance(eng_map, dict):
-                engine = eng_map.get(eng_label, "hy-mt2+polish")
+                engine = eng_map.get(eng_label, "sakura")
             else:
-                engine = "hy-mt2+polish"
+                engine = "sakura"
 
             ollama_model = opts.get("tl_ollama", tk.StringVar(value=config.OLLAMA_MODEL)).get()
 
@@ -3076,7 +3284,36 @@ class App:
                     if hasattr(self, "_lbl_oc_detail") else None,
                 ))
 
-            from ai_movie.translator import translate, translate_ollama, polish_ollama
+            from ai_movie.translator import (
+                TRANSLATE_ENGINES, translate, translate_ollama, polish_ollama,
+                translate_segments,
+            )
+
+            if engine in TRANSLATE_ENGINES:
+                from ai_movie import glossary as gl
+                gloss = gl.build_glossary(
+                    segments,
+                    progress_cb=lambda m: self.root.after(
+                        0, lambda t=m: self._lbl_oc_detail.configure(text=t)
+                        if hasattr(self, "_lbl_oc_detail") else None))
+                texts = translate_segments(
+                    segments, engine=engine, glossary=gloss,
+                    target_lang=target_lang,
+                    progress_cb=_tl_progress,
+                    cancel_check=lambda: self._oc_cancelled,
+                )
+                tl_results = [{**seg, "text_translated": t}
+                              for seg, t in zip(segments, texts)]
+                self.log.mark_step(step_name, "done")
+                self.log.set_step_data(step_name, {
+                    "target_lang": target_lang, "engine": engine,
+                    "glossary": gloss, "segments": tl_results,
+                    "count": len(tl_results),
+                })
+                self.log.add_entry(step_name, "done",
+                                   f"{len(tl_results)} segments ({engine})")
+                self.root.after(0, self._refresh_toolbar)
+                return True
 
             if engine == "ollama":
                 tl_results = translate_ollama(
@@ -3203,11 +3440,69 @@ class App:
 
             # Qwen models (non-SFT): synthesize the whole batch in the isolated
             # subprocess (this step already runs in a background thread).
-            if ref_method != "sft":
+            if ref_method != "sft" or voice_mode == "clone":
                 seg_texts = [(i, seg.get("text_translated", "").strip())
                              for i, seg in enumerate(segments)]
 
                 oc_genders: dict[int, str] = {}
+
+                def _oc_prog0(done, total):
+                    self.root.after(0, lambda d=done, t=total: (
+                        self._bar_oc_detail.configure(mode="determinate",
+                                                      maximum=t, value=d)
+                        if hasattr(self, "_bar_oc_detail") else None,
+                        self._lbl_oc_detail.configure(text=f"TTS(隔离): {d}/{t}")
+                        if hasattr(self, "_lbl_oc_detail") else None,
+                    ))
+
+                if voice_mode == "clone":
+                    # Per-speaker cloning — mirrors _run_isolated_generate.
+                    from ai_movie import diarize as diarize_mod
+                    diar = ((self.log.step_data.get("转换文字", {}) or {})
+                            .get("diarization") or {})
+                    refs = {}
+                    if diar.get("speakers"):
+                        orig = None
+                        for r in (self.log.step_data.get("拆分音轨", {})
+                                  or {}).get("results", []):
+                            if r.get("audio"):
+                                orig = r["audio"]
+                                break
+                        refs = diarize_mod.extract_speaker_references(
+                            diar, segments, orig or vocals_path,
+                            vocals_path=vocals_path, out_dir=out_dir)
+                    style_ref = (ref_audio, ref_text, ref_method)
+                    seg_refs, _modes = tts_mod.build_seg_refs(
+                        segments, refs, style_ref=style_ref)
+                    for i, seg in enumerate(segments):
+                        g = seg.get("gender") or seg.get("tts_gender")
+                        if g:
+                            oc_genders[i] = g
+                    items = tts_mod.run_cloned_synthesis(
+                        seg_texts, seg_refs, out_dir, model_choice=choice,
+                        progress_cb=_oc_prog0,
+                        cancel_check=lambda: self._oc_cancelled,
+                    )
+                    tts_results = []
+                    for i, seg in enumerate(segments):
+                        it = items.get(i, {})
+                        r = {**seg, "audio": it.get("audio")}
+                        if i in oc_genders:
+                            r["tts_gender"] = oc_genders[i]
+                        if it.get("tts_error"):
+                            r["tts_error"] = it["tts_error"]
+                        tts_results.append(r)
+                    from ai_movie.composer import fit_segments_to_timeline
+                    fit_segments_to_timeline(
+                        tts_results, out_dir=out_dir / "fitted")
+                    ok = sum(1 for r in tts_results if r.get("audio"))
+                    self.log.mark_step(step_name, "done")
+                    self.log.set_step_data(step_name, {
+                        "results": tts_results, "ok": ok, "refs": refs})
+                    self.log.add_entry(step_name, "done",
+                                       f"{ok}/{len(tts_results)} segments (clone)")
+                    self.root.after(0, self._refresh_toolbar)
+                    return True
 
                 def _oc_prog(done, total):
                     self.root.after(0, lambda d=done, t=total: (
@@ -3345,8 +3640,57 @@ class App:
             results = gen_data.get("results", [])
             anchor_gender = opts.get("oc_anchor_gender", tk.StringVar(value="female")).get() or None
             occlusion_gate = bool(opts.get("oc_anchor_occ", tk.BooleanVar(value=True)).get())
-            female = sum(1 for r in results if r.get("tts_gender") == "female" and r.get("audio"))
-            male = sum(1 for r in results if r.get("tts_gender") == "male" and r.get("audio"))
+
+            # Preferred path: detect the faces, label them, and bind each
+            # speaker to one.  Falls back to the gender filter below on any
+            # failure or when there are no speaker labels to bind.
+            if self.log.video_path and any(r.get("speaker") for r in results):
+                try:
+                    from ai_movie import faces as faces_mod
+                    from ai_movie.translator import free_gpu_for_local_work
+                    free_gpu_for_local_work()
+                    self.root.after(0, lambda: self._lbl_oc_detail.configure(
+                        text="人物锚定：人脸检测中…")
+                        if hasattr(self, "_lbl_oc_detail") else None)
+                    plan_path = Path(WORKSPACE_DIR) / "face_plan.json"
+                    plan = faces_mod.build_face_plan(
+                        Path(self.log.video_path), results,
+                        out_json=plan_path,
+                        progress_cb=lambda m: self.root.after(
+                            0, lambda t=m: self._lbl_oc_detail.configure(text=t)
+                            if hasattr(self, "_lbl_oc_detail") else None),
+                        cancel_check=lambda: self._oc_cancelled)
+                    thumbs = faces_mod.save_track_thumbnails(
+                        Path(self.log.video_path), plan,
+                        Path(WORKSPACE_DIR) / "face_tracks")
+                    tracks = [{k: v for k, v in t.items() if k != "keyframes"}
+                              for t in plan.get("tracks", [])]
+                    self.log.mark_step(step_name, "done")
+                    self.log.set_step_data(step_name, {
+                        "face_plan": str(plan_path),
+                        "speaker_track": plan.get("speaker_track", {}),
+                        "tracks": tracks,
+                        "thumbnails": {str(k): v for k, v in (thumbs or {}).items()},
+                        "anchored_frames": len(plan.get("frames", {})),
+                        "occlusion_gate": occlusion_gate,
+                    })
+                    bound = {k: v for k, v in
+                             (plan.get("speaker_track") or {}).items()
+                             if v is not None}
+                    self.log.add_entry(step_name, "done",
+                                       f"{len(tracks)} 条人脸轨迹，绑定 {len(bound)} 个说话人")
+                    self.root.after(0, self._refresh_toolbar)
+                    return True
+                except Exception as exc:                # noqa: BLE001
+                    self.log.add_entry(step_name, "warn",
+                                       f"人脸锚定失败，退回性别过滤：{exc}")
+
+            female = sum(1 for r in results
+                         if (r.get("gender") or r.get("tts_gender")) == "female"
+                         and r.get("audio"))
+            male = sum(1 for r in results
+                       if (r.get("gender") or r.get("tts_gender")) == "male"
+                       and r.get("audio"))
             self.log.mark_step(step_name, "done")
             self.log.set_step_data(step_name, {
                 "anchor_gender": anchor_gender,
@@ -3391,12 +3735,18 @@ class App:
             anchor_data = self.log.step_data.get("人物锚定", {})
             anchor_gender = anchor_data.get("anchor_gender")
             occlusion_gate = bool(anchor_data.get("occlusion_gate", False))
+            # face_plan (when 人物锚定 produced one) drives *which* face is
+            # lip-synced; anchor_gender remains the fallback for old projects.
+            face_plan = anchor_data.get("face_plan")
+            from ai_movie.translator import free_gpu_for_local_work
+            free_gpu_for_local_work()
             result = segment_based_lip_sync(
                 video_path=self.log.video_path,
                 tts_results=tts_results,
                 output_path=out_path,
                 backend=backend,
                 anchor_gender=anchor_gender,
+                face_plan=face_plan,
                 occlusion_gate=occlusion_gate,
                 progress_cb=_ls_progress,
                 cancel_check=lambda: self._oc_cancelled,
@@ -3422,10 +3772,10 @@ class App:
                 return False
 
             self._update_step_status(step_name, "running")
-            fidelity = float(opts.get("fe_fidelity", tk.DoubleVar(value=0.85)).get())
+            fidelity = float(opts.get("fe_fidelity", tk.DoubleVar(value=FACE_ENHANCE_FIDELITY)).get())
             det_every = int(opts.get("fe_det_every", tk.IntVar(value=4)).get())
             occlusion = bool(opts.get("fe_occlusion", tk.BooleanVar(value=True)).get())
-            protect_lips = bool(opts.get("fe_protect_lips", tk.BooleanVar(value=True)).get())
+            protect_lips = bool(opts.get("fe_protect_lips", tk.BooleanVar(value=FACE_ENHANCE_PROTECT_LIPS)).get())
             out_path = Path(WORKSPACE_DIR) / "lipsync_enhanced.mp4"
 
             def _fe_progress(done, total):
@@ -3437,10 +3787,14 @@ class App:
                         if hasattr(self, "_lbl_oc_detail") else None,
                     ))
 
+            from ai_movie.face_restore import frame_filter_from_plan
             result = restore_video(
                 Path(ls_output), out_path,
                 fidelity_weight=fidelity, det_every=det_every,
                 occlusion_aware=occlusion, protect_lips=protect_lips,
+                # Only the frames MuseTalk painted; the rest stays original.
+                frame_filter=frame_filter_from_plan(
+                    (self.log.step_data.get("人物锚定", {}) or {}).get("face_plan")),
                 progress_cb=_fe_progress,
                 cancel_check=lambda: self._oc_cancelled,
             )
@@ -3544,17 +3898,29 @@ class App:
     # ═══ remaining toolbar stubs ════════════════════════════════
 
     def _on_anchor_person(self):
-        """Person anchoring: choose which speakers get lip-synced.
+        """Person anchoring: decide *which face* each speaker owns.
 
-        v1: female-only — only segments whose speaker is female are lip-synced
-        (their video mouth is driven); male segments keep the original video
-        (their dubbed male audio still plays). Reads per-segment gender computed
-        during 人声生成 (``tts_gender``).
+        Detects every face in the video, tracks them, labels each track
+        male/female, and binds each diarized speaker to a track.  Lip-sync
+        then drives only that speaker's face; a speaker with no on-screen face
+        (an off-camera interviewer) leaves the picture untouched.
+
+        The pre-v2 behaviour — filtering *audio segments* by ``tts_gender``
+        without ever looking at the video — is kept as a fallback for projects
+        that have no diarization or where face detection finds nothing.
         """
         gen_data = self.log.step_data.get("人声生成", {})
         results = gen_data.get("results", [])
         if not results:
             messagebox.showwarning("提示", "请先完成「人声生成」步骤。")
+            return
+
+        video_path = Path(self.log.video_path) if self.log.video_path else None
+        use_faces = bool(getattr(self, "_anchor_faces_var",
+                                 tk.BooleanVar(value=True)).get())
+        if use_faces and video_path and video_path.exists() and \
+                any(r.get("speaker") for r in results):
+            self._run_face_plan(video_path, results)
             return
 
         female = sum(1 for r in results if r.get("tts_gender") == "female"
@@ -3580,6 +3946,151 @@ class App:
         self._refresh_toolbar()
         self._populate_anchor_tab(female, male, anchor_gender, occlusion_gate)
         self._switch_to_next_tab("人物锚定")
+
+    def _run_face_plan(self, video_path: Path, results: list[dict]):
+        """Build the per-frame face plan in a background thread."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("人物锚定")
+        dlg.geometry("460x140")
+        dlg.transient(self.root)
+        lbl = ttk.Label(dlg, text="人脸检测与跟踪中…（CPU，约每分钟视频 1 分钟）",
+                        font=(config.CJK_FONT, 10))
+        lbl.pack(padx=20, pady=(24, 8))
+        bar = ttk.Progressbar(dlg, length=400, mode="indeterminate")
+        bar.pack(padx=20)
+        bar.start(12)
+        self._anchor_dlg = dlg
+        self._cancel_requested = False
+
+        def _say(msg: str) -> None:
+            self.root.after(0, lambda m=msg: lbl.configure(text=m)
+                            if dlg.winfo_exists() else None)
+
+        def _worker():
+            try:
+                from ai_movie import faces as faces_mod
+                from ai_movie.translator import free_gpu_for_local_work
+                free_gpu_for_local_work(log_cb=_say)
+
+                plan_path = WORKSPACE_DIR / "face_plan.json"
+                plan = faces_mod.build_face_plan(
+                    video_path, results, out_json=plan_path,
+                    progress_cb=_say,
+                    cancel_check=lambda: self._cancel_requested)
+                thumbs = faces_mod.save_track_thumbnails(
+                    video_path, plan, WORKSPACE_DIR / "face_tracks")
+                self.root.after(0, lambda: self._on_face_plan_done(
+                    plan, str(plan_path), thumbs, results))
+            except Exception as exc:                    # noqa: BLE001
+                self.root.after(0, lambda e=exc: self._on_face_plan_error(
+                    f"{type(e).__name__}: {e}", results))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_face_plan_done(self, plan: dict, plan_path: str,
+                           thumbs: dict, results: list[dict]):
+        if hasattr(self, "_anchor_dlg") and self._anchor_dlg.winfo_exists():
+            self._anchor_dlg.destroy()
+
+        occ = getattr(self, "_anchor_occ_var", None)
+        occlusion_gate = bool(occ.get()) if occ is not None else True
+        tracks = [{k: v for k, v in t.items() if k != "keyframes"}
+                  for t in plan.get("tracks", [])]
+        bindings = plan.get("speaker_track", {})
+
+        self.log.mark_step("人物锚定", "done")
+        self.log.set_step_data("人物锚定", {
+            "face_plan": plan_path,
+            "speaker_track": bindings,
+            "tracks": tracks,
+            "thumbnails": {str(k): v for k, v in (thumbs or {}).items()},
+            "anchored_frames": len(plan.get("frames", {})),
+            "occlusion_gate": occlusion_gate,
+        })
+        bound = {k: v for k, v in bindings.items() if v is not None}
+        self.log.add_entry("人物锚定", "done",
+                           f"{len(tracks)} 条人脸轨迹，绑定 {len(bound)} 个说话人")
+        self._refresh_toolbar()
+        self._populate_face_anchor_tab(tracks, bindings, thumbs, occlusion_gate)
+        self._switch_to_next_tab("人物锚定")
+
+    def _on_face_plan_error(self, msg: str, results: list[dict]):
+        if hasattr(self, "_anchor_dlg") and self._anchor_dlg.winfo_exists():
+            self._anchor_dlg.destroy()
+        messagebox.showwarning(
+            "人物锚定", f"人脸分析失败，已退回按性别过滤：\n{msg}")
+        # Fall back to the pre-v2 gender-filter behaviour.
+        female = sum(1 for r in results
+                     if (r.get("gender") or r.get("tts_gender")) == "female"
+                     and r.get("audio"))
+        male = sum(1 for r in results
+                   if (r.get("gender") or r.get("tts_gender")) == "male"
+                   and r.get("audio"))
+        anchor = getattr(self, "_anchor_gender_var", None)
+        anchor_gender = (anchor.get() if anchor is not None else "female") or None
+        occ = getattr(self, "_anchor_occ_var", None)
+        occlusion_gate = bool(occ.get()) if occ is not None else True
+        self.log.mark_step("人物锚定", "done")
+        self.log.set_step_data("人物锚定", {
+            "anchor_gender": anchor_gender, "occlusion_gate": occlusion_gate,
+            "female_segments": female, "male_segments": male,
+        })
+        self._refresh_toolbar()
+        self._populate_anchor_tab(female, male, anchor_gender, occlusion_gate)
+
+    def _populate_face_anchor_tab(self, tracks: list[dict], bindings: dict,
+                                  thumbs: dict, occlusion_gate: bool):
+        tab = self._tab_frames.get("人物锚定")
+        if tab is None:
+            return
+        for w in tab.winfo_children():
+            w.destroy()
+        f = ttk.Frame(tab, padding=16)
+        f.pack(expand=True, fill="both")
+        tk.Label(f, text="✓ 人物锚定完成（按人脸）",
+                 font=(config.CJK_FONT, 14, "bold"), fg="#155724").pack(pady=(0, 10))
+
+        box = ttk.LabelFrame(f, text="检测到的人脸轨迹", padding=10)
+        box.pack(fill="x", pady=(0, 10))
+        self._anchor_thumb_imgs = []       # keep refs alive
+        if not tracks:
+            tk.Label(box, text="未检测到人脸", fg="#888").pack(anchor="w")
+        for t in tracks:
+            row = ttk.Frame(box)
+            row.pack(fill="x", pady=2)
+            path = (thumbs or {}).get(t["id"]) or (thumbs or {}).get(str(t["id"]))
+            if path and Path(path).exists():
+                try:
+                    img = tk.PhotoImage(file=path)
+                    while img.width() > 96:
+                        img = img.subsample(2)
+                    self._anchor_thumb_imgs.append(img)
+                    tk.Label(row, image=img).pack(side="left", padx=(0, 8))
+                except Exception:                       # noqa: BLE001
+                    pass
+            owner = [k for k, v in bindings.items() if v == t["id"]]
+            tk.Label(row,
+                     text=f"轨迹 {t['id']}：{t.get('gender', '未知')} "
+                          f"(置信度 {t.get('conf', 0)})  关键帧 {t.get('n', 0)}"
+                          f"   → {('说话人 ' + '、'.join(owner)) if owner else '未绑定'}",
+                     font=(config.CJK_FONT, 10)).pack(side="left", anchor="w")
+
+        unbound = [k for k, v in bindings.items() if v is None]
+        if unbound:
+            tk.Label(f, text=f"说话人 {'、'.join(unbound)} 在画面中没有对应人脸，"
+                            f"其台词将保持原视频不做口型",
+                     font=(config.CJK_FONT, 10), fg="#555").pack(anchor="w")
+
+        bar = ttk.Frame(f)
+        bar.pack(anchor="w", pady=(10, 0))
+        self._anchor_faces_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="按人脸锚定（关闭则退回按性别过滤）",
+                        variable=self._anchor_faces_var).pack(side="left")
+        self._anchor_occ_var = tk.BooleanVar(value=occlusion_gate)
+        ttk.Checkbutton(bar, text="遮挡/误检检测",
+                        variable=self._anchor_occ_var).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="重新锚定",
+                   command=self._on_anchor_person).pack(side="left", padx=(8, 0))
 
     def _populate_anchor_tab(self, female: int, male: int, anchor_gender, occlusion_gate=True):
         tab = self._tab_frames.get("人物锚定")
@@ -3700,24 +4211,32 @@ class App:
         anchor_data = self.log.step_data.get("人物锚定", {})
         anchor_gender = anchor_data.get("anchor_gender")
         occlusion_gate = bool(anchor_data.get("occlusion_gate", False))
+        face_plan = (self.log.step_data.get("人物锚定", {}) or {}).get("face_plan")
         threading.Thread(
             target=self._run_segment_lip_sync,
-            args=(str(video_path), tts_results, backend, anchor_gender, occlusion_gate),
+            args=(str(video_path), tts_results, backend, anchor_gender,
+                  occlusion_gate, face_plan),
             daemon=True,
         ).start()
 
     def _run_segment_lip_sync(self, video_path: str, tts_results: list[dict], backend: str,
-                              anchor_gender: str | None = None, occlusion_gate: bool = False):
+                              anchor_gender: str | None = None, occlusion_gate: bool = False,
+                              face_plan: str | None = None):
         import traceback as _tb
         from ai_movie.lip_sync import segment_based_lip_sync
+        from ai_movie.translator import free_gpu_for_local_work
         out_path = Path(WORKSPACE_DIR) / "lipsync_output.mp4"
         try:
+            # An 80 GB resident LLM leaves no room for MuseTalk on this
+            # unified-memory box.
+            free_gpu_for_local_work()
             result = segment_based_lip_sync(
                 video_path=video_path,
                 tts_results=tts_results,
                 output_path=out_path,
                 backend=backend,
                 anchor_gender=anchor_gender,
+                face_plan=face_plan,
                 occlusion_gate=occlusion_gate,
                 progress_cb=lambda cur, total: self.root.after(
                     0, lambda c=cur, t=total: self._update_lip_sync_progress(c, t)),
@@ -3891,10 +4410,10 @@ class App:
             return
         in_video = Path(in_video)
 
-        fidelity = float(getattr(self, "_fe_fidelity_var", tk.DoubleVar(value=0.85)).get())
+        fidelity = float(getattr(self, "_fe_fidelity_var", tk.DoubleVar(value=FACE_ENHANCE_FIDELITY)).get())
         det_every = int(getattr(self, "_fe_detevery_var", tk.IntVar(value=4)).get())
         occlusion = bool(getattr(self, "_fe_occlusion_var", tk.BooleanVar(value=True)).get())
-        protect_lips = bool(getattr(self, "_fe_protect_lips_var", tk.BooleanVar(value=True)).get())
+        protect_lips = bool(getattr(self, "_fe_protect_lips_var", tk.BooleanVar(value=FACE_ENHANCE_PROTECT_LIPS)).get())
 
         self.log.mark_step("人脸增强", "running")
         self.log.add_entry("人脸增强", "start",
@@ -3957,6 +4476,9 @@ class App:
                 det_every=det_every,
                 occlusion_aware=occlusion,
                 protect_lips=protect_lips,
+                # Only the frames MuseTalk painted; the rest stays original.
+                frame_filter=face_restore.frame_filter_from_plan(
+                    (self.log.step_data.get("人物锚定", {}) or {}).get("face_plan")),
                 progress_cb=_progress,
                 cancel_check=lambda: self._cancel_requested,
                 log_cb=_log,
@@ -4259,6 +4781,22 @@ class App:
         # Store mapping for lookup
         self._backend_map = dict(zip(BACKEND_LABELS, BACKEND_VALUES))
 
+        # ── speaker diarization ──────────────────────────────────
+        # Segments are cut at speaker changes and tagged with a speaker +
+        # gender, which everything downstream depends on: per-speaker voice
+        # cloning, and picking which face to lip-sync.
+        self._asr_diarize_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="说话人分离", variable=self._asr_diarize_var
+                        ).pack(side="left", padx=(16, 4))
+
+        ttk.Label(bar, text="人数：",
+                  font=(config.CJK_FONT, 10)).pack(side="left", padx=(6, 2))
+        self._asr_nspk_var = tk.IntVar(value=0)
+        ttk.Spinbox(bar, from_=0, to=6, width=3, textvariable=self._asr_nspk_var
+                    ).pack(side="left")
+        ttk.Label(bar, text="(0=自动)", foreground="#888",
+                  font=(config.CJK_FONT, 9)).pack(side="left", padx=(2, 0))
+
         # Result area (scrollable text, populated after transcription)
         result_frame = ttk.Frame(tab)
         result_frame.pack(expand=True, fill="both", padx=4, pady=(4, 4))
@@ -4316,9 +4854,25 @@ class App:
         ttk.Label(bar2, text="翻译引擎：",
                   font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 8))
 
-        self._tl_engine_var = tk.StringVar(value="hy-mt2")
+        # v2 engines: context-aware, glossary-pinned, speaker-tagged.
+        # Default is plain Sakura — the gpt-oss variants are offered but that
+        # model does not currently serve requests on this machine (it loads
+        # 83 GB onto the GPU and its server never becomes available).
+        self._tl_engine_var = tk.StringVar(value="sakura")
         ttk.Radiobutton(
-            bar2, text="Hy-MT2 (本地，推荐)",
+            bar2, text="Sakura 直译 (推荐，快)",
+            variable=self._tl_engine_var, value="sakura",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            bar2, text="Sakura + gpt-oss 润色",
+            variable=self._tl_engine_var, value="sakura+gptoss",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            bar2, text="gpt-oss 直译",
+            variable=self._tl_engine_var, value="gptoss",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            bar2, text="Hy-MT2 (本地，原方案)",
             variable=self._tl_engine_var, value="hy-mt2",
         ).pack(side="left", padx=(0, 12))
         ttk.Radiobutton(
@@ -4494,7 +5048,7 @@ class App:
         # Fidelity weight (higher = stay closer to input / more faithful).
         ttk.Label(bar, text="保真度：",
                   font=(config.CJK_FONT, 10)).pack(side="left", padx=(0, 4))
-        self._fe_fidelity_var = tk.DoubleVar(value=0.85)
+        self._fe_fidelity_var = tk.DoubleVar(value=FACE_ENHANCE_FIDELITY)
         ttk.Scale(bar, from_=0.0, to=1.0, orient="horizontal", length=120,
                   variable=self._fe_fidelity_var).pack(side="left")
         self._lbl_fe_fidelity = ttk.Label(bar, text="0.85", width=5,
@@ -4513,7 +5067,7 @@ class App:
                     textvariable=self._fe_detevery_var).pack(side="left")
 
         # Protect the generated lip-sync mouth (exclude lips from restoration).
-        self._fe_protect_lips_var = tk.BooleanVar(value=True)
+        self._fe_protect_lips_var = tk.BooleanVar(value=FACE_ENHANCE_PROTECT_LIPS)
         ttk.Checkbutton(bar, text="保护嘴唇",
                         variable=self._fe_protect_lips_var).pack(side="left", padx=(10, 0))
 

@@ -299,7 +299,15 @@ def _transcribe_cpu(
     file_start_cb: Callable[[int, str], None] | None,
     file_progress_cb: Callable[[int, int], None] | None,
     cancel_check: Callable[[], bool] | None,
+    diarize: bool = False,
+    num_speakers: int | None = None,
+    vocals_path: str | Path | None = None,
+    max_duration: float | None = None,
+    max_chars: int | None = None,
+    status_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
+    from ai_movie.config import ASR_CONDITION_ON_PREVIOUS, ASR_WORD_TIMESTAMPS
+
     model = _load_cpu_model(model_size)
     all_results: list[dict] = []
 
@@ -316,6 +324,8 @@ def _transcribe_cpu(
             segments_iter, info = model.transcribe(
                 str(p), language=language,
                 beam_size=5, vad_filter=True,
+                word_timestamps=ASR_WORD_TIMESTAMPS,
+                condition_on_previous_text=ASR_CONDITION_ON_PREVIOUS,
             )
         except Exception as exc:
             all_results.append({"source": str(p), "error": str(exc)})
@@ -323,30 +333,48 @@ def _transcribe_cpu(
                 progress_cb(i + 1, len(audio_paths))
             continue
 
-        segs: list[dict] = []
+        raw_segs: list[dict] = []
+        words: list[dict] = []
         for seg in segments_iter:
             if cancel_check and cancel_check():
                 break
-            d = {"start": round(seg.start, 2),
-                  "end": round(seg.end, 2),
-                  "text": seg.text.strip(),
-                  "source": str(p)}
-            segs.append(d)
-            if segment_cb:
-                segment_cb(i, d)
+            raw_segs.append({"start": round(seg.start, 2),
+                             "end": round(seg.end, 2),
+                             "text": seg.text.strip()})
+            for w in (getattr(seg, "words", None) or []):
+                words.append({"w": w.word, "s": round(w.start, 3),
+                              "e": round(w.end, 3),
+                              "p": round(float(getattr(w, "probability", 0.0)), 3)})
             # Per-file progress from segment end timestamp
             if duration > 0 and file_progress_cb:
                 pct = min(int(seg.end / duration * 100), 99)
                 file_progress_cb(i, pct)
 
+        diar = None
+        if diarize:
+            diar = _run_diarization(
+                p, None, num_speakers=num_speakers,
+                vocals_path=vocals_path, status_cb=status_cb,
+            )
+
+        segs = _finalize_segments(
+            raw_segs, words, source=str(p), diarization=diar,
+            max_duration=max_duration, max_chars=max_chars,
+            segment_cb=(lambda d, _i=i: segment_cb(_i, d)) if segment_cb else None,
+        )
+
         if file_progress_cb:
             file_progress_cb(i, 100)
 
-        all_results.append({
+        entry = {
             "source": str(p),
             "language": info.language,
             "segments": segs,
-        })
+            "words": words,
+        }
+        if diar:
+            entry["diarization"] = diar
+        all_results.append(entry)
 
         if progress_cb:
             progress_cb(i + 1, len(audio_paths))
@@ -471,6 +499,12 @@ def _transcribe_whisper_gpu(
     file_start_cb: Callable[[int, str], None] | None,
     file_progress_cb: Callable[[int, int], None] | None,
     cancel_check: Callable[[], bool] | None,
+    diarize: bool = False,
+    num_speakers: int | None = None,
+    vocals_path: str | Path | None = None,
+    max_duration: float | None = None,
+    max_chars: int | None = None,
+    status_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """Transcribe with openai-whisper GPU + Silero VAD pre-segmentation.
 
@@ -480,6 +514,9 @@ def _transcribe_whisper_gpu(
     timeline.  This prevents the hallucination-loop issue that Whisper
     exhibits on long Japanese audio and produces more natural sentence
     boundaries aligned with conversational pauses.
+
+    With *diarize*, speaker turns are computed from the same VAD spans and
+    fed to the sentence splitter, so no segment ever spans two speakers.
 
     Falls back to whole-file transcription if VAD is unavailable.
     """
@@ -523,8 +560,19 @@ def _transcribe_whisper_gpu(
             # VAD unavailable or found nothing → whole-file fallback
             speech_segs = [{"start": 0.0, "end": len(audio_np) / WHISPER_SR}]
 
+        # ── speaker diarization (reuses the VAD spans above) ─────
+        diar = None
+        if diarize:
+            diar = _run_diarization(
+                p, speech_segs,
+                num_speakers=num_speakers, vocals_path=vocals_path,
+                status_cb=status_cb,
+            )
+
         # ── transcribe each VAD segment ──────────────────────────
         all_segs: list[dict] = []
+        all_words: list[dict] = []
+        chunk_errors: list[str] = []
 
         for vad_seg in speech_segs:
             if cancel_check and cancel_check():
@@ -537,12 +585,8 @@ def _transcribe_whisper_gpu(
             if len(chunk) < WHISPER_SR * 0.1:   # skip < 100 ms
                 continue
 
-            try:
-                result = model.transcribe(
-                    chunk, language=language, verbose=False,
-                )
-            except Exception:
-                # single-chunk failure shouldn't kill the whole file
+            result = _transcribe_chunk(model, chunk, language, chunk_errors)
+            if result is None:
                 continue
 
             offset = vad_seg["start"]
@@ -553,52 +597,197 @@ def _transcribe_whisper_gpu(
                     "end": round(seg["end"] + offset, 2),
                     "text": seg["text"].strip(),
                 })
+                for w in (seg.get("words") or []):
+                    token = w.get("word", w.get("text", ""))
+                    if not token:
+                        continue
+                    all_words.append({
+                        "w": token,
+                        "s": round(float(w["start"]) + offset, 3),
+                        "e": round(float(w["end"]) + offset, 3),
+                        "p": round(float(w.get("probability", 0.0)), 3),
+                    })
 
             # per-VAD-segment progress (0..99 % within file)
             if file_progress_cb and duration > 0:
                 pct = min(int(vad_seg["end"] / duration * 100), 99)
                 file_progress_cb(i, pct)
 
-        # ── sort by start time & deduplicate ───────────────────
         all_segs.sort(key=lambda s: s["start"])
+        all_words.sort(key=lambda w: w["s"])
 
-        merged: list[dict] = []
-        for seg in all_segs:
-            if not seg["text"]:
-                continue
-            if merged and seg["start"] <= merged[-1]["end"] + 0.05:
-                # overlapping / abutting → merge
-                merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
-                merged[-1]["text"] += seg["text"]
-            else:
-                merged.append(seg)
-
-        # ── emit segments via callbacks ─────────────────────────
-        segs: list[dict] = []
-        for seg in merged:
-            d = {
-                "start": seg["start"],
-                "end": seg["end"],
-                "text": seg["text"],
-                "source": str(p),
-            }
-            segs.append(d)
-            if segment_cb:
-                segment_cb(i, d)
+        segs = _finalize_segments(
+            all_segs, all_words, source=str(p),
+            diarization=diar,
+            max_duration=max_duration, max_chars=max_chars,
+            segment_cb=(lambda d, _i=i: segment_cb(_i, d)) if segment_cb else None,
+        )
 
         if file_progress_cb:
             file_progress_cb(i, 100)
 
-        all_results.append({
+        entry = {
             "source": str(p),
             "language": language,
             "segments": segs,
-        })
+            "words": all_words,
+        }
+        if chunk_errors:
+            entry["chunk_errors"] = chunk_errors[:20]
+        if diar:
+            entry["diarization"] = diar
+        all_results.append(entry)
 
         if progress_cb:
             progress_cb(i + 1, len(audio_paths))
 
     return all_results
+
+
+def _transcribe_chunk(model, chunk, language: str,
+                      errors: list[str]) -> dict | None:
+    """Transcribe one VAD chunk with word timestamps and hallucination guards.
+
+    Word timestamps use a cross-attention DTW pass that can fail on ROCm;
+    on any such failure we retry once without them so the chunk still gets
+    transcribed (the splitter then falls back to segment granularity).
+    A failed chunk is recorded rather than silently dropped.
+    """
+    from ai_movie.config import (
+        ASR_CONDITION_ON_PREVIOUS,
+        ASR_INITIAL_PROMPT,
+        ASR_WORD_TIMESTAMPS,
+    )
+
+    common = dict(
+        language=language,
+        verbose=False,
+        condition_on_previous_text=ASR_CONDITION_ON_PREVIOUS,
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        compression_ratio_threshold=2.4,
+        logprob_threshold=-1.0,
+        no_speech_threshold=0.6,
+    )
+    prompt = ASR_INITIAL_PROMPT.get(language)
+    if prompt:
+        common["initial_prompt"] = prompt
+
+    if ASR_WORD_TIMESTAMPS:
+        try:
+            return model.transcribe(chunk, word_timestamps=True, **common)
+        except Exception as exc:                        # noqa: BLE001
+            errors.append(f"word_timestamps failed: {type(exc).__name__}: {exc}")
+    try:
+        return model.transcribe(chunk, **common)
+    except Exception as exc:                            # noqa: BLE001
+        errors.append(f"{type(exc).__name__}: {exc}")
+        return None
+
+
+def _finalize_segments(
+    raw_segments: list[dict],
+    words: list[dict],
+    *,
+    source: str,
+    diarization: dict | None = None,
+    max_duration: float | None = None,
+    max_chars: int | None = None,
+    segment_cb: Callable[[dict], None] | None = None,
+) -> list[dict]:
+    """Re-split raw Whisper output into sentence-sized, single-speaker segments.
+
+    Replaces the old "merge everything whose gap is <= 0.05 s" rule, which
+    chained Whisper's contiguous segments into 44-second multi-speaker blobs.
+    """
+    from ai_movie import segmenter
+    from ai_movie.config import ASR_MAX_SEGMENT_CHARS, ASR_MAX_SEGMENT_DURATION
+
+    if max_duration is None:
+        max_duration = ASR_MAX_SEGMENT_DURATION
+    if max_chars is None:
+        max_chars = ASR_MAX_SEGMENT_CHARS
+
+    word_stream = words or segmenter.segments_to_words(raw_segments)
+    turns = (diarization or {}).get("turns")
+    speakers = (diarization or {}).get("speakers") or {}
+
+    pieces = segmenter.split_into_sentences(
+        word_stream,
+        speaker_turns=turns,
+        max_duration=max_duration,
+        max_chars=max_chars,
+    )
+
+    out: list[dict] = []
+    for piece in pieces:
+        spk = piece.get("speaker") or ""
+        gender = (speakers.get(spk) or {}).get("gender") if spk else None
+        d = {
+            "start": piece["start"],
+            "end": piece["end"],
+            "text": piece["text"],
+            "source": source,
+            "asr_conf": piece.get("asr_conf", 0.0),
+        }
+        if spk:
+            d["speaker"] = spk
+            d["speaker_conf"] = _turn_conf(turns, piece["start"], piece["end"])
+        if gender:
+            d["gender"] = gender
+            # Back-compat alias — lip_sync.py / app.py still read tts_gender.
+            d["tts_gender"] = gender
+        out.append(d)
+        if segment_cb:
+            segment_cb(d)
+    return out
+
+
+def _turn_conf(turns: list[dict] | None, start: float, end: float) -> float:
+    """Fraction of ``[start, end]`` covered by its dominant speaker turn."""
+    if not turns:
+        return 0.0
+    span = max(1e-6, end - start)
+    best = 0.0
+    for t in turns:
+        ov = min(end, float(t["end"])) - max(start, float(t["start"]))
+        if ov > best:
+            best = ov
+    return round(max(0.0, min(1.0, best / span)), 2)
+
+
+def _run_diarization(
+    audio_path: Path,
+    speech_segs: list[dict],
+    *,
+    num_speakers: int | None = None,
+    vocals_path: str | Path | None = None,
+    status_cb: Callable[[str], None] | None = None,
+) -> dict | None:
+    """Diarize *audio_path*, reusing the VAD spans already computed.
+
+    Returns ``None`` (and logs) on any failure — transcription must not be
+    lost because speaker clustering had a bad day.
+    """
+    try:
+        from ai_movie import diarize as diarize_mod
+    except Exception as exc:                            # noqa: BLE001
+        print(f"[ASR] diarization unavailable: {exc}", file=sys.stderr)
+        return None
+
+    try:
+        if status_cb:
+            status_cb("说话人分离中…")
+        return diarize_mod.diarize_file(
+            audio_path,
+            vocals_path=vocals_path,
+            num_speakers=num_speakers,
+            speech_spans=speech_segs,
+            progress_cb=status_cb,
+        )
+    except Exception as exc:                            # noqa: BLE001
+        print(f"[ASR] diarization failed ({type(exc).__name__}: {exc}) — "
+              f"continuing without speaker labels", file=sys.stderr)
+        return None
 
 
 # ── public API ─────────────────────────────────────────────────
@@ -613,6 +802,12 @@ def transcribe_all(
     file_start_cb: Callable[[int, str], None] | None = None,
     file_progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    diarize: bool | None = None,
+    num_speakers: int | None = None,
+    vocals_path: str | Path | None = None,
+    max_duration: float | None = None,
+    max_chars: int | None = None,
+    status_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """Transcribe audio files. Auto-selects best available backend.
 
@@ -632,11 +827,28 @@ def transcribe_all(
         ``file_progress_cb(file_idx, pct)`` — 0–100 % within the current file
     cancel_check:
         Return ``True`` to abort.
+    diarize:
+        Run speaker diarization and label every segment.  Defaults to
+        ``config.ASR_DIARIZE``.
+    num_speakers:
+        Force the speaker count (``None`` = estimate automatically).
+    vocals_path:
+        Separated vocals track, used for cleaner speaker embeddings.
+        Gender is always measured on the original audio.
+    max_duration, max_chars:
+        Segment caps for the sentence splitter (defaults from config).
+    status_cb:
+        ``status_cb(message)`` — coarse stage messages (diarization, etc).
 
     Returns
     -------
-    list[dict] with ``source``, ``language``, ``segments``.
+    list[dict] with ``source``, ``language``, ``segments``, ``words`` and
+    (when diarization ran) ``diarization``.
     """
+    if diarize is None:
+        from ai_movie.config import ASR_DIARIZE
+        diarize = ASR_DIARIZE
+
     if model_size is None:
         from ai_movie.config import ASR_MODEL_SIZE, ASR_OPENAI_WHISPER_MODEL
         cpu_model = ASR_MODEL_SIZE
@@ -645,6 +857,11 @@ def transcribe_all(
         cpu_model = model_size
         gpu_model = model_size
 
+    extra = dict(
+        diarize=diarize, num_speakers=num_speakers, vocals_path=vocals_path,
+        max_duration=max_duration, max_chars=max_chars, status_cb=status_cb,
+    )
+
     # ── Linux / macOS ──────────────────────────────────────────────
     if sys.platform != "win32":
         # Force faster-whisper
@@ -652,7 +869,7 @@ def transcribe_all(
             return _transcribe_cpu(
                 audio_paths, language, cpu_model,
                 segment_cb, progress_cb, file_start_cb,
-                file_progress_cb, cancel_check,
+                file_progress_cb, cancel_check, **extra,
             )
 
         # Force openai-whisper or auto
@@ -663,7 +880,7 @@ def transcribe_all(
                     return _transcribe_whisper_gpu(
                         audio_paths, language, gpu_model,
                         segment_cb, progress_cb, file_start_cb,
-                        file_progress_cb, cancel_check,
+                        file_progress_cb, cancel_check, **extra,
                     )
                 elif backend == "openai-whisper":
                     raise RuntimeError("GPU not available (torch.cuda.is_available() returned False)")
@@ -677,7 +894,7 @@ def transcribe_all(
         return _transcribe_cpu(
             audio_paths, language, cpu_model,
             segment_cb, progress_cb, file_start_cb,
-            file_progress_cb, cancel_check,
+            file_progress_cb, cancel_check, **extra,
         )
 
     # ── Windows: WSL+ROCm → DirectML GPU → CPU ─────────────────
