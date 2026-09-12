@@ -1041,13 +1041,29 @@ def _cut_audio_clip(
     start: float,
     duration: float,
     output_path: Path,
+    *,
+    offset_ms: float = 0.0,
 ) -> Path:
-    """Cut a precise audio clip as 16kHz mono WAV."""
+    """Cut a precise audio clip as 16kHz mono WAV.
+
+    ``offset_ms`` shifts the driving audio relative to the picture:
+    positive = audio plays *later* (the window starts earlier in the track,
+    so the sound that belongs to frame 0 arrives ``offset_ms`` after it).
+    A window that would start before 0 is zero-padded at the front; the
+    clip is always exactly ``duration`` long.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    s = float(start) - float(offset_ms) / 1000.0
+    af = []
+    if s < 0:
+        af.append(f"adelay={int(round(-s * 1000))}:all=1")
+        s = 0.0
+    af.append(f"apad,atrim=0:{duration}")
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start), "-i", str(audio_path),
+        "-ss", f"{s:.6f}", "-i", str(audio_path),
         "-t", str(duration),
+        "-af", ",".join(af),
         "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
         str(output_path),
     ]
@@ -1132,11 +1148,18 @@ def musetalk_sync_batch(
     box_smooth: int = MUSETALK_BOX_SMOOTH,
     sharpen: float = MUSETALK_SHARPEN,
     paste_interp: str = "cubic",
+    fusion: str | None = None,
+    vae_only: bool = False,
     timeout: int = 7200,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[int, Path]:
     """Lip-sync many clips in ONE MuseTalk process.
+
+    ``fusion`` / ``vae_only`` need ``patches/musetalk_fusion.patch``; they
+    are only put on the command line when non-default, so an unpatched
+    vendor tree keeps working with the defaults.  Per-task overrides go in
+    ``task["opts"]`` (``fusion``, ``vae_only``, ``box_smooth``, …).
 
     Loading the UNet, VAE, Whisper and DWPose takes ~5.5 minutes on this
     machine, against ~12 seconds of actual inference for a 4-second clip.
@@ -1217,6 +1240,10 @@ def musetalk_sync_batch(
     ]
     if use_float16:
         cmd.append("--use_float16")
+    if fusion and fusion != "alpha":
+        cmd += ["--fusion", str(fusion)]
+    if vae_only:
+        cmd.append("--vae_only")
 
     env = {**__import__("os").environ, "PYTHONPATH": str(_MUSETALK_DIR)}
     _log(f"MuseTalk batch: {len(tasks)} clips in one process "
@@ -1506,15 +1533,70 @@ def _segment_lip_sync_musetalk_batch(
     face_restore: bool,
     min_gap: float = 0.05,
     exact_fps: str | None = None,
+    audio_offset_ms: float = 0.0,
+    fusion: str | None = None,
+    occlusion_mode: str | None = None,
+    small_face_upscale: bool | None = None,
+    stats: dict | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> Path | None:
-    """Cut every speech range, lip-sync them in one MuseTalk process, reassemble."""
+    """Cut every speech range, lip-sync them in one MuseTalk process, reassemble.
+
+    v3 additions: ``audio_offset_ms`` (A/V knob, see ``_cut_audio_clip``),
+    ``fusion`` (MuseTalk paste mode), ``occlusion_mode`` (frame/region),
+    the small-face 2× route (clips whose anchored frames are mostly
+    ``face_plan["frames_sr"]`` are rendered on a lanczos-upscaled copy and
+    scaled back), and ``stats`` (per-clip occlusion / SR bookkeeping for QC).
+    """
+    from ai_movie.config import (LIPSYNC_SMALL_FACE_UPSCALE, LIPSYNC_SR_MAX_CLIP_SEC,
+                                 LIPSYNC_SR_MIN_FRAC)
+    from ai_movie.shots import local_cuts
+
+    if small_face_upscale is None:
+        small_face_upscale = LIPSYNC_SMALL_FACE_UPSCALE
+    sr_frames = set(int(f) for f in (face_plan or {}).get("frames_sr") or [])
+    plan_frames = (face_plan or {}).get("frames") or {}
+    cuts = [int(c) for c in (face_plan or {}).get("cuts") or []]
+
+    def _sr_clip(seg_start: float, seg_end: float) -> bool:
+        """Does this range go to the 2× route?"""
+        if not (small_face_upscale and sr_frames):
+            return False
+        base = int(round(seg_start * target_fps))
+        n = int(round((seg_end - seg_start) * target_fps)) + 2
+        anchored = [base + i for i in range(n) if str(base + i) in plan_frames]
+        if not anchored:
+            return False
+        small = sum(1 for f in anchored if f in sr_frames)
+        return small >= LIPSYNC_SR_MIN_FRAC * len(anchored)
+
+    # 2× frames cost 4× RAM inside MuseTalk (it holds every frame of a
+    # clip), so SR ranges are re-chunked to LIPSYNC_SR_MAX_CLIP_SEC.
+    if small_face_upscale and sr_frames:
+        rechunked: list[tuple[float, float]] = []
+        for s, e in speech_ranges:
+            if _sr_clip(s, e) and (e - s) > LIPSYNC_SR_MAX_CLIP_SEC:
+                n_parts = int(np.ceil((e - s) / LIPSYNC_SR_MAX_CLIP_SEC))
+                edges = [s + (e - s) * k / n_parts for k in range(n_parts + 1)]
+                edges = [round(x * target_fps) / target_fps for x in edges]
+                edges[0], edges[-1] = s, e
+                rechunked.extend((edges[k], edges[k + 1]) for k in range(n_parts)
+                                 if edges[k + 1] > edges[k])
+            else:
+                rechunked.append((s, e))
+        if len(rechunked) != len(speech_ranges):
+            _log(f"small-face route: {len(speech_ranges)} ranges → {len(rechunked)} "
+                 f"(2× clips capped at {LIPSYNC_SR_MAX_CLIP_SEC}s)")
+        speech_ranges = rechunked
+
     total = len(speech_ranges)
     processed_map: dict[tuple[float, float], Path] = {}
     tasks: list[dict] = []
     task_range: list[tuple[float, float]] = []
+    task_sr: list[bool] = []
+    clip_stats: list[dict] = []
 
     # ── 1. Cut all clips up front ────────────────────────────────
     for idx, (seg_start, seg_end) in enumerate(speech_ranges):
@@ -1532,32 +1614,46 @@ def _segment_lip_sync_musetalk_batch(
         # fit, but pass-through clips have no later correction point.
         _cut_video_clip(working_video, seg_start, duration, orig_clip,
                         reencode=True, fps=exact_fps or ms_fps)
-        _cut_audio_clip(speech_track, seg_start, duration, audio_clip)
+        _cut_audio_clip(speech_track, seg_start, duration, audio_clip,
+                        offset_ms=audio_offset_ms)
         processed_map[(seg_start, seg_end)] = orig_clip     # default: pass-through
 
+        use_sr = _sr_clip(seg_start, seg_end)
         bbox_json = None
         if face_plan:
             bbox_json = _write_clip_bbox_json(
                 face_plan, seg_start, duration, target_fps,
-                tmp_dir / f"{name}_bbox.json", scale=1.0 / resize_factor)
+                tmp_dir / f"{name}_bbox.json",
+                scale=(2.0 if use_sr else 1.0) / resize_factor)
             if bbox_json is None:
                 _log(f"[{idx+1}/{total}] no target face in "
                      f"[{seg_start:.1f}s–{seg_end:.1f}s] — original passes through")
                 continue
 
-        tasks.append({"video": orig_clip, "audio": audio_clip,
+        task_video = orig_clip
+        if use_sr:
+            up_clip = tmp_dir / f"{name}_up2x.mp4"
+            _rescale_video(orig_clip, up_clip, 0.5, fps=exact_fps or ms_fps)
+            task_video = up_clip
+            _log(f"[{idx+1}/{total}] small face in [{seg_start:.1f}s–{seg_end:.1f}s] "
+                 f"— rendering at 2×")
+
+        tasks.append({"video": task_video, "audio": audio_clip,
                       "output": tmp_dir / f"{name}_lipsync.mp4",
-                      "bbox_json": bbox_json})
+                      "bbox_json": bbox_json, "orig": orig_clip,
+                      "opts": ({"fusion": fusion} if fusion and fusion != "alpha" else {})})
         task_range.append((seg_start, seg_end))
+        task_sr.append(use_sr)
 
     _log(f"Prepared {len(tasks)} clips for lip-sync "
-         f"({total - len(tasks)} pass through unchanged)")
+         f"({total - len(tasks)} pass through unchanged, "
+         f"{sum(task_sr)} at 2×)")
 
     # ── 2. One MuseTalk process for all of them ──────────────────
     results: dict[int, Path] = {}
     if tasks:
         results = musetalk_sync_batch(
-            tasks, fps=ms_fps, use_float16=True, batch_size=4,
+            tasks, fps=ms_fps, use_float16=True, batch_size=4, fusion=fusion,
             progress_cb=progress_cb, cancel_check=cancel_check)
         if cancel_check and cancel_check():
             shutil.rmtree(str(tmp_dir), ignore_errors=True)
@@ -1570,17 +1666,38 @@ def _segment_lip_sync_musetalk_batch(
             _log(f"clip {i} produced no output — keeping original")
             continue
         seg_start, seg_end = rng
-        orig_clip = tasks[i]["video"]
+        orig_clip = tasks[i]["orig"]
         final_clip = clip
+        cstat = {"clip": i, "start": seg_start, "end": seg_end, "sr": task_sr[i]}
+
+        if task_sr[i]:
+            # Back to the original clip's exact size (and frame rate).
+            back = tmp_dir / f"speech_{i:04d}_down.mp4"
+            try:
+                _rescale_video(final_clip, back, 2.0, size=_probe_size(orig_clip),
+                               fps=exact_fps or ms_fps)
+                if back.exists():
+                    final_clip = back
+            except Exception as exc:                    # noqa: BLE001
+                _log(f"clip {i}: scale-back failed ({exc}) — keeping original")
+                clip_stats.append(cstat)
+                continue
 
         if occlusion_gate:
             gated = tmp_dir / f"speech_{i:04d}_gated.mp4"
             try:
                 from ai_movie import face_restore as _fr
+                base = int(round(seg_start * target_fps))
+                n_local = int(round((seg_end - seg_start) * target_fps)) + 2
+                ostat: dict = {}
                 _fr.occlusion_gate_video(orig_clip, final_clip, gated,
+                                         occlusion_mode=occlusion_mode,
+                                         cuts=local_cuts(cuts, base, n_local),
+                                         stats=ostat,
                                          cancel_check=cancel_check, log_cb=_log)
                 if gated.exists():
                     final_clip = gated
+                cstat["occlusion"] = ostat
             except Exception as exc:                    # noqa: BLE001
                 _log(f"clip {i}: occlusion gate failed ({exc}) — un-gated")
 
@@ -1605,6 +1722,18 @@ def _segment_lip_sync_musetalk_batch(
             _log(f"clip {i}: duration fit skipped ({exc})")
 
         processed_map[rng] = final_clip
+        clip_stats.append(cstat)
+
+    if stats is not None:
+        occ = [c.get("occlusion") or {} for c in clip_stats]
+        stats.update({
+            "clips": len(task_range), "sr_clips": int(sum(task_sr)),
+            "audio_offset_ms": audio_offset_ms, "fusion": fusion or "alpha",
+            "occlusion_mode": (occ[0].get("mode") if occ and occ[0] else occlusion_mode),
+            "reverted_frames": int(sum(o.get("reverted_frames", 0) for o in occ)),
+            "region_frames": int(sum(o.get("region_frames", 0) for o in occ)),
+            "per_clip": clip_stats,
+        })
 
     gc.collect()
     if torch.cuda.is_available():
@@ -1665,11 +1794,20 @@ def segment_based_lip_sync(
     occlusion_gate: bool = False,
     anchor_gender: str | None = None,
     face_plan: dict | str | Path | None = None,
+    audio_offset_ms: float | None = None,
+    fusion: str | None = None,
+    occlusion_mode: str | None = None,
+    stats: dict | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> Path | None:
     """Run segment-based lip-sync — only on video portions that have speech.
+
+    v3 keyword-only additions (all default to config): ``audio_offset_ms``
+    (``LIPSYNC_AUDIO_OFFSET_MS``), ``fusion`` (``MUSETALK_FUSION``),
+    ``occlusion_mode`` (``OCCLUSION_MODE``) and ``stats`` (filled with
+    per-clip bookkeeping — MuseTalk path only).
 
     Silent portions pass through unchanged (stream copy).  Segments where
     face detection fails fall back to the original clip automatically.
@@ -1828,12 +1966,17 @@ def segment_based_lip_sync(
     # them all to a single process.  Wav2Lip keeps the per-clip loop (its
     # model is already cached in-process).
     if backend == "musetalk":
+        from ai_movie.config import LIPSYNC_AUDIO_OFFSET_MS, MUSETALK_FUSION
         return _segment_lip_sync_musetalk_batch(
             speech_ranges, working_video, speech_track, tmp_dir, output_path,
             video_path=video_path, video_duration=video_duration,
             target_fps=target_fps, ms_fps=ms_fps, face_plan=face_plan,
             resize_factor=resize_factor, occlusion_gate=occlusion_gate,
             face_restore=face_restore, min_gap=0.05, exact_fps=exact_fps,
+            audio_offset_ms=(LIPSYNC_AUDIO_OFFSET_MS if audio_offset_ms is None
+                             else audio_offset_ms),
+            fusion=fusion or MUSETALK_FUSION,
+            occlusion_mode=occlusion_mode, stats=stats,
             progress_cb=progress_cb, detail_progress_cb=detail_progress_cb,
             cancel_check=cancel_check,
         )
@@ -2041,37 +2184,61 @@ def _probe_fps_exact(video_path: Path) -> str:
     return "25"
 
 
-def _downscale_video(
-    src: Path,
-    dst: Path,
-    factor: int = 2,
-) -> Path:
-    """Downscale a video by *factor* using bicubic scaling via FFmpeg."""
+def _probe_size(src: Path) -> tuple[int, int]:
     probe = subprocess.run([
         "ffprobe", "-v", "quiet", "-select_streams", "v:0",
         "-show_entries", "stream=width,height",
         "-of", "csv=p=0", str(src),
     ], capture_output=True, text=True)
     try:
-        w, h = map(int, probe.stdout.strip().split(","))
+        w, h = map(int, probe.stdout.strip().split(",")[:2])
+        return w, h
     except (ValueError, AttributeError):
-        w, h = 1920, 1080
+        return 1920, 1080
 
-    new_w, new_h = w // factor, h // factor
-    # Ensure even dimensions for YUV 4:2:0
-    new_w += new_w % 2
-    new_h += new_h % 2
 
-    _log(f"  Scaling: {w}×{h} → {new_w}×{new_h}")
+def _rescale_video(
+    src: Path,
+    dst: Path,
+    factor: float = 2.0,
+    *,
+    size: tuple[int, int] | None = None,
+    fps: str | float | None = None,
+) -> Path:
+    """Scale a video by ``1/factor`` (factor 2 = half size, 0.5 = double).
+
+    Downscaling uses bicubic (v2 behaviour); upscaling uses lanczos so the
+    2× clip fed to MuseTalk for small faces is as crisp as the source
+    allows.  ``size`` forces exact output dimensions (used to scale the 2×
+    render back to the original clip's size).  ``fps`` pins the frame rate
+    so a rescaled clip keeps its exact frame count.
+    """
+    w, h = _probe_size(src)
+    if size is not None:
+        new_w, new_h = size
+    else:
+        new_w, new_h = int(round(w / factor)), int(round(h / factor))
+        new_w += new_w % 2
+        new_h += new_h % 2
+    flags = "lanczos" if (new_w > w) else ("area" if size is not None else "bicubic")
+    _log(f"  Scaling: {w}×{h} → {new_w}×{new_h} ({flags})")
+    vf = f"scale={new_w}:{new_h}:flags={flags}"
+    if fps:
+        vf += f",fps={fps}"
     result = subprocess.run([
         "ffmpeg", "-y",
         "-i", str(src),
-        "-vf", f"scale={new_w}:{new_h}:flags=bicubic",
+        "-vf", vf,
         "-c:v", "libx264", "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-an",
         str(dst),
     ], capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Failed to downscale video:\n{result.stderr[-500:]}")
+        raise RuntimeError(f"Failed to rescale video:\n{result.stderr[-500:]}")
     return dst
+
+
+def _downscale_video(src: Path, dst: Path, factor: int = 2) -> Path:
+    """Downscale a video by *factor* (kept for older callers)."""
+    return _rescale_video(src, dst, float(factor))

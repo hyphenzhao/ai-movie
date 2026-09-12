@@ -1085,6 +1085,11 @@ def select_best_reference(
                   file=sys.stderr)
             continue
 
+        # Similarity picks the timbre; the F0 gate vetoes octave collapse,
+        # which similarity cannot see (Documentation/vc-gate-result.md).
+        from ai_movie import pitch as _pitch
+        from ai_movie.config import TTS_F0_GATE
+
         scored = []
         for i, c in enumerate(cands):
             wav = (items.get(i) or {}).get("audio")
@@ -1094,27 +1099,48 @@ def select_best_reference(
                 sim = _diarize.similarity(c["ref_audio"], wav)
             except Exception:                           # noqa: BLE001
                 continue
-            scored.append((sim, i, c))
+            g = {"ok": True, "ratio": None, "reason": "gate_off"}
+            f0_ref = f0_out = None
+            if TTS_F0_GATE:
+                try:
+                    f0_ref, _ = _pitch.f0_median(c["ref_audio"])
+                    f0_out, _ = _pitch.f0_median(wav)
+                    g = _pitch.gate(f0_ref, f0_out, ref.get("gender"))
+                except Exception as exc:                # noqa: BLE001
+                    g = {"ok": True, "ratio": None, "reason": f"f0_error:{exc}"}
+            c.update({"probe_similarity": round(sim, 3),
+                      "f0_ref": f0_ref and round(f0_ref, 1),
+                      "f0_out": f0_out and round(f0_out, 1),
+                      "f0_ratio": g.get("ratio"), "f0_ok": bool(g["ok"]),
+                      "f0_reason": g.get("reason", "")})
+            scored.append((sim, i, c, bool(g["ok"])))
             if progress_cb:
                 progress_cb(f"  {spk} 候选{i}（{c['duration']}s @{c['start']}s）"
-                            f" 相似度 {sim:.3f}")
+                            f" 相似度 {sim:.3f}  F0 {c['f0_ref']}→{c['f0_out']}"
+                            f" ratio={g.get('ratio')} {'✓' if g['ok'] else '✗ ' + g.get('reason', '')}")
         if not scored:
             continue
 
-        scored.sort(key=lambda x: -x[0])
-        best_sim, best_i, best_c = scored[0]
+        survivors = [s for s in scored if s[3]]
+        pool = survivors or scored
+        pool.sort(key=lambda x: -x[0])
+        best_sim, best_i, best_c, _ = pool[0]
+        chosen_by = "probe+f0" if survivors else "similarity_no_f0_survivor"
+        if not survivors and progress_cb:
+            progress_cb(f"{spk}: 没有候选通过 F0 门，按相似度选择（克隆质量校验会再拦一次）")
         if best_i != 0:
             if progress_cb:
-                progress_cb(f"{spk}: 改用候选{best_i}（{best_sim:.3f} > "
-                            f"{scored[-1][0]:.3f}）")
+                progress_cb(f"{spk}: 改用候选{best_i}（{best_sim:.3f}）")
             keep_alts = ref.get("alternatives")
             speaker_refs[spk] = {**best_c, "alternatives": keep_alts,
                                  "gender": ref.get("gender"),
                                  "probe_similarity": round(best_sim, 3),
-                                 "chosen_by": "probe"}
+                                 "chosen_by": chosen_by,
+                                 "f0_warning": not survivors}
         else:
             ref["probe_similarity"] = round(best_sim, 3)
-            ref["chosen_by"] = "probe"
+            ref["chosen_by"] = chosen_by
+            ref["f0_warning"] = not survivors
     return speaker_refs
 
 
@@ -1123,19 +1149,27 @@ def verify_clone_quality(
     speaker_refs: dict[str, dict],
     *,
     min_similarity: float | None = None,
+    f0_gate: bool | None = None,
 ) -> dict[str, dict]:
-    """Measure speaker similarity between synthesized audio and each reference.
+    """Measure speaker similarity (and pitch consistency) per speaker.
 
-    Returns ``{speaker: {"similarity", "n", "ok"}}``.  Callers use this to
-    decide whether to re-synthesize a speaker with a built-in voice.
+    Returns ``{speaker: {"similarity", "n", "ok", "f0_out", "f0_ref",
+    "f0_ratio", "f0_ok", "reason"}}``.  ``ok`` needs the median similarity
+    above the threshold *and*, with the F0 gate on, the median output pitch
+    inside the speaker's gender band and within the allowed ratio of the
+    reference — the octave-collapse case that similarity alone let through.
+    Callers use ``ok`` to decide whether to fall back to a built-in voice.
     """
-    from ai_movie import diarize
-    from ai_movie.config import TTS_CLONE_MIN_SIMILARITY
+    from ai_movie import diarize, pitch as _pitch
+    from ai_movie.config import TTS_CLONE_MIN_SIMILARITY, TTS_F0_GATE
 
     if min_similarity is None:
         min_similarity = TTS_CLONE_MIN_SIMILARITY
+    if f0_gate is None:
+        f0_gate = TTS_F0_GATE
 
     by_spk: dict[str, list[float]] = {}
+    f0s: dict[str, list[float]] = {}
     for seg in segments:
         spk = seg.get("speaker") or ""
         ref = speaker_refs.get(spk)
@@ -1149,12 +1183,38 @@ def verify_clone_quality(
                 diarize.similarity(ref["ref_audio"], audio))
         except Exception:                               # noqa: BLE001
             continue
+        if f0_gate:
+            try:
+                f, _ = _pitch.f0_median(audio)
+                if f is not None:
+                    f0s.setdefault(spk, []).append(f)
+            except Exception:                           # noqa: BLE001
+                pass
 
     out: dict[str, dict] = {}
     for spk, sims in by_spk.items():
         med = float(np.median(sims))
-        out[spk] = {"similarity": round(med, 3), "n": len(sims),
-                    "ok": med >= min_similarity}
+        rec = {"similarity": round(med, 3), "n": len(sims),
+               "ok": med >= min_similarity, "reason": ""}
+        if not rec["ok"]:
+            rec["reason"] = "similarity_below_threshold"
+        if f0_gate:
+            ref = speaker_refs.get(spk) or {}
+            f0_out = float(np.median(f0s[spk])) if f0s.get(spk) else None
+            f0_ref = ref.get("f0_ref")
+            if f0_ref is None and ref.get("ref_audio"):
+                try:
+                    f0_ref, _ = _pitch.f0_median(ref["ref_audio"])
+                except Exception:                       # noqa: BLE001
+                    f0_ref = None
+            g = _pitch.gate(f0_ref, f0_out, ref.get("gender"))
+            rec.update({"f0_out": f0_out and round(f0_out, 1),
+                        "f0_ref": f0_ref and round(f0_ref, 1),
+                        "f0_ratio": g.get("ratio"), "f0_ok": bool(g["ok"])})
+            if not g["ok"]:
+                rec["ok"] = False
+                rec["reason"] = (rec["reason"] + ";" if rec["reason"] else "") + g["reason"]
+        out[spk] = rec
     return out
 
 

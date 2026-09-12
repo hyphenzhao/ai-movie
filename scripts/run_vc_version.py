@@ -170,12 +170,10 @@ def main() -> int:
         log("  → drift too large to reuse v1's lip-sync; v2 needs its own render")
 
     # ── mix and mux ────────────────────────────────────────────────────
-    bg = (state.get("separate") or {}).get("background")
+    from ai_movie.composer import mix_for_state
     audio_out = out_dir / "final_audio.wav"
-    if bg and Path(bg).exists():
-        mix_audio(segs, Path(bg), audio_out)
-    else:
-        build_speech_track(segs, audio_out)
+    mix_stats: dict = {}
+    mix_for_state(state, segs, audio_out, stats=mix_stats)   # stereo bed if present
     shutil.copy2(str(audio_out), str(deliver / "03_final_audio.wav"))
 
     # Prefer the CodeFormer-enhanced render (same frames, sharper mouth).
@@ -206,7 +204,8 @@ def main() -> int:
 
     state["vc"] = {"segments": segs, "refs": refs, "video": str(final),
                    "converted": converted, "reused_lipsync": reuse_lipsync,
-                   "max_drift_ms": round(worst[0] * 1000, 1)}
+                   "max_drift_ms": round(worst[0] * 1000, 1),
+                   "mix": mix_stats}
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2),
                           encoding="utf-8")
     log(f"done → {deliver / '05_final_dubbed.mp4'}")

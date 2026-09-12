@@ -40,12 +40,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-GENDER_HZ = {"female": (165.0, 320.0), "male": (70.0, 175.0)}
+from ai_movie.config import OSD_REF_MAX_OVERLAP, TTS_GENDER_HZ as GENDER_HZ  # noqa: E402
+from ai_movie.pitch import f0_median as _f0_median                            # noqa: E402
+
+# Generic Chinese probe lines (built-in SFT voices) reused across videos.
 SOURCES = {
-    "female": ["workspace/output_test/vc_probe/sft/f1.wav",
-               "workspace/output_test/vc_probe/sft/f2.wav"],
-    "male": ["workspace/output_test/vc_probe/sft/m2.wav",
-             "workspace/output_test/vc_probe/sft/m0.wav"],
+    "female": ["asset/vc_probe/f1.wav", "asset/vc_probe/f2.wav"],
+    "male": ["asset/vc_probe/m2.wav", "asset/vc_probe/m0.wav"],
 }
 N_CANDIDATES = 3
 MIN_SEG_SECONDS = 2.0
@@ -59,7 +60,6 @@ def main() -> int:
     args = ap.parse_args()
 
     import numpy as np
-    import librosa
     import soundfile as sf
     from ai_movie.diarize import _load_mono16k
 
@@ -77,15 +77,21 @@ def main() -> int:
     segs = state["asr"]["segments"]
 
     def f0_profile(a: "np.ndarray"):
-        f0, vf, vp = librosa.pyin(a, fmin=60, fmax=500, sr=16000,
-                                  frame_length=1024, hop_length=256)
-        ok = vf & (vp > 0.5) & ~np.isnan(f0)
-        if int(ok.sum()) < 6:
-            return None, int(ok.sum())
-        return float(np.median(f0[ok])), int(ok.sum())
+        return _f0_median(a)
 
     def f0_of(path: str):
-        return f0_profile(_load_mono16k(path))[0]
+        return _f0_median(path)[0]
+
+    # Overlapped-speech regions (osd stage): a window where two people talk
+    # is useless as a timbre reference, whatever its pitch says.
+    overlap = ((state.get("osd") or {}).get("regions")) or []
+
+    def overlap_ratio(a: float, b: float) -> float:
+        if b <= a or not overlap:
+            return 0.0
+        cov = sum(max(0.0, min(b, float(e)) - max(a, float(s_)))
+                  for s_, e in overlap)
+        return cov / (b - a)
 
     genders = sorted({s.get("gender") for s in segs if s.get("gender")})
     print(f"genders present: {genders}")
@@ -99,6 +105,8 @@ def main() -> int:
                 continue
             d = float(s["end"]) - float(s["start"])
             if d < MIN_SEG_SECONDS:
+                continue
+            if overlap_ratio(float(s["start"]), float(s["end"])) > OSD_REF_MAX_OVERLAP:
                 continue
             a = vocals[int(s["start"] * 16000):int(s["end"] * 16000)]
             med, voiced = f0_profile(a)

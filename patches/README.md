@@ -95,3 +95,37 @@ Apply after the other two:
 cd models/musetalk && git apply ../../patches/musetalk_quality.patch
 ```
 `models/musetalk/.orig/audio_processor.py` is the pristine copy.
+
+## musetalk_fusion.patch — three-layer paste + VAE-only ablation (v3)
+
+Applies on top of the three patches above (touches `scripts/inference.py`,
+`musetalk/utils/blending.py`, `musetalk/utils/face_parsing/__init__.py`):
+
+- `FaceParsing.__call__(…, raw_classes=True)` returns the raw CelebAMask-HQ
+  class map instead of one thresholded silhouette.
+- `blending.get_image_fusion(...)`: keeps the **original outer face** and takes
+  only the **mouth interior + lips** (parsed from the generated crop) from the
+  render, with a weight ramping from 1 there to 0 at the jaw silhouette
+  (`ramp_frac`, default 12 % of the crop) and never beyond the 8 %-feathered
+  jaw mask.  `fusion="laplacian"` merges the two through a Burt-Adelson
+  Laplacian pyramid (low frequencies over a wide band, edges over a narrow
+  one) so the sharp original and the soft 256² render meet without a halo;
+  `fusion="alpha"` is a plain linear blend of the same weight.  Pixels the
+  weight never touches stay bit-exact original.  Falls back to `get_image`
+  when the parser finds no mouth in the render.
+- `scripts/inference.py`: `--fusion {alpha,laplacian}` (default `alpha` =
+  upstream `get_image`, so an un-configured run is unchanged) and
+  `--vae_only` (bypass the UNet: `pred_latents = latent_batch[:, 4:]`, the
+  unmasked reference half, so the output isolates VAE + paste loss from mouth
+  generation).  Both are also per-task yaml keys (`fusion`, `vae_only`) so an
+  A/B renders in one process (`scripts/ab_fusion.py`).
+
+Apply after the other three:
+```
+cd models/musetalk && git apply ../../patches/musetalk_fusion.patch
+```
+Pristine pre-fusion copies of the three files are in
+`models/musetalk/.orig/fusion_base/`; regenerate with
+`diff -u .orig/fusion_base/<f> <f>`.  Note: the earlier 5 % → 8 % feather
+change in `blending.py::get_image` predates this patch and is not part of it
+(it is a one-line edit; see the `# ai-movie:` comment there).

@@ -50,30 +50,49 @@ def ff(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {r.stderr[-400:]}")
 
 
+def resolve_source(state: dict, state_path: Path | None = None) -> Path | None:
+    """The real source video: ``_video`` if it still exists, else
+    ``inputs/<workspace name>.mp4``, else the demuxed (silent) copy."""
+    v = state.get("_video")
+    if v:
+        p = Path(v) if Path(v).is_absolute() else ROOT / v
+        if p.exists():
+            return p
+    if state_path is not None:
+        cand = ROOT / "inputs" / f"{Path(state_path).parent.name}.mp4"
+        if cand.exists():
+            return cand
+    dv = (state.get("demux") or {}).get("video")
+    return Path(dv) if dv and Path(dv).exists() else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("state")
     ap.add_argument("--out", required=True)
     ap.add_argument("--video", default=None,
                     help="dubbed video (default: state's compose/vc output)")
+    ap.add_argument("--source", default=None,
+                    help="original video for the side-by-side (default: auto)")
     ap.add_argument("--label", default="配音")
     ap.add_argument("-n", type=int, default=3, help="how many single clips")
     args = ap.parse_args()
 
     state = json.loads(Path(args.state).read_text(encoding="utf-8"))
-    work = Path(args.state).parent
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-
     dubbed = args.video or ((state.get("vc") or {}).get("video")
                             or (state.get("compose") or {}).get("video"))
+    source = Path(args.source) if args.source else resolve_source(state, Path(args.state))
+    return make_clips(state, Path(args.out), dubbed, source, args.label, args.n)
+
+
+def make_clips(state: dict, out: Path, dubbed: str | Path | None,
+               source: Path | None, label: str = "配音", n: int = 3) -> int:
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     if not dubbed or not Path(dubbed).exists():
         print(f"no dubbed video ({dubbed})")
         return 1
-    # _video is only populated on some code paths; the demux record always
-    # knows what it demuxed.
-    source = (state.get("_video")
-              or (state.get("demux") or {}).get("video"))
+    dubbed = str(dubbed)
 
     segs = ((state.get("vc") or {}).get("segments")
             or (state.get("fit") or {}).get("segments") or [])
@@ -123,7 +142,7 @@ def main() -> int:
     for w in best:
         if all(abs(w["start"] - p["start"]) >= WINDOW for p in picks):
             picks.append(w)
-        if len(picks) >= args.n:
+        if len(picks) >= n:
             break
 
     print(f"{len(best)} candidate windows; picked {len(picks)}")
@@ -141,10 +160,10 @@ def main() -> int:
 
     # Side-by-side against the untouched source: the clearest way to show what
     # changed, since both mouths are on screen at the same instant.
-    if source and Path(ROOT / source).exists() and picks:
+    if source and Path(source).exists() and picks:
         w = picks[0]
-        dst = out / f"demo_对比_原片vs{args.label}_{int(w['start'])}-{int(w['start'] + WINDOW)}s.mp4"
-        ff(["-ss", str(w["start"]), "-i", str(ROOT / source),
+        dst = out / f"demo_对比_原片vs{label}_{int(w['start'])}-{int(w['start'] + WINDOW)}s.mp4"
+        ff(["-ss", str(w["start"]), "-i", str(source),
             "-ss", str(w["start"]), "-i", dubbed, "-t", str(WINDOW),
             "-filter_complex",
             "[0:v]scale=960:-2,pad=960:1080:(ow-iw)/2:(oh-ih)/2[l];"

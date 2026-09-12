@@ -43,6 +43,11 @@ _PARSE_WEIGHTS = _PARSE_DIR / "79999_iter.pth"
 _SKIN = 1
 _LIP_CLASSES = (11, 12, 13)        # mouth interior + upper/lower lip
 _FACE_CLASSES = (1, 11, 12, 13)    # skin + mouth + lips (lower-face material)
+# CelebAMask-HQ ids: 0 background, 1 skin, 2/3 brows, 4/5 eyes, 6 glasses,
+# 7/8 ears, 9 earring, 10 nose, 11 mouth, 12 u_lip, 13 l_lip, 14 neck,
+# 15 necklace, 16 cloth, 17 hair, 18 hat.  Things that can sit in front of
+# a mouth and are not face material (hands are "skin" — not catchable):
+_OCCLUDER_CLASSES = (0, 15, 16, 17, 18)
 
 _net = None
 _parser = None
@@ -122,7 +127,7 @@ def _restore_crop(face_bgr: np.ndarray, net, device: str, w: float) -> np.ndarra
 
 
 def _resolve_boxes(key_idx: list[int], key_boxes: list, key_valid: list[bool],
-                   n: int, det_every: int) -> list:
+                   n: int, det_every: int, cuts=None) -> list:
     """Resolve a per-frame face box (or ``None``) from sparse keyframe detections.
 
     Faces move little between adjacent frames, so we only detect on a subset of
@@ -139,23 +144,26 @@ def _resolve_boxes(key_idx: list[int], key_boxes: list, key_valid: list[bool],
     Returns a list of length *n*; each element is an ``(y1,y2,x1,x2)`` int tuple
     or ``None``.
     """
+    from ai_movie.faces import boxes_disjoint
+    from ai_movie.shots import crosses_cut
+
     boxes: list = [None] * n
     half = max(1, det_every)
 
-    def _center_scale(b):
+    def _xyxy(b):
         y1, y2, x1, x2 = b
-        return ((x1 + x2) * 0.5, (y1 + y2) * 0.5), max(1.0, max(y2 - y1, x2 - x1))
+        return [x1, y1, x2, y2]
 
     for k in range(len(key_idx)):
         if not key_valid[k]:
             continue
         i0, b0 = key_idx[k], key_boxes[k]
         # Try to interpolate forward to the next VALID, non-cut keyframe.
+        # ``cuts`` (clip-local scdet cut indices) is the explicit signal;
+        # ``boxes_disjoint`` is the geometric fallback shared with faces.py.
         if k + 1 < len(key_idx) and key_valid[k + 1]:
             i1, b1 = key_idx[k + 1], key_boxes[k + 1]
-            (c0, s0), (c1, s1) = _center_scale(b0), _center_scale(b1)
-            dist = ((c0[0] - c1[0]) ** 2 + (c0[1] - c1[1]) ** 2) ** 0.5
-            cut = dist > 0.6 * max(s0, s1) or max(s0, s1) > 1.8 * min(s0, s1)
+            cut = boxes_disjoint(_xyxy(b0), _xyxy(b1)) or crosses_cut(i0, i1, cuts)
             if not cut:
                 span = max(1, i1 - i0)
                 for i in range(i0, i1):
@@ -208,11 +216,15 @@ def restore_video(
     parse_device: str | None = None,
     chunk_size: int = 600,
     frame_filter: Callable[[int], bool] | None = None,
+    cuts=None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> Path | None:
     """Restore faces in *in_video*, writing the result (with original audio) to *out_video*.
+
+    ``cuts``: global scdet cut frame indices (see ``ai_movie.shots``); face
+    boxes are never interpolated across one.
 
     ``frame_filter(global_frame_index) -> bool`` restricts the pass to the
     frames it returns True for (typically the lip-synced ones from the face
@@ -386,7 +398,9 @@ def restore_video(
             key_boxes = [(b[0] * inv, b[1] * inv, b[2] * inv, b[3] * inv)
                          for _, b, _sc in face_results]              # (y1, y2, x1, x2)
             key_valid = [sc >= conf_thresh for _, _b, sc in face_results]
-            boxes = _resolve_boxes(key_idx, key_boxes, key_valid, n, det_every)
+            from ai_movie.shots import local_cuts as _local_cuts
+            boxes = _resolve_boxes(key_idx, key_boxes, key_valid, n, det_every,
+                                   cuts=_local_cuts(cuts, base, n))
             boxes = [b if keep[i] else None for i, b in enumerate(boxes)]
             if log_cb:
                 nvalid = sum(key_valid)
@@ -534,24 +548,48 @@ def occlusion_gate_video(
     min_occluded_run: int = 6,
     parse_device: str | None = None,
     chunk_size: int = 600,
+    occlusion_mode: str | None = None,
+    full_lip_thresh: float | None = None,
+    region_dilate_frac: float = 0.03,
+    region_feather_frac: float = 0.02,
+    cuts=None,
+    stats: dict | None = None,
     cancel_check: Callable[[], bool] | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> Path:
-    """Keep the ORIGINAL frame wherever the mouth is occluded / no face found.
+    """Keep the ORIGINAL pixels wherever the mouth is occluded / no face found.
 
     MuseTalk pastes a generated mouth onto each original frame.  When the mouth
-    is covered (e.g. a hand) it paints a mouth onto the occluder.  This picks,
-    per frame, between the lip-synced frame (mouth visible) and the original
-    frame (mouth occluded or no confident face), using the BiSeNet lip-presence
-    gate.  Audio is taken from *lipsync_video*.  If the parser is unavailable
-    the lip-synced video is passed through unchanged.
+    is covered it paints a mouth onto the occluder.  Two modes:
 
-    ``min_occluded_run``: the BiSeNet lip check misfires on isolated frames
-    (head turns, motion blur, wide-open mouths), so a frame is only reverted to
-    the original when it is part of a **run** of at least this many consecutive
-    occluded frames — a real hand-over-mouth lasts many frames, sporadic misses
-    do not.  This keeps normal lip-sync intact.
+    ``"frame"`` (v2): per frame, choose between the lip-synced frame (mouth
+    visible) and the original frame (mouth occluded or no confident face)
+    using the BiSeNet lip-presence gate, only inside runs of at least
+    ``min_occluded_run`` occluded frames (the lip check misfires on isolated
+    head-turn / motion-blur frames; a real hand-over-mouth lasts many).
+
+    ``"region"`` (v3): parse both the original and the lip-synced lower
+    face.  Pixels the original labels as hair / hat / clothing / background
+    — or as non-face where the generated frame put lips — are the occluder;
+    the original is pasted back only there (dilated, feathered), so the
+    mouth keeps moving around a strand of hair instead of freezing for the
+    whole run.  The whole frame is reverted only when the original has
+    essentially no lip pixels at all (``full_lip_thresh``) for a sustained
+    run.  BiSeNet labels hands as skin, so a hand is *not* caught — that
+    limit is documented, not hidden.
+
+    ``cuts`` are clip-local scdet cut indices (box interpolation never
+    bridges one); ``stats`` receives per-clip counts.  Audio is taken from
+    *lipsync_video*.  If the parser is unavailable the lip-synced video is
+    passed through unchanged.
     """
+    from ai_movie.config import OCCLUSION_FULL_LIP_THRESH, OCCLUSION_MODE
+    from ai_movie.shots import local_cuts
+
+    occlusion_mode = occlusion_mode or OCCLUSION_MODE
+    full_lip_thresh = OCCLUSION_FULL_LIP_THRESH if full_lip_thresh is None else full_lip_thresh
+    region_mode = occlusion_mode == "region"
+
     orig_video, lipsync_video, out_video = Path(orig_video), Path(lipsync_video), Path(out_video)
     if not face_parser_available():
         out_video.parent.mkdir(parents=True, exist_ok=True)
@@ -576,6 +614,8 @@ def occlusion_gate_video(
     writer = None
     processed = 0
     reverted = 0
+    region_frames = 0
+    region_px = 0.0
     try:
         while processed < total:
             if cancel_check and cancel_check():
@@ -584,6 +624,7 @@ def occlusion_gate_video(
                     writer.release()
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return out_video
+            base = processed
             ow, lw = [], []
             for _ in range(min(chunk_size, total - processed)):
                 okO, fO = capO.read(); okL, fL = capL.read()
@@ -617,10 +658,13 @@ def occlusion_gate_video(
             inv = 1.0 / det_scale
             key_boxes = [(b[0] * inv, b[1] * inv, b[2] * inv, b[3] * inv) for _, b, _s in fr]
             key_valid = [s >= conf_thresh for _, _b, s in fr]
-            boxes = _resolve_boxes(key_idx, key_boxes, key_valid, n, det_every)
+            boxes = _resolve_boxes(key_idx, key_boxes, key_valid, n, det_every,
+                                   cuts=local_cuts(cuts, base, n))
 
             # First pass: per-frame occluded flag (no confident face OR mouth
-            # has essentially no visible lip pixels).
+            # has essentially no visible lip pixels).  In region mode the
+            # per-pixel occluder is composited right here and only a total
+            # loss of lip pixels counts as "occluded" for the frame revert.
             occluded = [False] * n
             for i in range(n):
                 box = boxes[i]
@@ -636,11 +680,40 @@ def occlusion_gate_video(
                     sy = max(0, min(cy - S // 2, H - 1))
                     S = min(S, W - sx, H - sy)
                     if S > 8:
-                        par = _parse_crop(ow[i][sy:sy + S, sx:sx + S], parser, parse_dev)
+                        crop_o = ow[i][sy:sy + S, sx:sx + S]
+                        par = _parse_crop(crop_o, parser, parse_dev)
                         par = cv2.resize(par, (S, S), interpolation=cv2.INTER_NEAREST)
                         region_sel = _lower_face_mask(S) > 0.5
                         lip_px = int((np.isin(par, _LIP_CLASSES) & region_sel).sum())
-                        occluded[i] = lip_px < occlusion_lip_thresh * S * S
+                        if not region_mode:
+                            occluded[i] = lip_px < occlusion_lip_thresh * S * S
+                            continue
+                        occluded[i] = lip_px < full_lip_thresh * S * S
+                        if occluded[i]:
+                            continue
+                        crop_l = lw[i][sy:sy + S, sx:sx + S]
+                        if crop_l.shape != crop_o.shape:
+                            continue
+                        par_l = _parse_crop(crop_l, parser, parse_dev)
+                        par_l = cv2.resize(par_l, (S, S), interpolation=cv2.INTER_NEAREST)
+                        occ = region_sel & (
+                            np.isin(par, _OCCLUDER_CLASSES)
+                            | (~np.isin(par, _FACE_CLASSES) & np.isin(par_l, _LIP_CLASSES)))
+                        if not occ.any():
+                            continue
+                        m = occ.astype(np.uint8) * 255
+                        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+                        if not m.any():
+                            continue
+                        k = max(3, int(region_dilate_frac * S)) | 1
+                        m = cv2.dilate(m, np.ones((k, k), np.uint8))
+                        sig = max(1.0, region_feather_frac * S)
+                        mf = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
+                        mf = np.clip(mf, 0.0, 1.0)[..., None]
+                        blended = crop_o.astype(np.float32) * mf + crop_l.astype(np.float32) * (1 - mf)
+                        lw[i][sy:sy + S, sx:sx + S] = np.clip(blended, 0, 255).astype(np.uint8)
+                        region_frames += 1
+                        region_px += float(mf.mean())
 
             # Second pass: only revert frames in a SUSTAINED occluded run
             # (filters out sporadic BiSeNet misses on normal talking frames).
@@ -689,7 +762,15 @@ def occlusion_gate_video(
                 "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", str(out_video),
             ], check=True, capture_output=True, text=True)
         if log_cb:
-            log_cb(f"occlusion-gate done: {reverted}/{total} frames kept original")
+            log_cb(f"occlusion-gate done ({occlusion_mode}): {reverted}/{total} frames "
+                   f"kept original"
+                   + (f", {region_frames} frames region-patched" if region_mode else ""))
+        if stats is not None:
+            stats.update({"mode": occlusion_mode, "frames": int(total),
+                          "reverted_frames": int(reverted),
+                          "region_frames": int(region_frames),
+                          "region_px_mean": round(region_px / region_frames, 4)
+                          if region_frames else 0.0})
     finally:
         if capO.isOpened():
             capO.release()

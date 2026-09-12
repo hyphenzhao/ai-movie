@@ -97,6 +97,7 @@ def export_speaker_csv(segments: list[dict], path: str | Path) -> Path:
             "gender": seg.get("gender") or seg.get("tts_gender") or "",
             "spk_conf": round(float(seg.get("speaker_conf", 0.0)), 2),
             "asr_conf": round(float(seg.get("asr_conf", 0.0)), 2),
+            "overlap": seg.get("overlap", ""),
             "text": (seg.get("text") or "").strip(),
             "text_translated": (seg.get("text_translated") or "").strip(),
         })

@@ -12,6 +12,7 @@ ChatML prompt template::
 
 """
 
+import re
 import sys
 import threading
 from pathlib import Path
@@ -1734,6 +1735,114 @@ def _glossary_hit(src: str, ja: str) -> bool:
     """Whether *ja* occurs in *src* as a real term (see glossary._term_pattern)."""
     from ai_movie.glossary import _term_pattern
     return bool(_term_pattern(ja).search(src))
+
+
+_KANA_RE = re.compile(r"[぀-ゟ゠-ヿ]")
+
+
+def _visible_len(text: str) -> int:
+    from ai_movie.composer import _visible_chars
+    return _visible_chars(text)
+
+
+def compact_translation(
+    ja: str,
+    zh: str,
+    max_chars: int,
+    *,
+    glossary: dict[str, dict] | None = None,
+    context: list[str] | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    max_tries: int = 2,
+) -> str | None:
+    """Rewrite one finished Chinese line to at most *max_chars* visible chars.
+
+    Used by the compact stage on lines whose synthesized duration cannot fit
+    their time slot.  Same single-sentence rewrite channel as
+    :func:`enforce_glossary` (the drafting model, Sakura, ignores
+    constraints).  Returns ``None`` when no acceptable rewrite came back;
+    the caller then keeps the full line and lets fit/truncation handle it.
+
+    Accepted only if the candidate is non-empty, has no kana, is really
+    shorter than the original, is within budget, keeps every pinned
+    glossary term the source contains, and is not absurdly short (≥ 30 % of
+    the original) — so a rewrite can drop words but never the sentence.
+    """
+    from ai_movie.config import COMPACT_MODEL, OLLAMA_BASE_URL
+
+    model = model or COMPACT_MODEL
+    base_url = base_url or OLLAMA_BASE_URL
+    zh = (zh or "").strip()
+    ja = (ja or "").strip()
+    if not zh:
+        return None
+    n_orig = _visible_len(zh)
+    if n_orig <= max_chars:
+        return None
+
+    pins: list[str] = []
+    if glossary and ja:
+        pins = [v["zh"] for k, v in glossary.items()
+                if v.get("zh") and _glossary_hit(ja, k)]
+    pin_txt = ("；人名/术语必须保留：" + "、".join(pins)) if pins else ""
+    ctx_txt = ""
+    if context:
+        ctx_txt = "上下文（仅供理解）：\n" + "\n".join(context[-3:]) + "\n"
+
+    # The instruct model does not count characters reliably (asked for 4 it
+    # returns 6), so the budget is a *steer*: the second try asks for less,
+    # and the shortest candidate that passes the fidelity checks wins even
+    # if it is still over budget — a shorter faithful line always beats the
+    # full one, and the fit stage absorbs the remainder.
+    best: str | None = None
+    best_n = n_orig
+    budget = int(max_chars)
+    for attempt in range(max_tries):
+        ask = budget if attempt == 0 else max(2, int(budget * 0.7))
+        prompt = (
+            f"{ctx_txt}"
+            f"下面这句中文配音台词太长，念不完。请把它改写得更短：保留原意和口语感，"
+            f"去掉可有可无的词，不超过 {ask} 个汉字{pin_txt}。\n"
+            f"日文原文（参考）：{ja}\n"
+            f"待压缩：{zh}\n"
+            f"只输出压缩后的一句中文，不要解释，不要引号。"
+        )
+        try:
+            raw = _call_ollama_chat(
+                model,
+                [{"role": "system",
+                  "content": "你是中文配音台词精简助手。只输出压缩后的一句中文，不要解释。"},
+                 {"role": "user", "content": prompt}],
+                base_url, timeout=300,
+                options={"num_predict": max(48, ask * 3), "temperature": 0.0})
+        except Exception:                               # noqa: BLE001
+            break
+        cand = _clean_ollama_output(raw).strip().strip("「」『』\"'“”")
+        cand = cand.split("\n")[0].strip()
+        n = _visible_len(cand)
+        if (cand and not _KANA_RE.search(cand) and n < best_n
+                and n >= max(2, int(0.3 * n_orig))
+                and all(p in cand for p in pins)
+                and _char_overlap(cand, zh) >= 0.3):
+            best, best_n = cand, n
+            if n <= max_chars:
+                break
+    return best
+
+
+def _char_overlap(cand: str, orig: str) -> float:
+    """Fraction of the candidate's CJK characters that occur in *orig*.
+
+    A cheap fidelity check for the compact rewrite: a faithful shortening
+    reuses the original's words (0.5–1.0), whereas a hallucinated line
+    shares almost nothing (measured 0.14 on one that invented content).
+    """
+    cjk = [c for c in cand if "一" <= c <= "鿿"]
+    if not cjk:
+        return 0.0
+    pool = set(orig)
+    return sum(1 for c in cjk if c in pool) / len(cjk)
 
 
 def translate_segments(

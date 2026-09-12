@@ -497,6 +497,111 @@ def eval_lipsync_frames(state: dict, rep: Report, *, samples: int = 30,
                       f"{inside / max(inside + outside, 1):.0%} of changes)")
 
 
+# ── v3 additions ───────────────────────────────────────────────────
+
+def eval_compact(state: dict, rep: Report) -> None:
+    c = state.get("compact") or {}
+    if not c or c.get("skipped"):
+        rep.note("C5", "compact stage", "skipped" if c else "not run")
+        return
+    rows = c.get("report") or []
+    trig = 1.30
+    before = sum(1 for r in rows if r.get("ratio_before", 0) > trig)
+    after = sum(1 for r in rows if r.get("ratio_after", 0) > trig)
+    rep.note("C5", f"lines above {trig}x their slot before → after compact",
+             f"{before} → {after}")
+    rep.check("C6", "compact never lengthened a line (every accepted rewrite is shorter audio)",
+              all(r.get("ratio_after", 0) <= r.get("ratio_before", 0) + 1e-6
+                  for r in rows if r.get("status") == "rewritten"),
+              f"{c.get('rewritten', 0)}/{c.get('attempted', 0)} rewrites accepted")
+
+
+def eval_f0_gate(state: dict, rep: Report) -> None:
+    q = (state.get("tts") or {}).get("quality") or {}
+    refs = (state.get("vc") or {}).get("refs") or {}
+    if q:
+        bad = [s for s, r in q.items() if r.get("f0_ok") is False]
+        rep.check("C2c", "cloned speakers' output pitch in their gender band",
+                  not bad, f"{len(q) - len(bad)}/{len(q)} ok" + (f" (bad: {bad})" if bad else ""))
+    elif refs:
+        rep.note("C2c", "VC references chosen by output-pitch gate (auto_select_refs)",
+                 ", ".join(f"{k}={Path(str(v.get('ref_audio') or v.get('ref') or v.get('path') or '')).name}"
+                           for k, v in refs.items()) or "none")
+    else:
+        rep.note("C2c", "F0 gate", "no cloned speakers")
+
+
+def eval_cuts(state: dict, rep: Report) -> None:
+    pp = (state.get("faces") or {}).get("plan_path")
+    if not pp or not Path(pp).exists():
+        return
+    plan = json.loads(Path(pp).read_text(encoding="utf-8"))
+    cuts = set(int(c) for c in plan.get("cuts") or [])
+    frames = plan.get("frames") or {}
+    rep.note("D8a", "shot cuts detected (scdet)", len(cuts))
+    if not frames:
+        return
+    from ai_movie.faces import boxes_disjoint
+    jumps = 0
+    for k, box in frames.items():
+        f = int(k)
+        nxt = frames.get(str(f + 1))
+        if nxt is None or (f + 1) in cuts:
+            continue
+        if boxes_disjoint(box, nxt):
+            jumps += 1
+    rep.check("D8", "no target-box jump between consecutive frames inside a shot",
+              jumps == 0, jumps)
+
+
+def eval_qc(state: dict, rep: Report) -> None:
+    from ai_movie import qc as qc_mod
+    q = qc_mod.build_qc(state)
+    sm = q["summary"]
+    if not sm["n"]:
+        rep.note("F1", "QC", "no segments")
+        return
+    rep.note("F1", f"QC ({q['key']}) PASS/WARN/FAIL",
+             f"{sm['PASS']}/{sm['WARN']}/{sm['FAIL']} of {sm['n']}")
+    rep.check("F2", "QC FAIL segments ≤ 5%", sm["fail_frac"] <= 0.05,
+              f"{sm['fail_frac']:.1%}")
+    top = list(sm["reasons"].items())[:4]
+    rep.note("F3", "top QC reasons", "; ".join(f"{k}×{v}" for k, v in top) or "none")
+    if (state.get("vc") or {}).get("segments"):
+        qv = qc_mod.build_qc(state, key="vc")["summary"]
+        rep.note("F4", "QC (vc) PASS/WARN/FAIL",
+                 f"{qv['PASS']}/{qv['WARN']}/{qv['FAIL']} of {qv['n']}")
+
+
+def eval_mix(state: dict, rep: Report) -> None:
+    m = state.get("mix") or {}
+    a = m.get("audio")
+    if not a or not Path(a).exists():
+        return
+    import subprocess as _sp
+    try:
+        out = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                       "-show_entries", "stream=sample_rate,channels", "-of", "csv=p=0", a],
+                      capture_output=True, text=True, timeout=60).stdout.strip()
+        sr, ch = out.split(",")[:2]
+        rep.check("E2", "final mix is stereo at ≥ 44.1 kHz",
+                  int(ch) >= 2 and int(sr) >= 44100, f"{sr} Hz × {ch} ch")
+    except Exception as exc:                            # noqa: BLE001
+        rep.note("E2", "final mix format", f"probe failed: {exc}")
+    try:
+        r = _sp.run(["ffmpeg", "-hide_banner", "-nostats", "-i", a, "-af", "ebur128=peak=true",
+                     "-f", "null", "-"], capture_output=True, text=True, timeout=600)
+        import re as _re
+        mI = _re.findall(r"I:\s+(-?[0-9.]+) LUFS", r.stderr)
+        mP = _re.findall(r"Peak:\s+(-?[0-9.]+) dBFS", r.stderr)
+        if mI and mP:
+            lufs, tp = float(mI[-1]), float(mP[-1])
+            rep.check("E3", "integrated loudness within −16 ± 1.5 LUFS and true peak ≤ −1 dBTP",
+                      abs(lufs + 16.0) <= 1.5 and tp <= -0.9, f"{lufs} LUFS, {tp} dBTP")
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def eval_compose(state: dict, rep: Report) -> None:
     cv = state.get("compose") or {}
     v = cv.get("video")
@@ -523,6 +628,12 @@ def main() -> int:
         rep.note("D3", "frame-level lip-sync check skipped",
                  f"{type(exc).__name__}: {exc}")
     eval_compose(state, rep)
+    for fn, key in ((eval_compact, "C5"), (eval_f0_gate, "C2c"), (eval_cuts, "D8"),
+                    (eval_mix, "E2"), (eval_qc, "F1")):
+        try:
+            fn(state, rep)
+        except Exception as exc:                        # noqa: BLE001
+            rep.note(key, f"{fn.__name__} skipped", f"{type(exc).__name__}: {exc}")
 
     text = rep.render()
     print(text)

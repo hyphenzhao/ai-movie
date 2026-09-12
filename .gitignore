@@ -63,3 +63,8 @@ models/musetalk/
 
 # Pinned transformers 4.51.3 for CosyVoice2/3 subprocess (rebuild via scripts/setup_tts_transformers.sh)
 vendor/tts_transformers/
+
+# v3: isolated pyannote venv, customer deliverables, HF token
+vendor/osd_venv/
+deliver/
+asset/hf_token

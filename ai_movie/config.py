@@ -258,6 +258,15 @@ TTS_VOCALS_RMS_MIN_RATIO = 0.25
 # without rejecting usable clones.
 TTS_CLONE_MIN_SIMILARITY = 0.40
 
+# F0 gate (v3): ECAPA similarity cannot see octave collapse (the shipped
+# female reference halved every line's pitch, 232→117 Hz, while scoring
+# *higher* similarity than working clips).  A candidate reference is only
+# eligible if a probe synthesized from it lands in the speaker's gender band
+# and within this output/reference F0 ratio (see ai_movie/pitch.py).
+TTS_F0_GATE = True
+TTS_F0_RATIO_RANGE = (0.8, 1.25)
+TTS_GENDER_HZ = {"female": (165.0, 320.0), "male": (70.0, 175.0)}
+
 # ── Duration fitting (TTS → time slot) ─────────────────────────
 
 # Fit each synthesized segment into its timeline slot.  Without this the
@@ -307,6 +316,23 @@ TTS_RATE_MIN_CORRECTION = 1.20
 # Upper bound on the global correction (beyond this something else is wrong).
 TTS_RATE_MAX_CORRECTION = 2.60
 
+# ── Duration-constrained rewrite ("compact" stage, v3) ──────────
+#
+# The translator never knew how long a slot was; a Chinese line that could
+# not physically fit was sped up to 1.60× and then truncated.  After TTS the
+# real duration of every line is known, so lines whose natural duration
+# exceeds COMPACT_TRIGGER_RATIO × slot are rewritten shorter (meaning kept,
+# glossary names kept) and re-synthesized.  Measured, not predicted: SFT
+# voices run 0.17–0.20 s/char, clones up to 0.6, so a prediction-only tier
+# would rewrite the wrong lines.
+COMPACT_ENABLED = True
+COMPACT_TRIGGER_RATIO = 1.30      # natural duration / slot above which we rewrite
+COMPACT_TARGET_RATIO = 1.15       # budget the rewrite for this ratio (fit absorbs it)
+COMPACT_MAX_ROUNDS = 2            # rewrite → re-synth → re-measure, at most twice
+COMPACT_MIN_CHARS = 4             # never ask for fewer visible characters than this
+COMPACT_MODEL = "dolphin-mixtral:8x7b"   # same instruct model enforce_glossary uses
+TTS_COMPACT_SEC_PER_CHAR_DEFAULT = 0.24  # only when a speaker has no measurable lines
+
 # ── Vocal Separation settings ──────────────────────────────────
 
 # Active backend: "demucs" (GPU, reliable) or "uvr" (Mel-Band RoiFormer,
@@ -320,6 +346,32 @@ DEMUCS_MODEL = "htdemucs"
 # Requires audio-separator package + first-time model download.
 UVR_MODEL_NAME = "vocals_mel_band_roformer.ckpt"
 UVR_MODEL_FILE_DIR = str(ROOT_DIR / "models" / "uvr")
+
+# ── Production bed + mixing (v3) ───────────────────────────────
+#
+# Until v3 the demuxer extracted a 16 kHz mono wav, separation ran on that,
+# and mix_audio adopted the background's sample rate — so every final dub
+# shipped with a 16 kHz mono soundtrack regardless of the source (48 kHz
+# stereo).  The analysis chain (ASR, diarization, reference clips) still
+# wants 16 kHz mono; the *production* bed is now separated from the
+# full-rate stereo audio and the analysis stems are derived from it.
+SEPARATE_FULL_RATE_BED = True
+SEPARATE_ANALYSIS_FROM_FULL = True
+
+# Envelope ducking: the bed drops MIX_DUCK_DB under speech with a smooth
+# attack/release instead of a hard per-sample gate.
+MIX_DUCK_DB = -10.0
+MIX_DUCK_ATTACK_MS = 50.0
+MIX_DUCK_RELEASE_MS = 300.0
+
+# Each dubbed line is matched to the loudness of the original dialogue in
+# the same slot (bounded, so a mis-measured slot cannot blow a line up).
+MIX_MATCH_LOUDNESS = True
+MIX_MATCH_CLAMP_DB = 3.0
+
+# Final two-pass ffmpeg loudnorm target.
+MIX_TARGET_LUFS = -16.0
+MIX_TRUE_PEAK_DB = -1.0
 
 # ── Lip Sync settings ──────────────────────────────────────────
 
@@ -588,3 +640,69 @@ OLLAMA_SAKURA_TIMEOUT = 900     # 15 min — 14B+ models need time for cold-star
 WINDOW_TITLE = "AI Movie - 视频配音"
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
+# ── Overlapped-speech detection (v3, pyannote/segmentation-3.0 on CPU) ──
+OSD_ENABLED = True
+OSD_MODEL = "pyannote/segmentation-3.0"
+OSD_DEVICE = "cpu"
+OSD_VENV = str(ROOT_DIR / "vendor" / "osd_venv")
+# Diarization units with more overlap than this are not used as seeds for
+# the channel classifier (their pitch/mel evidence is a mixture).
+OSD_SEED_EXCLUDE = 0.5
+# Reference-clip windows with more overlap than this are rejected.
+OSD_REF_MAX_OVERLAP = 0.2
+
+# ── Shot detection (v3) ────────────────────────────────────────
+# ffmpeg scdet threshold (0–100; 10 catches hard cuts without firing on
+# fast motion).  Track interpolation and the occlusion gate never bridge a
+# detected cut.
+SHOT_DETECT = True
+SHOT_SCDET_THRESHOLD = 10.0
+
+# ── Small-face upscale route (v3) ──────────────────────────────
+# Faces narrower than FACE_MIN_WIDTH used to pass through untouched (the
+# 256² model produces mush below ~80 px).  Faces in [FACE_MIN_WIDTH_SR,
+# FACE_MIN_WIDTH) are now rendered on a 2× upscaled clip (the face is then
+# 80–160 px, inside the model's comfort zone) and scaled back.  A clip takes
+# the route when at least LIPSYNC_SR_MIN_FRAC of its anchored frames are
+# small faces.
+FACE_MIN_WIDTH_SR = 40
+LIPSYNC_SMALL_FACE_UPSCALE = True
+LIPSYNC_SR_MIN_FRAC = 0.5
+LIPSYNC_SR_MAX_CLIP_SEC = 6.0      # 2× frames cost 4× RAM; keep clips short
+
+# ── A/V offset knob (v3, experiments) ──────────────────────────
+# Milliseconds the driving audio is delayed relative to the picture when
+# cutting MuseTalk's audio clips.  Positive = audio later.  Measured lag is
+# 0 frames (Documentation/v2-quality-upgrade.md), so the default is 0; the
+# knob exists so scripts/ab_offset.py can sweep it.
+LIPSYNC_AUDIO_OFFSET_MS = 0
+
+# ── Occlusion handling (v3) ────────────────────────────────────
+# "frame":  revert the whole frame to the original when the mouth is
+#           occluded for ≥ 6 consecutive frames (v2 behaviour).
+# "region": paste the original back only where an occluder (hair, hat,
+#           clothing, background — anything BiSeNet does not call face) sits
+#           in the lower face; the whole frame is reverted only when there
+#           are essentially no lip pixels at all (OCCLUSION_FULL_LIP_THRESH).
+#           Hands are labelled skin by BiSeNet and are NOT caught by this.
+OCCLUSION_MODE = "frame"
+OCCLUSION_FULL_LIP_THRESH = 0.0005
+
+# ── MuseTalk paste fusion (v3, patches/musetalk_fusion.patch) ──
+# "alpha":     single feathered jaw mask (upstream behaviour, 8 % feather).
+# "laplacian": three-layer mask (generated mouth interior + lips, original
+#              outer face) blended through a Laplacian pyramid.
+MUSETALK_FUSION = "alpha"
+
+# ── Per-segment QC thresholds (v3, ai_movie/qc.py) ─────────────
+QC_ASR_CONF_WARN = 0.5
+QC_SPEAKER_CONF_WARN = 0.6
+QC_FIT_WARN = 1.25
+QC_FIT_FAIL = 1.60
+QC_OVERRUN_WARN = 0.15
+QC_OVERRUN_FAIL = 0.30
+QC_GATED_FRAC_WARN = 0.5
+QC_OVERLAP_WARN = 0.3
+QC_OVERLAP_FAIL = 0.6
+QC_CLONE_SIM_WARN = TTS_CLONE_MIN_SIMILARITY
+QC_MIX_GAIN_WARN = 2.9

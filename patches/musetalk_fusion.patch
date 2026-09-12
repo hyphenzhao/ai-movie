@@ -1,0 +1,221 @@
+--- a/scripts/inference.py	2026-09-12 10:56:37.125534459 +0800
++++ b/scripts/inference.py	2026-09-12 11:02:19.919924967 +0800
+@@ -15,7 +15,7 @@
+ from transformers import WhisperModel
+ import sys
+ 
+-from musetalk.utils.blending import get_image
++from musetalk.utils.blending import get_image, get_image_fusion
+ from musetalk.utils.face_parsing import FaceParsing
+ from musetalk.utils.audio_processor import AudioProcessor
+ from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
+@@ -188,6 +188,10 @@
+             box_smooth = int(_task.get("box_smooth", args.box_smooth))
+             sharpen = float(_task.get("sharpen", args.sharpen))
+             paste_interp = _INTERP.get(str(_task.get("paste_interp", args.paste_interp)), cv2.INTER_CUBIC)
++            # ai-movie (fusion patch): paste mode and the VAE-only ablation
++            # are per task too, so an A/B renders in one process.
++            fusion = str(_task.get("fusion", args.fusion))
++            vae_only = bool(_task.get("vae_only", args.vae_only))
+ 
+             # Extract audio features.  For a video input pin the number of
+             # audio windows to the number of frames: the output is then exactly
+@@ -308,7 +312,13 @@
+                 audio_feature_batch = pe(whisper_batch)
+                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                 
+-                pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
++                if vae_only:
++                    # Ablation: skip the UNet and round-trip the unmasked
++                    # reference half of the latent through the VAE, so the
++                    # output isolates VAE + paste loss from mouth generation.
++                    pred_latents = latent_batch[:, 4:]
++                else:
++                    pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                 recon = vae.decode_latents(pred_latents)
+                 for res_frame in recon:
+                     res_frame_list.append(res_frame)
+@@ -347,7 +357,11 @@
+                                                flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+                 
+                 # Merge results with version-specific parameters
+-                if args.version == "v15":
++                if fusion != "alpha":
++                    combine_frame = get_image_fusion(ori_frame, res_frame, [x1, y1, x2, y2],
++                                                     mode=args.parsing_mode if args.version == "v15" else "raw",
++                                                     fp=fp, fusion=fusion)
++                elif args.version == "v15":
+                     combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                 else:
+                     combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+@@ -405,6 +419,12 @@
+                         help="unsharp-mask amount applied to the generated face before paste; 0 = off")
+     parser.add_argument("--paste_interp", type=str, default="cubic", choices=list(_INTERP),
+                         help="interpolation used when the 256² render is scaled UP to the face box")
++    parser.add_argument("--fusion", type=str, default="alpha", choices=["alpha", "laplacian"],
++                        help="paste mode: 'alpha' = one feathered jaw mask (upstream); "
++                             "'laplacian' = generated mouth+lips over the original outer face, "
++                             "blended per pyramid band")
++    parser.add_argument("--vae_only", action="store_true",
++                        help="ablation: bypass the UNet and round-trip the crop through the VAE")
+     parser.add_argument("--target_bbox_json", type=str, default=None,
+                         help="JSON with {'frames': {frame_index: [x1,y1,x2,y2]}} naming "
+                              "which face to drive per frame; frames absent from the map "
+--- a/musetalk/utils/blending.py	2026-09-12 10:56:37.126136301 +0800
++++ b/musetalk/utils/blending.py	2026-09-12 11:02:04.909595263 +0800
+@@ -94,6 +94,129 @@
+     return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
+ 
+ 
++# ── ai-movie fusion patch ─────────────────────────────────────────────
++#
++# ``get_image`` pastes the whole generated lower face through ONE feathered
++# silhouette mask.  The 256² VAE render is softer than the source, so the
++# feather is also where the sharp original cheek/chin meets the soft
++# generated one — visible as a halo, and the reason CodeFormer had to be
++# run over the paste afterwards.  ``get_image_fusion`` keeps the *original*
++# outer face and takes only what actually changed from the render: the
++# mouth interior and the lips (parsed from the generated crop), with a
++# weight that ramps from 1 there to 0 at the jaw silhouette.  With
++# ``fusion="laplacian"`` the two are merged per frequency band (Burt-Adelson
++# pyramid) so low frequencies blend over a wide area and edges over a narrow
++# one — no halo, no seam.
++
++def _laplacian_blend(gen, orig, w, levels=4):
++    """Blend ``gen`` over ``orig`` with per-pixel weight ``w`` via a Laplacian pyramid.
++
++    ``gen``/``orig``: float32 HxWx3, ``w``: float32 HxW in [0, 1].
++    """
++    H, W = orig.shape[:2]
++    m = 2 ** levels
++    Hp, Wp = ((H + m - 1) // m) * m, ((W + m - 1) // m) * m
++
++    def _pad(x):
++        return cv2.copyMakeBorder(x, 0, Hp - H, 0, Wp - W, cv2.BORDER_REFLECT_101)
++
++    ga, gb, gw = [_pad(gen)], [_pad(orig)], [_pad(w)]
++    for _ in range(levels):
++        ga.append(cv2.pyrDown(ga[-1]))
++        gb.append(cv2.pyrDown(gb[-1]))
++        gw.append(cv2.pyrDown(gw[-1]))
++    la, lb = [], []
++    for i in range(levels):
++        size = (ga[i].shape[1], ga[i].shape[0])
++        la.append(ga[i] - cv2.pyrUp(ga[i + 1], dstsize=size))
++        lb.append(gb[i] - cv2.pyrUp(gb[i + 1], dstsize=size))
++    la.append(ga[-1])
++    lb.append(gb[-1])
++    blended = []
++    for i in range(levels + 1):
++        wi = gw[i][..., None]
++        blended.append(la[i] * wi + lb[i] * (1.0 - wi))
++    out = blended[-1]
++    for i in range(levels - 1, -1, -1):
++        size = (blended[i].shape[1], blended[i].shape[0])
++        out = cv2.pyrUp(out, dstsize=size) + blended[i]
++    return out[:H, :W]
++
++
++def get_image_fusion(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5,
++                     mode="jaw", fp=None, fusion="laplacian", levels=4,
++                     lip_dilate_frac=0.02, ramp_frac=0.12, feather_frac=0.08):
++    """Three-layer paste: generated mouth interior + lips, original outer face.
++
++    Same geometry as ``get_image`` (expanded crop, face-box mask, lower half
++    only).  ``fusion="alpha"`` blends the three-layer weight linearly;
++    ``"laplacian"`` blends it per pyramid band.  Falls back to ``get_image``
++    if the parser yields nothing usable.
++    """
++    body = Image.fromarray(image[:, :, ::-1])
++    face_pil = Image.fromarray(face[:, :, ::-1])
++
++    x, y, x1, y1 = face_box
++    crop_box, s = get_crop_box(face_box, expand)
++    x_s, y_s, x_e, y_e = crop_box
++
++    face_large = body.crop(crop_box)                    # original, padded if off-frame
++    ori_shape = face_large.size                         # (W, H)
++    cw, ch = ori_shape
++    if cw < 16 or ch < 16 or fp is None:
++        return get_image(image, face, face_box, upper_boundary_ratio, expand, mode, fp)
++
++    gen_large = face_large.copy()
++    gen_large.paste(face_pil, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))
++
++    # 1. jaw silhouette from the ORIGINAL (what get_image uses), un-blurred
++    jaw_img = face_seg(face_large, mode=mode, fp=fp)
++    if jaw_img is None:
++        return get_image(image, face, face_box, upper_boundary_ratio, expand, mode, fp)
++    jaw = np.array(jaw_img, dtype=np.uint8)
++    box_mask = np.zeros((ch, cw), dtype=np.uint8)
++    box_mask[max(0, y - y_s):max(0, y1 - y_s), max(0, x - x_s):max(0, x1 - x_s)] = 1
++    top = int(ch * upper_boundary_ratio)
++    box_mask[:top, :] = 0
++    jaw = (jaw > 127).astype(np.uint8) * box_mask
++
++    # 2. mouth interior + lips from the GENERATED crop
++    par_g = fp(gen_large, raw_classes=True)
++    par_g = cv2.resize(par_g, (cw, ch), interpolation=cv2.INTER_NEAREST)
++    mouth = (par_g == 11).astype(np.uint8)
++    lips = np.isin(par_g, [12, 13]).astype(np.uint8)
++    k = max(3, int(lip_dilate_frac * cw)) | 1
++    lips = cv2.dilate(lips, np.ones((k, k), np.uint8))
++    gen_region = ((mouth | lips) & box_mask).astype(np.uint8)
++    if gen_region.sum() < 16:
++        # Parser found no mouth in the render — nothing to take from it.
++        return get_image(image, face, face_box, upper_boundary_ratio, expand, mode, fp)
++
++    # 3. weight: 1 on the generated region, ramping to 0 across the outer
++    #    face, and never beyond the (softened) jaw silhouette
++    dist = cv2.distanceTransform((1 - gen_region).astype(np.uint8), cv2.DIST_L2, 5)
++    ramp = max(4.0, ramp_frac * cw)
++    w = np.clip(1.0 - dist / ramp, 0.0, 1.0).astype(np.float32)
++    kf = int(feather_frac * cw // 2 * 2) + 1
++    jaw_soft = cv2.GaussianBlur(jaw.astype(np.float32) * 255.0, (kf, kf), 0) / 255.0
++    w = np.minimum(w, jaw_soft)
++    w[:top, :] = 0.0
++
++    gen_np = np.array(gen_large, dtype=np.float32)
++    ori_np = np.array(face_large, dtype=np.float32)
++    if fusion == "laplacian":
++        out = _laplacian_blend(gen_np, ori_np, w, levels=levels)
++    else:
++        out = gen_np * w[..., None] + ori_np * (1.0 - w[..., None])
++    # Pixels the weight never touched stay bit-exact original.
++    untouched = (w <= 1e-4)[..., None]
++    out = np.where(untouched, ori_np, out)
++    out = np.clip(out, 0, 255).astype(np.uint8)
++
++    body.paste(Image.fromarray(out), crop_box[:2])
++    return np.array(body)[:, :, ::-1]
++
++
+ def get_image_blending(image, face, face_box, mask_array, crop_box):
+     body = Image.fromarray(image[:,:,::-1])
+     face = Image.fromarray(face[:,:,::-1])
+--- a/musetalk/utils/face_parsing/__init__.py	2026-09-12 10:56:37.126723375 +0800
++++ b/musetalk/utils/face_parsing/__init__.py	2026-09-12 11:01:37.167390352 +0800
+@@ -74,7 +74,7 @@
+             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+         ])
+ 
+-    def __call__(self, image, size=(512, 512), mode="raw"):
++    def __call__(self, image, size=(512, 512), mode="raw", raw_classes=False):
+         if isinstance(image, str):
+             image = Image.open(image)
+ 
+@@ -88,7 +88,13 @@
+                 img = torch.unsqueeze(img, 0)
+             out = self.net(img)[0]
+             parsing = out.squeeze(0).cpu().numpy().argmax(0)
+-            
++
++            # ai-movie (fusion patch): the raw CelebAMask-HQ class map, for
++            # callers that build their own masks (mouth interior / lips /
++            # outer face) instead of one thresholded silhouette.
++            if raw_classes:
++                return parsing.astype(np.uint8)
++
+             # Add 14:neck, remove 10:nose and 7:8:9
+             if mode == "neck":
+                 parsing[np.isin(parsing, [1, 11, 12, 13, 14])] = 255

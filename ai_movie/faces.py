@@ -254,26 +254,38 @@ def detect_face_tracks(
             "det_every": det_every, "tracks": kept}
 
 
+def boxes_disjoint(box_a, box_b) -> bool:
+    """Geometric shot-change guard shared with ``face_restore._resolve_boxes``.
+
+    True when two boxes cannot be the same face a few frames apart: the
+    centre moved more than 0.6× the face size, or the size changed by more
+    than 1.8×.  Boxes are ``[x1, y1, x2, y2]``.
+    """
+    ca = ((box_a[0] + box_a[2]) / 2, (box_a[1] + box_a[3]) / 2)
+    cb = ((box_b[0] + box_b[2]) / 2, (box_b[1] + box_b[3]) / 2)
+    sa = max(box_a[2] - box_a[0], box_a[3] - box_a[1])
+    sb = max(box_b[2] - box_b[0], box_b[3] - box_b[1])
+    dist = float(np.hypot(cb[0] - ca[0], cb[1] - ca[1]))
+    return dist > 0.6 * max(sa, sb) or max(sa, sb) > 1.8 * max(min(sa, sb), 1e-6)
+
+
 def interpolate_track(track: dict, n_frames: int,
-                      *, det_every: int = FACE_DET_EVERY) -> dict[int, list[float]]:
+                      *, det_every: int = FACE_DET_EVERY,
+                      cuts=None) -> dict[int, list[float]]:
     """Fill in every frame of a track by interpolating between keyframes.
 
-    Refuses to interpolate across an apparent scene cut — the same guard
-    ``face_restore._resolve_boxes`` uses — so a track never smears a box
-    across a hard shot change.
+    Refuses to interpolate across a shot change — an explicit ``scdet`` cut
+    (``cuts``, see ``ai_movie.shots``) or the geometric guard
+    ``boxes_disjoint`` — so a track never smears a box across a hard cut.
     """
+    from ai_movie.shots import crosses_cut
     kfs = {int(k): v for k, v in track["keyframes"].items()}
     keys = sorted(kfs)
     out: dict[int, list[float]] = {}
     for a, b in zip(keys, keys[1:]):
         box_a, box_b = kfs[a], kfs[b]
         out[a] = box_a
-        ca = ((box_a[0] + box_a[2]) / 2, (box_a[1] + box_a[3]) / 2)
-        cb = ((box_b[0] + box_b[2]) / 2, (box_b[1] + box_b[3]) / 2)
-        sa = max(box_a[2] - box_a[0], box_a[3] - box_a[1])
-        sb = max(box_b[2] - box_b[0], box_b[3] - box_b[1])
-        dist = float(np.hypot(cb[0] - ca[0], cb[1] - ca[1]))
-        cut = dist > 0.6 * max(sa, sb) or max(sa, sb) > 1.8 * max(min(sa, sb), 1e-6)
+        cut = boxes_disjoint(box_a, box_b) or crosses_cut(a, b, cuts)
         if cut or (b - a) > det_every * (FACE_TRACK_MAX_GAP + 1):
             continue
         for f in range(a + 1, b):
@@ -282,11 +294,14 @@ def interpolate_track(track: dict, n_frames: int,
     if keys:
         out[keys[-1]] = kfs[keys[-1]]
         # Hold the first/last keyframe box over the surrounding det_every window
-        # so a range boundary doesn't land on a missing frame.
+        # so a range boundary doesn't land on a missing frame — but never
+        # across a cut.
         for f in range(max(0, keys[0] - det_every), keys[0]):
-            out[f] = kfs[keys[0]]
+            if not crosses_cut(f, keys[0], cuts):
+                out[f] = kfs[keys[0]]
         for f in range(keys[-1] + 1, min(n_frames, keys[-1] + det_every + 1)):
-            out[f] = kfs[keys[-1]]
+            if not crosses_cut(keys[-1], f, cuts):
+                out[f] = kfs[keys[-1]]
     return out
 
 
@@ -515,18 +530,20 @@ def estimate_track_pose(
 
 
 def interpolate_scalar(values: dict[int, float], n_frames: int,
-                       *, det_every: int = FACE_DET_EVERY) -> dict[int, float]:
+                       *, det_every: int = FACE_DET_EVERY,
+                       cuts=None) -> dict[int, float]:
     """Per-frame linear interpolation of a per-keyframe scalar (e.g. yaw).
 
-    Mirrors ``interpolate_track``'s hold-at-the-ends behaviour so every frame
-    that has a box also has a value.
+    Mirrors ``interpolate_track``'s hold-at-the-ends and never-across-a-cut
+    behaviour so every frame that has a box also has a value.
     """
+    from ai_movie.shots import crosses_cut
     kfs = {int(k): float(v) for k, v in values.items()}
     keys = sorted(kfs)
     out: dict[int, float] = {}
     for a, b in zip(keys, keys[1:]):
         out[a] = kfs[a]
-        if (b - a) > det_every * (FACE_TRACK_MAX_GAP + 1):
+        if (b - a) > det_every * (FACE_TRACK_MAX_GAP + 1) or crosses_cut(a, b, cuts):
             continue
         for f in range(a + 1, b):
             w = (f - a) / float(b - a)
@@ -534,9 +551,34 @@ def interpolate_scalar(values: dict[int, float], n_frames: int,
     if keys:
         out[keys[-1]] = kfs[keys[-1]]
         for f in range(max(0, keys[0] - det_every), keys[0]):
-            out[f] = kfs[keys[0]]
+            if not crosses_cut(f, keys[0], cuts):
+                out[f] = kfs[keys[0]]
         for f in range(keys[-1] + 1, min(n_frames, keys[-1] + det_every + 1)):
-            out[f] = kfs[keys[-1]]
+            if not crosses_cut(keys[-1], f, cuts):
+                out[f] = kfs[keys[-1]]
+    return out
+
+
+def _median_filter_runs(ids: list[int], flag_of, k: int) -> set[int]:
+    """Median-filter a per-frame boolean over contiguous runs of *ids*."""
+    if not ids:
+        return set()
+    out: set[int] = set()
+    runs: list[list[int]] = [[ids[0]]]
+    for f in ids[1:]:
+        if f == runs[-1][-1] + 1:
+            runs[-1].append(f)
+        else:
+            runs.append([f])
+    for run in runs:
+        bad = np.array([bool(flag_of(f)) for f in run], dtype=bool)
+        if k > 1 and len(run) >= k:
+            pad = k // 2
+            padded = np.concatenate([np.repeat(bad[:1], pad), bad, np.repeat(bad[-1:], pad)])
+            bad = np.array([np.median(padded[i:i + k]) > 0.5 for i in range(len(run))])
+        elif k > 1:
+            bad[:] = bad.mean() > 0.5
+        out.update(f for f, g in zip(run, bad) if g)
     return out
 
 
@@ -548,41 +590,48 @@ def gate_frames(
     yaw_max: float = FACE_YAW_MAX,
     min_width: float = FACE_MIN_WIDTH,
     smooth: int = FACE_GATE_SMOOTH,
-) -> set[int]:
+    min_width_sr: float | None = None,
+) -> set[int] | tuple[set[int], set[int]]:
     """Frames MuseTalk should NOT paint: hard profiles and tiny faces.
 
     Decided per contiguous run of frames and median-filtered over *smooth*
     frames, so the mouth never flips between synced and original for a
     handful of frames.  A frame with no yaw estimate is never gated by yaw.
+
+    With ``min_width_sr`` (v3 small-face route) the function returns
+    ``(gated, sr_frames)``: faces in ``[min_width_sr, min_width)`` are *not*
+    gated but flagged for rendering on a 2× upscaled clip.  Without it the
+    v2 single-set return is kept for older callers.
     """
     if not frame_ids:
-        return set()
+        return (set(), set()) if min_width_sr is not None else set()
     ids = sorted(frame_ids)
-    gated: set[int] = set()
-    runs: list[list[int]] = [[ids[0]]]
-    for f in ids[1:]:
-        if f == runs[-1][-1] + 1:
-            runs[-1].append(f)
-        else:
-            runs.append([f])
     k = max(1, int(smooth) | 1)
-    for run in runs:
-        bad = np.zeros(len(run), dtype=bool)
-        for i, f in enumerate(run):
-            b = boxes.get(f)
-            if b is None:
-                continue
-            w = b[2] - b[0]
-            y = yaw.get(f)
-            bad[i] = (w < min_width) or (y is not None and abs(y) > yaw_max)
-        if k > 1 and len(run) >= k:
-            pad = k // 2
-            padded = np.concatenate([np.repeat(bad[:1], pad), bad, np.repeat(bad[-1:], pad)])
-            bad = np.array([np.median(padded[i:i + k]) > 0.5 for i in range(len(run))])
-        elif k > 1:
-            bad[:] = bad.mean() > 0.5
-        gated.update(f for f, g in zip(run, bad) if g)
-    return gated
+
+    def _w(f):
+        b = boxes.get(f)
+        return None if b is None else (b[2] - b[0])
+
+    def _yaw_bad(f):
+        y = yaw.get(f)
+        return y is not None and abs(y) > yaw_max
+
+    lo = float(min_width_sr) if min_width_sr is not None else float(min_width)
+
+    def _bad(f):
+        w = _w(f)
+        return False if w is None else (w < lo or _yaw_bad(f))
+
+    gated = _median_filter_runs(ids, _bad, k)
+    if min_width_sr is None:
+        return gated
+
+    def _small(f):
+        w = _w(f)
+        return False if w is None else (lo <= w < float(min_width))
+
+    sr = _median_filter_runs(ids, _small, k) - gated
+    return gated, sr
 
 
 # ── active-speaker heuristic ───────────────────────────────────────
@@ -877,11 +926,20 @@ def build_face_plan(
     yaw_max: float = FACE_YAW_MAX,
     min_width: float = FACE_MIN_WIDTH,
     gate_smooth: int = FACE_GATE_SMOOTH,
+    min_width_sr: float | None = None,
+    cuts: list[int] | None = None,
     progress_cb: Callable[[str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     **det_kw,
 ) -> dict:
     """End-to-end: tracks → gender → binding → per-frame target boxes.
+
+    v3: ``cuts`` (scdet shot boundaries; detected automatically when
+    ``SHOT_DETECT`` and not given) stop interpolation across a cut, and
+    ``min_width_sr`` (default ``FACE_MIN_WIDTH_SR`` when
+    ``LIPSYNC_SMALL_FACE_UPSCALE``) routes faces in ``[min_width_sr,
+    min_width)`` to the 2× upscale render instead of gating them —
+    ``plan["frames_sr"]`` lists those frames.
 
     ``frames`` maps a frame index to the box MuseTalk must drive, or omits it
     entirely when that frame should pass through unmodified.
@@ -933,13 +991,27 @@ def build_face_plan(
                     "votes": t.get("votes", 0)}
           for t in plan["tracks"]}
 
+    from ai_movie.config import (FACE_MIN_WIDTH_SR, LIPSYNC_SMALL_FACE_UPSCALE,
+                                 SHOT_DETECT)
+    if min_width_sr is None and LIPSYNC_SMALL_FACE_UPSCALE:
+        min_width_sr = float(FACE_MIN_WIDTH_SR)
+    if cuts is None and SHOT_DETECT:
+        from ai_movie.shots import detect_cuts
+        _say("切镜检测中…")
+        cache_dir = cache_path.parent if cache_path else None
+        cuts = detect_cuts(video_path,
+                           cache=(cache_dir / "shots_cache.json") if cache_dir else None)
+        _say(f"切镜：{len(cuts)} 处")
+    cuts = sorted(int(c) for c in (cuts or []))
+
     _say("说话人与人脸绑定中…")
     bindings = bind_speakers_to_tracks(
         plan, tg, segments, video_path=video_path,
         require_gender_match=require_gender_match)
 
     per_track = {t["id"]: interpolate_track(t, plan["n_frames"],
-                                            det_every=plan.get("det_every", 5))
+                                            det_every=plan.get("det_every", 5),
+                                            cuts=cuts)
                  for t in plan["tracks"]}
 
     # Speakers no single track could cover (cut-heavy footage fragments one
@@ -953,14 +1025,19 @@ def build_face_plan(
             plan, tg, segments, per_track, unbound, video_path=video_path)
 
     per_track_yaw = {t["id"]: interpolate_scalar(t.get("yaw") or {}, plan["n_frames"],
-                                                 det_every=plan.get("det_every", 5))
+                                                 det_every=plan.get("det_every", 5),
+                                                 cuts=cuts)
                      for t in plan["tracks"]}
 
+    from ai_movie.shots import shot_id_for
     fps = plan["fps"]
     frames: dict[int, list[float]] = {}
     frame_yaw: dict[int, float] = {}
+    frames_sr: set[int] = set()
     ranges: list[tuple[float, float]] = []
     segment_gated: dict[int, int] = {}
+    segment_sr: dict[int, int] = {}
+    segment_cuts: dict[int, int] = {}
     n_gated = 0
     # lip_sync pads each speech range (0.5 s before / 0.3 s after) for a
     # smooth transition; the plan has to cover that padding too, otherwise the
@@ -980,13 +1057,25 @@ def build_face_plan(
                 cand[f] = [round(x, 1) for x in box]
         if not cand:
             continue
-        # Hard profiles / tiny faces keep the original footage (see config).
-        gated = gate_frames(list(cand), cand, per_track_yaw[tid],
-                            yaw_max=yaw_max, min_width=min_width,
-                            smooth=gate_smooth)
+        # Hard profiles / tiny faces keep the original footage (see config);
+        # small-but-not-tiny faces go to the 2× render.
+        gated, sr = gate_frames(list(cand), cand, per_track_yaw[tid],
+                                yaw_max=yaw_max, min_width=min_width,
+                                smooth=gate_smooth,
+                                min_width_sr=min_width_sr if min_width_sr is not None
+                                else float(min_width))
+        if min_width_sr is None:
+            sr = set()
         if gated:
             segment_gated[i] = len(gated)
             n_gated += len(gated)
+        if sr:
+            segment_sr[i] = len(sr)
+            frames_sr.update(sr)
+        s_id = shot_id_for(a, cuts)
+        e_id = shot_id_for(b, cuts)
+        if e_id != s_id:
+            segment_cuts[i] = e_id - s_id
         got = 0
         for f, box in cand.items():
             if f in gated:
@@ -1000,8 +1089,12 @@ def build_face_plan(
             ranges.append((float(seg["start"]), float(seg["end"])))
     if n_gated:
         _log(f"yaw/size gate: {n_gated} frames pass through "
-             f"(|yaw|>{yaw_max:.0f}° or width<{min_width}px) "
+             f"(|yaw|>{yaw_max:.0f}° or width<{min_width_sr if min_width_sr is not None else min_width}px) "
              f"across {len(segment_gated)} segments")
+    if frames_sr:
+        _log(f"small-face route: {len(frames_sr)} frames "
+             f"({min_width_sr}–{min_width}px) will render at 2× "
+             f"across {len(segment_sr)} segments")
 
     out = {
         "video": str(video_path),
@@ -1016,8 +1109,14 @@ def build_face_plan(
         "frames": {str(k): v for k, v in sorted(frames.items())},
         "frame_yaw": {str(k): v for k, v in sorted(frame_yaw.items())},
         "gate": {"yaw_max": yaw_max, "min_width": min_width,
-                 "smooth": gate_smooth, "gated_frames": n_gated},
+                 "min_width_sr": min_width_sr,
+                 "smooth": gate_smooth, "gated_frames": n_gated,
+                 "sr_frames": len(frames_sr)},
         "segment_gated": {str(k): v for k, v in sorted(segment_gated.items())},
+        "segment_sr": {str(k): v for k, v in sorted(segment_sr.items())},
+        "segment_cuts": {str(k): v for k, v in sorted(segment_cuts.items())},
+        "frames_sr": sorted(frames_sr),
+        "cuts": cuts,
         "sync_ranges": ranges,
         "_tracks_full": plan["tracks"],
     }

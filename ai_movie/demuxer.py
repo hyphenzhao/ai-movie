@@ -8,12 +8,46 @@ from ai_movie.cutter import get_duration_seconds
 from ai_movie.utils import ensure_dir
 
 
+def probe_audio_stream(video_path: Path) -> dict:
+    """Sample rate / channel count of the first audio stream (0/0 if none)."""
+    try:
+        out = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,channels",
+            "-of", "csv=p=0", str(video_path),
+        ], check=True, capture_output=True, text=True).stdout.strip()
+        sr, ch = out.split(",")[:2]
+        return {"sample_rate": int(sr), "channels": int(ch)}
+    except Exception:                                   # noqa: BLE001
+        return {"sample_rate": 0, "channels": 0}
+
+
+def extract_full_audio(video_path: Path, dst: Path) -> dict:
+    """Full-rate stereo PCM for the production bed (see composer.mix_audio).
+
+    Keeps the source sample rate; anything wider than stereo is downmixed
+    to two channels (no 5.1 material in the test corpus, and the mixer
+    places speech identically on every channel anyway).
+    """
+    info = probe_audio_stream(video_path)
+    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-c:a", "pcm_s24le"]
+    if info["channels"] > 2:
+        cmd += ["-ac", "2"]
+    cmd.append(str(dst))
+    subprocess.run(cmd, check=True, capture_output=True)
+    if info["channels"] > 2:
+        info["channels"] = 2
+    return {"audio_full": str(dst), **info}
+
+
 def demux_video(video_path: Path, out_dir: Path) -> dict:
-    """Split a single video into silent video + audio WAV.
+    """Split a single video into silent video + audio WAVs.
 
     Returns
     -------
-    dict with keys ``video``, ``audio``, ``duration``.
+    dict with keys ``video``, ``audio`` (16 kHz mono — the analysis track),
+    ``audio_full`` (source rate, stereo — the production bed source),
+    ``sample_rate``, ``channels``, ``duration``.
     """
     out_dir = ensure_dir(out_dir)
 
@@ -27,18 +61,23 @@ def demux_video(video_path: Path, out_dir: Path) -> dict:
         str(silent_video),
     ], check=True, capture_output=True)
 
-    # Audio track: 16 kHz mono WAV
+    # Audio track: 16 kHz mono WAV (ASR / diarization / reference clips).
+    # This command is deliberately unchanged from v2 so cached analysis
+    # results stay byte-identical.
     subprocess.run([
         "ffmpeg", "-y", "-i", str(video_path),
         "-vn", "-ar", "16000", "-ac", "1",
         str(audio),
     ], check=True, capture_output=True)
 
+    full = extract_full_audio(video_path, out_dir / "audio_full.wav")
+
     duration = get_duration_seconds(video_path)
     return {
         "video": str(silent_video),
         "audio": str(audio),
         "duration": duration,
+        **full,
     }
 
 

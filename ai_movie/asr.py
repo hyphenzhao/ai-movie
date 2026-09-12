@@ -710,6 +710,7 @@ def _finalize_segments(
     word_stream = words or segmenter.segments_to_words(raw_segments)
     turns = (diarization or {}).get("turns")
     speakers = (diarization or {}).get("speakers") or {}
+    overlap_regions = (diarization or {}).get("overlap_regions") or []
 
     pieces = segmenter.split_into_sentences(
         word_stream,
@@ -736,6 +737,10 @@ def _finalize_segments(
             d["gender"] = gender
             # Back-compat alias — lip_sync.py / app.py still read tts_gender.
             d["tts_gender"] = gender
+        if overlap_regions:
+            from ai_movie.osd import overlap_ratio
+            d["overlap"] = round(overlap_ratio(overlap_regions, piece["start"],
+                                               piece["end"]), 3)
         out.append(d)
         if segment_cb:
             segment_cb(d)

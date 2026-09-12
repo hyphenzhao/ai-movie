@@ -610,6 +610,7 @@ def diarize_file(
     segments: list[dict] | None = None,
     device: str = DIARIZE_DEVICE,
     progress_cb: Callable[[str], None] | None = None,
+    overlap_regions: list | None = None,
 ) -> dict:
     """Diarize one audio file.
 
@@ -689,8 +690,22 @@ def diarize_file(
             fa, fb = int(s_ * fps), min(int(e_ * fps), len(ok))
             confs.append(_acoustic_conf(val, cut,
                                         int(ok[fa:fb].sum()) if fb > fa else 0))
+        # Units where two people speak (OSD) measure a mixture: they are
+        # neither seeds for the channel classifier nor eligible for its
+        # override — their pitch label stands, flagged for review downstream.
+        exclude: set[int] = set()
+        if overlap_regions:
+            from ai_movie.config import OSD_SEED_EXCLUDE
+            from ai_movie.osd import unit_overlap
+            u_ov = unit_overlap(overlap_regions, units)
+            exclude = {i for i, r in enumerate(u_ov) if r > OSD_SEED_EXCLUDE}
+            for i in exclude:
+                confs[i] = 0.0
+            if exclude:
+                _say(f"重叠语音：{len(exclude)} 个单元不参与声道分类")
         genders, chan_info = _refine_with_channel(pitch_audio, units,
-                                                  genders, confs)
+                                                  genders, confs,
+                                                  exclude=exclude)
         if chan_info.get("overridden"):
             _say(f"声道特征修正 {chan_info['overridden']} 段"
                  f"（交叉验证 {chan_info.get('cv_accuracy')}）")
@@ -756,16 +771,23 @@ def diarize_file(
                                          int(ok[fa:fb].sum()) if fb > fa else 0), 2),
         })
 
+    if overlap_regions:
+        from ai_movie.osd import overlap_ratio as _ovr
+        for row in unit_rows:
+            row["overlap"] = round(_ovr(overlap_regions, row["start"], row["end"]), 3)
+
     return {
         "turns": turns,
         "speakers": speakers,
         "num_speakers": len(speakers),
-        "backend": "f0+channel" + ("+ecapa" if sub_info else ""),
+        "backend": "f0+channel" + ("+ecapa" if sub_info else "")
+                   + ("+osd" if overlap_regions else ""),
         "pitch": pinfo,
         "cut_hz": cut,
         "subsplit": sub_info,
         "channel": chan_info,
         "units": unit_rows,
+        "overlap_regions": list(overlap_regions or []),
     }
 
 
@@ -806,8 +828,12 @@ def _refine_with_channel(
     *,
     min_conf: float = 0.45,
     min_seeds: int = 6,
+    exclude: set[int] | None = None,
 ) -> tuple[list[str], dict]:
     """Re-label low-pitch-confidence units with a seeded channel classifier.
+
+    ``exclude``: unit indices (overlapped speech) that are neither seeds nor
+    override candidates.
 
     Units whose pitch is unambiguous become training seeds; the classifier
     then decides the ones where pYIN found too few voiced frames (a short,
@@ -864,8 +890,9 @@ def _refine_with_channel(
 
     out = list(genders)
     changed = 0
+    exclude = exclude or set()
     for i in range(len(units)):
-        if confs[i] >= min_conf or i not in pos:
+        if confs[i] >= min_conf or i not in pos or i in exclude:
             continue
         pf = float(p_female[pos[i]])
         if pf < 0.35 or pf > 0.65:              # only act when it is decisive
@@ -1209,8 +1236,13 @@ def extract_speaker_references(
     max_dur: float | None = None,
     target_dur: float | None = None,
     n_alternatives: int = 2,
+    overlap_regions: list | None = None,
 ) -> dict[str, dict]:
     """Pick one clean reference clip per speaker for zero-shot voice cloning.
+
+    ``overlap_regions`` (OSD): windows with more than ``OSD_REF_MAX_OVERLAP``
+    of their span in overlapped speech are rejected outright — two voices
+    make no timbre reference.
 
     Candidates are runs of consecutive ASR segments belonging to one speaker,
     so the clip always comes with its exact Japanese transcript — which is
@@ -1284,6 +1316,11 @@ def extract_speaker_references(
         a, b = int(s * _SR), min(int(e * _SR), len(src))
         if b - a < int(0.5 * _SR):
             return None
+        if overlap_regions:
+            from ai_movie.config import OSD_REF_MAX_OVERLAP
+            from ai_movie.osd import overlap_ratio as _ovr
+            if _ovr(overlap_regions, s, e) > OSD_REF_MAX_OVERLAP:
+                return None
 
         clip = src[a:b]
         rms = _rms(clip)

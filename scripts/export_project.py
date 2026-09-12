@@ -82,7 +82,11 @@ def build(state: dict, name: str, video: str | None) -> ProjectLog:
     # ── 人声分离 ────────────────────────────────────────────────
     if sep.get("vocals"):
         done("人声分离", {"vocals": sep.get("vocals"),
-                          "background": sep.get("background")})
+                          "background": sep.get("background"),
+                          "vocals_full": sep.get("vocals_full"),
+                          "background_full": sep.get("background_full"),
+                          "bed_sr": sep.get("bed_sr"),
+                          "bed_channels": sep.get("bed_channels")})
 
     # ── 文本翻译 ────────────────────────────────────────────────
     tsegs = tr.get("segments") or []
@@ -97,7 +101,8 @@ def build(state: dict, name: str, video: str | None) -> ProjectLog:
         }, f"{len(tsegs)} 段 / {tr.get('chosen')}")
 
     # ── 人声生成（含时长适配后的 audio_fit）────────────────────
-    gsegs = (fit.get("segments") or tts.get("segments") or [])
+    compact = state.get("compact") or {}
+    gsegs = (fit.get("segments") or compact.get("segments") or tts.get("segments") or [])
     if gsegs:
         ok = sum(1 for s in gsegs if s.get("audio"))
         data = {"results": gsegs, "ok": ok}
@@ -131,8 +136,13 @@ def build(state: dict, name: str, video: str | None) -> ProjectLog:
 
     # ── 合成视频 ────────────────────────────────────────────────
     if comp.get("video"):
+        qc = state.get("qc") or {}
+        qs = ((qc.get("fit") or {}).get("summary")) or {}
+        detail = ""
+        if qs:
+            detail = f"QC {qs.get('PASS', 0)}/{qs.get('WARN', 0)}/{qs.get('FAIL', 0)}"
         done("合成视频", {"output_video": comp["video"],
-                          "output": comp["video"]})
+                          "output": comp["video"], "qc": qc}, detail)
 
     return log
 
