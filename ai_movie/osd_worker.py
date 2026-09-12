@@ -98,31 +98,47 @@ def main() -> int:
              f"falling back to raw inference")
 
     # ── 2. manual: sliding-window inference → multilabel → ≥2 speakers ──
+    # pyannote.audio 4.x dropped the OverlappedSpeechDetection pipeline;
+    # Inference() converts a powerset segmentation model to per-speaker
+    # multilabel activations (skip_conversion=False) and aggregates the
+    # sliding windows, so "≥ 2 speakers active" is overlap.
     try:
         import numpy as np
         from pyannote.audio import Inference
-        inf = Inference(model, duration=getattr(model.specifications, "duration", 10.0),
-                        step=1.0, device=torch.device(device))
+        dur = getattr(getattr(model, "specifications", None), "duration", None) or 10.0
+        inf = Inference(model, window="sliding", duration=dur, step=max(0.5, dur / 10),
+                        skip_conversion=False, device=torch.device(device))
         out = inf({"audio": audio})
-        data = np.asarray(out.data)
-        # Powerset models come back as class probabilities unless Inference
-        # converted them; detect by checking the specification.
-        spec = model.specifications
-        if getattr(spec, "powerset", False) and data.shape[-1] == len(spec.classes):
-            # argmax over powerset classes → multilabel
-            idx = data.argmax(-1)
-            ml = np.zeros(data.shape[:-1] + (spec.num_powerset_classes if hasattr(spec, "num_powerset_classes") else 3,))
-            mapping = model.powerset.mapping.cpu().numpy()        # (P, K)
-            ml = mapping[idx]
-            active = ml.sum(-1)
-        else:
-            active = (data > 0.5).sum(-1)
-        mask = active >= 2
+        data = np.asarray(out.data, dtype=np.float32)
         sw = out.sliding_window
-        times = [sw[i].start for i in range(len(mask))]
+        if data.ndim == 2:                                # (frames, speakers), aggregated
+            mask = (data > 0.5).sum(-1) >= 2
+            times = [sw[i].start for i in range(len(mask))]
+        elif data.ndim == 3:
+            # (chunks, frames, speakers): speaker identities are not aligned
+            # across chunks so pyannote leaves them un-aggregated — but the
+            # overlap indicator (≥ 2 active) is permutation-invariant, so we
+            # aggregate *that* on a global frame grid by averaging.
+            n_chunks, n_fr, _ = data.shape
+            ov = ((data > 0.5).sum(-1) >= 2).astype(np.float32)   # (chunks, frames)
+            frame_dt = float(sw.duration) / n_fr
+            total_t = float(sw[n_chunks - 1].start) + float(sw.duration)
+            n_glob = int(np.ceil(total_t / frame_dt)) + 1
+            acc = np.zeros(n_glob, dtype=np.float32)
+            cnt = np.zeros(n_glob, dtype=np.float32)
+            for c in range(n_chunks):
+                g0 = int(round(float(sw[c].start) / frame_dt))
+                acc[g0:g0 + n_fr] += ov[c]
+                cnt[g0:g0 + n_fr] += 1.0
+            mean = np.where(cnt > 0, acc / np.maximum(cnt, 1), 0.0)
+            mask = mean >= 0.5
+            times = [k * frame_dt for k in range(n_glob)]
+        else:
+            raise RuntimeError(f"unexpected output shape {data.shape}")
         regions = _regions_from_mask(mask, times)
         print(json.dumps({"regions": regions, "model": model_name,
-                          "method": "inference_multilabel"}))
+                          "method": "inference_multilabel", "n_frames": int(len(mask)),
+                          "speakers": int(data.shape[-1])}))
         return 0
     except Exception as exc:                            # noqa: BLE001
         print(json.dumps({"error": f"inference failed: {type(exc).__name__}: {exc}"}))
