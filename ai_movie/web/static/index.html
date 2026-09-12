@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Movie 配音工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <strong>工程</strong>
+      <span><button id="btn-upload" title="上传视频">上传</button> <button id="btn-import" title="登记 inputs/ 里已有的视频">导入</button></span>
+    </div>
+    <div id="projects"></div>
+    <div id="gpu-note" class="small muted" style="margin-top:10px"></div>
+  </aside>
+
+  <header id="top">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <strong id="title">选择一个工程</strong>
+        <span id="subtitle" class="small muted"></span>
+      </div>
+      <div class="row">
+        <button id="btn-one-click" class="primary">一键生成</button>
+        <button id="btn-refresh">刷新</button>
+      </div>
+    </div>
+    <div id="toolbar" class="toolbar" style="margin-top:8px"></div>
+  </header>
+
+  <main id="main"><div class="muted">左侧选择或上传一个工程。</div></main>
+
+  <footer id="drawer" class="collapsed">
+    <div class="bar">
+      <button id="drawer-toggle">日志 ▴</button>
+      <span id="job-title" class="mono"></span>
+      <div class="progress"><i id="job-bar"></i></div>
+      <span id="job-progress"></span>
+      <span style="flex:1"></span>
+      <button id="btn-cancel" class="danger" hidden>取消任务</button>
+    </div>
+    <pre id="log"></pre>
+  </footer>
+</div>
+<input type="file" id="file-input" accept="video/*,.mp4,.mkv,.mov,.webm,.avi" hidden>
+<div id="modal-root"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

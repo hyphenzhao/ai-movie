@@ -180,13 +180,76 @@ STEP_FILES: dict[str, list[str]] = {
 }
 
 
+_JSON_LOG = __import__("os").environ.get("AI_MOVIE_JSON_LOG") == "1"
+_CUR_STEP: str | None = None
+
+
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    """Timestamped line; NDJSON when AI_MOVIE_JSON_LOG=1 (the web UI parses it)."""
+    if _JSON_LOG:
+        print(json.dumps({"t": round(time.time(), 3), "ts": time.strftime("%H:%M:%S"),
+                          "step": _CUR_STEP, "msg": msg}, ensure_ascii=False), flush=True)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def emit(kind: str, **fields) -> None:
+    """Structured event (JSON mode only): step_start/step_done/cached/stale/took/error."""
+    if _JSON_LOG:
+        print(json.dumps({"t": round(time.time(), 3), "kind": kind, "step": _CUR_STEP,
+                          **fields}, ensure_ascii=False, default=str), flush=True)
 
 
 def _sha1(data: bytes) -> str:
     import hashlib
     return hashlib.sha1(data).hexdigest()
+
+
+def _fp_hash(body: dict) -> str:
+    """Combined hash of a fingerprint body (the ``hash`` key itself excluded)."""
+    core = {k: v for k, v in body.items() if k != "hash"}
+    return _sha1(json.dumps(core, sort_keys=True, ensure_ascii=False,
+                            default=str).encode("utf-8"))
+
+
+def save_state(path: Path, state: dict) -> None:
+    """Atomic state.json write (tmp + fsync + replace)."""
+    import os
+    path = Path(path)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(state, ensure_ascii=False, indent=1))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def restamp_after_edit(state: dict, edited: str, keep_valid: list[str] | None = None) -> None:
+    """Record a manual edit of ``edited``'s output so downstream stages go STALE.
+
+    Segment content is not part of any fingerprint (it would be far too
+    expensive to hash), so an edit bumps ``state["_edits"][edited]`` — which
+    ``step_fingerprint`` folds into that stage's ``extra`` — and recomputes
+    the stage hash.  Stages in *keep_valid* (e.g. ``translate`` after a
+    speaker-label edit, whose text is still right) get their ``up`` links
+    refreshed so they stay valid; every other downstream stage mismatches on
+    ``up`` at the next run and re-executes.  Raises KeyError for a legacy
+    state that has no fingerprint for the edited stage.
+    """
+    fps = state.get("_fp") or {}
+    if edited not in fps:
+        raise KeyError(f"no fingerprint for stage {edited!r} (run --fp-adopt first)")
+    edits = state.setdefault("_edits", {})
+    edits[edited] = int(edits.get(edited, 0)) + 1
+    fps[edited].setdefault("extra", {})["_edits"] = edits[edited]
+    fps[edited]["hash"] = _fp_hash(fps[edited])
+    for s in ALL_STEPS:
+        if s in (keep_valid or []) and s in fps:
+            up = fps[s].get("up") or {}
+            for dep in list(up):
+                if dep in fps:
+                    up[dep] = fps[dep]["hash"]
+            fps[s]["hash"] = _fp_hash(fps[s])
 
 
 def input_fingerprint(video: Path) -> str:
@@ -232,10 +295,22 @@ def _args_extra(step: str, args) -> dict:
         "translate": ["engines", "chosen_engine"],
         "tts": ["voice_mode", "no_ref_probe"],
         "compact": ["no_compact", "voice_mode"],
-        "lipsync": ["lipsync_backend", "lipsync_audio_offset_ms", "occlusion_mode"],
+        "faces": ["faces_bind"],
+        "lipsync": ["lipsync_backend", "lipsync_audio_offset_ms", "fusion", "occlusion_mode"],
         "enhance": ["enhance_fidelity", "enhance_protect_lips"],
     }
-    return {k: getattr(args, k, None) for k in pick.get(step, [])}
+    out = {}
+    for k in pick.get(step, []):
+        v = getattr(args, k, None)
+        # Keys introduced after v3 fingerprints were first written are only
+        # recorded when set, so every existing fingerprint stays valid.
+        if k in _OPTIONAL_EXTRA and v is None:
+            continue
+        out[k] = v
+    return out
+
+
+_OPTIONAL_EXTRA = {"faces_bind", "fusion"}
 
 
 def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
@@ -258,10 +333,12 @@ def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
             continue                    # optional upstream absent
         up[dep] = (fps.get(dep) or {}).get("hash", "legacy")
     extra = _args_extra(step, args)
+    n_edit = int((ctx.state.get("_edits") or {}).get(step, 0) or 0)
+    if n_edit:
+        extra["_edits"] = n_edit
     body = {"v": 1, "input": ctx.input_fp, "cfg": cfg, "code": code,
             "files": files, "up": up, "extra": extra}
-    body["hash"] = _sha1(json.dumps(body, sort_keys=True, ensure_ascii=False,
-                                    default=str).encode("utf-8"))
+    body["hash"] = _fp_hash(body)
     return body
 
 
@@ -301,32 +378,37 @@ class Ctx:
 
     def save(self) -> None:
         """Atomic write: a crash mid-write must never leave a truncated state."""
-        import os
-        tmp = self.state_path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(self.state, ensure_ascii=False, indent=1))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, self.state_path)
+        save_state(self.state_path, self.state)
 
     def fingerprint(self, step: str) -> dict:
         return step_fingerprint(self, step, self.args)
 
-    def has(self, step: str) -> bool:
-        """Cached *and* still valid for the current inputs, config and code."""
-        if not self.state.get(step):
-            return False
+    def explain(self, step: str) -> tuple[str, list[str]]:
+        """``(missing|skipped|legacy|valid|stale, reasons)`` without logging."""
+        doc = self.state.get(step)
+        if not doc:
+            return "missing", []
+        if isinstance(doc, dict) and (doc.get("skipped")
+                                      or (step == "osd" and doc.get("available") is False)):
+            return "skipped", [str(doc.get("reason") or "")]
         if self.no_fp:
-            return True
+            return "valid", []
         old = (self.state.get("_fp") or {}).get(step)
         if old is None:
-            return True                 # legacy state: trust it
+            return "legacy", []
         new = self.fingerprint(step)
         if old.get("hash") == new["hash"]:
-            return True
-        why = ", ".join(_fp_diff(old, new)[:6]) or "hash"
-        log(f"· {step} STALE ({why}) → re-running")
-        return False
+            return "valid", []
+        return "stale", _fp_diff(old, new)
+
+    def has(self, step: str) -> bool:
+        """Cached *and* still valid for the current inputs, config and code."""
+        status, why = self.explain(step)
+        if status == "stale":
+            log(f"· {step} STALE ({', '.join(why[:6]) or 'hash'}) → re-running")
+            emit("stale", step=step, reasons=why)
+            return False
+        return status != "missing"
 
     def stamp(self, step: str) -> None:
         self.state.setdefault("_fp", {})[step] = self.fingerprint(step)
@@ -849,10 +931,14 @@ def step_faces(ctx: Ctx, args) -> None:
     free_gpu_for_local_work(log_cb=log)
 
     segs = _timeline_segments(ctx)
+    override = parse_faces_bind(getattr(args, "faces_bind", None))
+    if override:
+        log(f"  speaker→track override: {override}")
     plan = faces_mod.build_face_plan(
         ctx.video, segs,
         out_json=ctx.work / "face_plan.json",
         tracks_cache=ctx.work / "face_tracks_cache.json",
+        speaker_track_override=override or None,
         progress_cb=log,
     )
     faces_mod.save_track_thumbnails(ctx.video, plan, ctx.deliver)
@@ -1024,7 +1110,8 @@ def step_qc(ctx: Ctx, args) -> None:
 
 # ── driver ─────────────────────────────────────────────────────────
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI; shared with the web UI so stored options produce identical runs."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("video")
     ap.add_argument("--name", default=None)
@@ -1077,10 +1164,39 @@ def main() -> int:
                     help="stamp every cached stage with its current fingerprint and exit")
     ap.add_argument("--fp-explain", default=None, metavar="STEP",
                     help="print why STEP is (or is not) stale and exit")
+    ap.add_argument("--status-json", action="store_true",
+                    help="print every stage's cache status as JSON and exit (no writes)")
+    ap.add_argument("--faces-bind", default=None,
+                    help="override speaker→track binding, e.g. 'S0=3,S1=none'")
+    return ap
+
+
+def parse_faces_bind(spec: str | None) -> dict[str, int | None]:
+    out: dict[str, int | None] = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        v = v.strip().lower()
+        out[k.strip()] = None if v in ("none", "null", "", "-") else int(v)
+    return out
+
+
+def main() -> int:
+    global _CUR_STEP
+    ap = build_parser()
     args = ap.parse_args()
 
     ctx = Ctx(Path(args.video), args.name, args=args, no_fp=args.no_fp)
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
+    if args.status_json:
+        out = {}
+        for s in ALL_STEPS:
+            st, why = ctx.explain(s)
+            out[s] = {"status": st, "reasons": why}
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
     log(f"Workspace: {ctx.work}")
 
     if args.fp_adopt:
@@ -1127,13 +1243,23 @@ def main() -> int:
         if s not in dispatch:
             log(f"unknown step: {s}")
             return 2
+        _CUR_STEP = s
         if ctx.has(s) and not args.force:
             log(f"· {s} (cached)")
+            emit("cached", step=s)
             continue
         log(f"▶ {s}")
+        emit("step_start", step=s)
         t0 = time.time()
-        dispatch[s]()
-        log(f"  {s} took {time.time() - t0:.0f}s")
+        try:
+            dispatch[s]()
+        except BaseException as exc:                    # noqa: BLE001
+            emit("error", step=s, error=f"{type(exc).__name__}: {exc}")
+            raise
+        took = time.time() - t0
+        log(f"  {s} took {took:.0f}s")
+        emit("step_done", step=s, took=round(took, 1))
+    _CUR_STEP = None
 
     log(f"Deliverables: {ctx.deliver}")
     return 0

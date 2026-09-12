@@ -928,6 +928,7 @@ def build_face_plan(
     gate_smooth: int = FACE_GATE_SMOOTH,
     min_width_sr: float | None = None,
     cuts: list[int] | None = None,
+    speaker_track_override: dict[str, int | None] | None = None,
     progress_cb: Callable[[str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     **det_kw,
@@ -1008,6 +1009,16 @@ def build_face_plan(
     bindings = bind_speakers_to_tracks(
         plan, tg, segments, video_path=video_path,
         require_gender_match=require_gender_match)
+    if speaker_track_override:
+        # A human decision (web UI) beats the heuristic; None = leave the
+        # picture untouched for that speaker.
+        valid = {t["id"] for t in plan["tracks"]}
+        for spk, tid in speaker_track_override.items():
+            if tid is None or tid in valid:
+                bindings[spk] = tid
+                _log(f"binding override: {spk} → {tid}")
+            else:
+                _log(f"binding override ignored: {spk} → track {tid} does not exist")
 
     per_track = {t["id"]: interpolate_track(t, plan["n_frames"],
                                             det_every=plan.get("det_every", 5),

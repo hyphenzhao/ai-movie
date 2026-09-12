@@ -31,28 +31,7 @@ stage "B: auto-select VC references (F0 gate)"
 $PY -u scripts/auto_select_refs.py "$STATE" || die "ref selection"
 
 stage "C: v2 (voice conversion)"
-$PY - "$STATE" <<'EOF' > "$WORK/_refs_args" || die "refs read"
-import json, sys
-from pathlib import Path
-picked = json.loads((Path(sys.argv[1]).parent / 'refs_auto' / 'refs.json')
-                    .read_text(encoding='utf-8'))['picked']
-print(picked.get('female') or '/nonexistent', picked.get('male') or '/nonexistent')
-EOF
-read -r REF_F REF_M < "$WORK/_refs_args"
-if [ "$REF_F" = "/nonexistent" ] && [ "$REF_M" = "/nonexistent" ]; then
-  echo "no qualifying reference for any gender — v2 == v1 voices (built-in)"
-  $PY - "$STATE" <<'EOF'
-import json, sys, shutil
-from pathlib import Path
-p = Path(sys.argv[1]); st = json.loads(p.read_text(encoding="utf-8"))
-# Register the v1 film as the deliverable so deliver.py --version vc still works.
-st["vc"] = {"segments": st["fit"]["segments"], "refs": {}, "video": st["compose"]["video"],
-            "converted": 0, "reused_lipsync": True, "max_drift_ms": 0.0, "note": "no VC reference qualified"}
-p.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
-EOF
-else
-  $PY -u scripts/run_vc_version.py "$STATE" --ref-female "$REF_F" --ref-male "$REF_M" || die "vc version"
-fi
+$PY -u scripts/run_vc_version.py "$STATE" --refs-json "$WORK/refs_auto/refs.json" || die "vc version"
 
 stage "D: QC (v1 + v2), verification, acceptance"
 $PY -u scripts/run_pipeline.py "$VIDEO" --name "$NAME" --steps qc --force || die "qc"

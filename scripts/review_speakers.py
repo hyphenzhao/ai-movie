@@ -337,30 +337,14 @@ def main() -> int:
         # segment with no decisive signal keeps whatever it already had.
         changed = 0
 
+        from ai_movie.diarize import assign_speaker_for_gender
+
         def fix_speaker(s: dict, g: str) -> None:
             """Point the segment at a speaker whose gender matches *g*."""
-            spks = diar.setdefault("speakers", {})
-            same_g = [spk for spk, meta in spks.items()
-                      if meta.get("gender") == g]
-            if len(same_g) == 1:
-                s["speaker"] = same_g[0]
-            elif not same_g:
-                # Diarization merged this speaker away entirely (an off-mic
-                # interviewer with too few voiced frames to form a pitch
-                # mode).  Leaving the old speaker id would bind these
-                # segments to the *other* speaker's face and drive that
-                # mouth with the wrong-gender voice — so mint a speaker for
-                # the orphan gender.  With no on-screen face of that gender,
-                # face binding then correctly leaves the picture untouched.
-                new_id = f"S{max((int(k[1:]) for k in spks
-                                  if k.startswith('S') and k[1:].isdigit()),
-                                 default=-1) + 1}"
-                spks[new_id] = {"gender": g, "f0_median": None,
-                                "total_speech": 0.0, "n_turns": 0,
-                                "synthesized_by": "review_speakers orphan-gender"}
-                s["speaker"] = new_id
+            before = set((diar.get("speakers") or {}))
+            assign_speaker_for_gender(diar, s, g, minted_by="review_speakers orphan-gender")
+            for new_id in set(diar.get("speakers") or {}) - before:
                 print(f"  minted speaker {new_id} ({g}) for orphan gender")
-            # with 2+ same-gender speakers there is no basis to choose — keep
 
         for i, s in enumerate(segs):
             r = rows[i]

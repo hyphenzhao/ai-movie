@@ -1545,3 +1545,32 @@ def similarity(a_wav: str | Path, b_wav: str | Path,
             e = enc.encode_batch(torch.from_numpy(a[None, :])).squeeze().cpu().numpy()
         out.append(e / max(np.linalg.norm(e), 1e-9))
     return float(np.dot(out[0], out[1]))
+
+
+def assign_speaker_for_gender(diar: dict, seg: dict, gender: str,
+                              *, minted_by: str = "manual") -> str:
+    """Point *seg* at a speaker whose gender is *gender*; mint one if none exists.
+
+    Shared by ``scripts/review_speakers.py --apply`` and the web editor.
+    With exactly one same-gender speaker the segment is re-pointed to it.
+    With none, a new ``S<k>`` is minted (an off-mic speaker with too few
+    voiced frames to form a pitch mode gets merged away by the diarizer;
+    leaving the old id would bind these lines to the *other* speaker's face).
+    With two or more candidates there is no basis to choose, so the id is
+    left as-is unless it already matches.  Returns the speaker id.
+    """
+    spks = diar.setdefault("speakers", {})
+    same_g = [spk for spk, meta in spks.items() if meta.get("gender") == gender]
+    cur = seg.get("speaker")
+    if len(same_g) == 1:
+        seg["speaker"] = same_g[0]
+    elif not same_g:
+        new_id = f"S{max((int(k[1:]) for k in spks if k.startswith('S') and k[1:].isdigit()), default=-1) + 1}"
+        spks[new_id] = {"gender": gender, "f0_median": None, "total_speech": 0.0,
+                        "n_turns": 0, "synthesized_by": minted_by}
+        seg["speaker"] = new_id
+    elif cur not in same_g:
+        seg["speaker"] = same_g[0]
+    seg["gender"] = gender
+    seg["tts_gender"] = gender
+    return seg["speaker"]

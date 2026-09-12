@@ -62,6 +62,9 @@ def main() -> int:
     ap.add_argument("--out-name", default="v2_cloned")
     ap.add_argument("--ref-female", default=DEFAULT_REFS["female"])
     ap.add_argument("--ref-male", default=DEFAULT_REFS["male"])
+    ap.add_argument("--refs-json", default=None,
+                    help="refs_auto/refs.json from auto_select_refs.py; overrides --ref-*; "
+                         "if no gender qualified, registers the v1 film as state['vc']")
     args = ap.parse_args()
 
     from ai_movie import artifacts, tts as tts_mod
@@ -73,6 +76,27 @@ def main() -> int:
     work = state_path.parent
     deliver = work / "deliverables" / args.out_name
     deliver.mkdir(parents=True, exist_ok=True)
+
+    if args.refs_json:
+        picked = (json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
+                  .get("picked") or {})
+        args.ref_female = picked.get("female") or "/nonexistent"
+        args.ref_male = picked.get("male") or "/nonexistent"
+        if args.ref_female == "/nonexistent" and args.ref_male == "/nonexistent":
+            # Nothing qualified through the F0 gate: the built-in voices ARE
+            # the deliverable.  Register v1 as the "vc" version so the
+            # downstream tooling (qc, deliver) has one place to look.
+            if not (state.get("fit") or {}).get("segments") or not (state.get("compose") or {}).get("video"):
+                log("no qualifying reference and no v1 film to fall back to")
+                return 1
+            state["vc"] = {"segments": state["fit"]["segments"], "refs": {},
+                           "video": state["compose"]["video"], "converted": 0,
+                           "reused_lipsync": True, "max_drift_ms": 0.0,
+                           "note": "no VC reference qualified — built-in voices"}
+            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1),
+                                  encoding="utf-8")
+            log("no qualifying reference for any gender — registered v1 as the vc version")
+            return 0
 
     v1_segs = (state.get("fit") or {}).get("segments") or []
     if not v1_segs:
