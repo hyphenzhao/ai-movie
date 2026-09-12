@@ -1006,7 +1006,8 @@ def step_qc(ctx: Ctx, args) -> None:
     docs = {}
     q = qc_mod.build_qc(ctx.state)
     paths = qc_mod.write_outputs(q, ctx.deliver)
-    docs["fit"] = {"summary": q["summary"], **{k: str(v) for k, v in paths.items()}}
+    docs["fit"] = {"summary": q["summary"],
+                   **{f"{k}_path": str(v) for k, v in paths.items()}}
     log(f"  QC ({q['key']}): {q['summary']['PASS']} PASS / {q['summary']['WARN']} WARN / "
         f"{q['summary']['FAIL']} FAIL of {q['summary']['n']}")
     for r, n in list(q["summary"]["reasons"].items())[:6]:
@@ -1014,7 +1015,8 @@ def step_qc(ctx: Ctx, args) -> None:
     if (ctx.state.get("vc") or {}).get("segments"):
         qv = qc_mod.build_qc(ctx.state, key="vc")
         pv = qc_mod.write_outputs(qv, ctx.deliver, suffix="_vc")
-        docs["vc"] = {"summary": qv["summary"], **{k: str(v) for k, v in pv.items()}}
+        docs["vc"] = {"summary": qv["summary"],
+                      **{f"{k}_path": str(v) for k, v in pv.items()}}
         log(f"  QC (vc): {qv['summary']['PASS']} PASS / {qv['summary']['WARN']} WARN / "
             f"{qv['summary']['FAIL']} FAIL")
     ctx.put("qc", docs)

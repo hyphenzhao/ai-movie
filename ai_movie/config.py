@@ -706,3 +706,4 @@ QC_OVERLAP_WARN = 0.3
 QC_OVERLAP_FAIL = 0.6
 QC_CLONE_SIM_WARN = TTS_CLONE_MIN_SIMILARITY
 QC_MIX_GAIN_WARN = 2.9
+QC_OCCLUSION_FRAC_WARN = 0.25   # clip-level occlusion fallback fraction that flags its segments

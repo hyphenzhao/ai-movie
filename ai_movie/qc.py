@@ -51,6 +51,7 @@ def _thresholds() -> dict:
         "clone_sim_warn": getattr(c, "QC_CLONE_SIM_WARN",
                                   getattr(c, "TTS_CLONE_MIN_SIMILARITY", 0.40)),
         "mix_gain_warn": getattr(c, "QC_MIX_GAIN_WARN", 2.9),
+        "occlusion_frac_warn": getattr(c, "QC_OCCLUSION_FRAC_WARN", 0.25),
     }
 
 
@@ -108,14 +109,19 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
                 return True
         return False
 
-    def _occluded_in(a_s: float, b_s: float) -> int:
-        n = 0
+    def _occluded_in(a_s: float, b_s: float) -> tuple[int, float]:
+        """Occlusion-fallback frames of the clips overlapping this segment and
+        the worst clip-level fraction (a clip spans several segments, so the
+        count alone over-attributes; the fraction is what the rule uses)."""
+        n, worst = 0, 0.0
         for c in lip_per_clip:
             if c.get("end", 0) <= a_s or c.get("start", 1e12) >= b_s:
                 continue
             o = c.get("occlusion") or {}
-            n += int(o.get("reverted_frames", 0)) + int(o.get("region_frames", 0))
-        return n
+            k = int(o.get("reverted_frames", 0)) + int(o.get("region_frames", 0))
+            n += k
+            worst = max(worst, k / max(1, int(o.get("frames", 0) or 1)))
+        return n, worst
 
     recs = []
     counts = {"PASS": 0, "WARN": 0, "FAIL": 0}
@@ -139,7 +145,7 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
         overrun = float(s.get("overrun") or 0.0)
         gain = mix_gain.get(str(i), mix_gain.get(i))
         comp = compact_report.get(i)
-        occ = _occluded_in(start, end)
+        occ, occ_frac = _occluded_in(start, end)
 
         warn, fail = [], []
         asr_conf = s.get("asr_conf")
@@ -171,8 +177,8 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
             warn.append("mostly_gated(profile/small)")
         if tid is None and _same_gender_track_present(a, b, gender):
             warn.append("unbound_but_same_gender_face_onscreen")
-        if occ:
-            warn.append(f"occlusion_fallback({occ}f)")
+        if occ_frac >= th["occlusion_frac_warn"]:
+            warn.append(f"occlusion_fallback({occ_frac:.0%} of clip)")
         if comp and comp.get("status") == "rewritten":
             warn.append("compact_rewritten")
         # Lines under 0.7 s keep the built-in voice by design (VC minimum);
