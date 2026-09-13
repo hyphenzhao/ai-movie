@@ -65,6 +65,37 @@ node scripts/web_check.js                                  # app.js 语法、id 
 - 域名 `ai-movie.hfnjc.net` 目前在 Cloudflare 橙云后面：ACME HTTP-01 仍成功签发；Cloudflare 免费版单请求 100 MB（已用分块上传规避）、
   会拦截非浏览器 UA（curl/urllib 需带浏览器 User-Agent）。改为“仅 DNS”即可去掉这些限制，Caddy 配置无需改动。
 
+## 成片预览站（VPS 本地供片）
+
+`https://ai-movie.hfnjc.net/preview/`（与工作台同一套登录）。Caddy 里一个 `handle @preview` 块直接
+`file_server` 出 `/var/www/preview`，仍走 `forward_auth`，**不经过 SSH 隧道**。
+
+**为什么单独做**：实测本机是整条链路最慢的一环——本机出口走 VPN（出口 IP 在首尔，AS40676 Psychz，路径 MTU 1293），
+上行只有 26 Mbps、往返 169 ms，经隧道再套一层加密后只剩 16.5 Mbps；而 VPS 自身有 106 Mbps。把成片复制到 VPS 后
+预览速度从 2.0 MB/s 提到 6.2 MB/s。
+
+| 测量 | 值 |
+|---|---|
+| 本机 → VPS 单流 / 4 并行 | 20 / 31 Mbps |
+| VPS → 本机 | 56 Mbps |
+| 本机自身上行 / 下行 | 26 / 131 Mbps |
+| VPS 自身下行（Vultr 东京） | 106 Mbps |
+| 经 SSH 隧道的实际 Web 数据 | 16.5 Mbps |
+| RTT 本机↔VPS（对照：本机↔Vultr 东京 163 ms） | 169 ms，0 丢包 |
+
+**建站与更新**：`scripts/build_preview_site.py` 里的 `RELEASES` 表列出每个版本组包含哪些成片
+（原片 / v1 内置音色 / v2 原声音色 + demo 目录），脚本用 ffprobe 补齐时长/分辨率/码率/音轨，
+生成 `manifest.json` + 自包含的 `index.html`（版本由新到旧分组，同一部片切换版本保持播放位置），
+再 rsync 到 VPS：
+
+```bash
+.venv/bin/python scripts/build_preview_site.py            # 只在本地生成清单
+.venv/bin/python scripts/build_preview_site.py --upload   # 生成并增量同步到 VPS
+```
+
+当前内容：4 个版本组、49 个文件、5.4 GB；VPS 剩余 5.2 GB。每新增一个版本（三部片两种音色）约 1.5 GB，
+空间不够时可把最旧的 v1 组改成 720p 预览版。
+
 ## 常用操作
 
 - 新增 Web 用户：在 VPS 上 `authelia crypto hash generate argon2 --random -p 1` 得到密码与摘要，写入 `users_database.yml`（自动热加载）；
