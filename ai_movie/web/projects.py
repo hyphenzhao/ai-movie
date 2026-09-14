@@ -57,9 +57,9 @@ OPTION_SPEC = [
 
 def default_options() -> dict:
     ns = rp.build_parser().parse_args(["_"])
-    opts = {k: getattr(ns, k, None) for k, _ in OPTION_SPEC}
-    opts["voice_mode"] = "sft"          # the production recipe (run_v3.sh)
-    return opts
+    # The parser's own defaults are the production recipe (voice_mode=sft etc.),
+    # so the web UI and the CLI cannot drift apart.
+    return {k: getattr(ns, k, None) for k, _ in OPTION_SPEC}
 
 
 # ── paths ───────────────────────────────────────────────────────────

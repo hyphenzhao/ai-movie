@@ -1137,11 +1137,21 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-ref-probe", action="store_true",
                     help="skip probing candidate reference clips (faster, "
                          "picks by heuristic score only)")
-    ap.add_argument("--voice-mode", default="clone",
+    # 'sft' is the shipped recipe, not 'clone'.  Zero-shot cloning conditions
+    # the LLM on the Japanese reference transcript, and on this material it
+    # leaked the source language into the dub — 10 of 20 sampled lines came
+    # back as Japanese kana (Documentation/vc-gate-result.md).  The production
+    # chain therefore synthesizes with built-in Chinese speakers first and
+    # recovers the real timbre afterwards with voice conversion
+    # (scripts/auto_select_refs.py + scripts/run_vc_version.py), where no text
+    # conditioning exists at all.  All three released films were made this way.
+    ap.add_argument("--voice-mode", default="sft",
                     choices=["clone", "sft", "gender", "female", "male"],
-                    help="'sft' forces every segment onto a built-in speaker "
+                    help="default 'sft': every segment onto a built-in speaker "
                          "(中文女/中文男) — no reference audio anywhere, so the "
-                         "Japanese source cannot leak into the output")
+                         "Japanese source cannot leak into the output; the real "
+                         "timbre comes back via run_vc_version.py. 'clone' is the "
+                         "old zero-shot path and can leak Japanese.")
     ap.add_argument("--no-osd", action="store_true",
                     help="skip overlapped-speech detection")
     ap.add_argument("--no-compact", action="store_true",

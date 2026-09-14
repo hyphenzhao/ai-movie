@@ -25,7 +25,7 @@ die() { echo "FAILED: $*" >&2; exit 1; }
 T0=$(date +%s)
 
 stage "A: v1 pipeline (all stages)"
-$PY -u scripts/run_pipeline.py "$VIDEO" --name "$NAME" --voice-mode sft || die "pipeline"
+$PY -u scripts/run_pipeline.py "$VIDEO" --name "$NAME" || die "pipeline"   # voice-mode sft 已是默认
 
 stage "B: auto-select VC references (F0 gate)"
 $PY -u scripts/auto_select_refs.py "$STATE" || die "ref selection"
