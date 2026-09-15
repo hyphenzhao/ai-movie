@@ -97,10 +97,13 @@ STEP_CONFIG: dict[str, list[str]] = {
     "asr": ["ASR_MODEL_SIZE", "ASR_OPENAI_WHISPER_MODEL", "ASR_WORD_TIMESTAMPS",
             "ASR_VAD_THRESHOLD", "ASR_MAX_SEGMENT_DURATION", "ASR_MAX_SEGMENT_CHARS",
             "ASR_PAUSE_SPLIT_SEC", "ASR_MIN_SEGMENT_DURATION", "DIARIZE_GENDER_HZ",
-            "DIARIZE_AHC_THRESHOLD", "OSD_SEED_EXCLUDE"],
+            "DIARIZE_AHC_THRESHOLD", "OSD_SEED_EXCLUDE", "ASR_SILENCE_DBFS",
+            "TTS_VOCALS_RMS_MIN_RATIO"],
     "glossary": ["GLOSSARY_AUTO_EXTRACT", "GLOSSARY_MAX_TERMS", "GLOSSARY_MIN_COUNT"],
     "translate": ["TRANSLATION_CTX_BEFORE", "TRANSLATION_CTX_AFTER",
-                  "OLLAMA_SAKURA_MODEL", "GLOSSARY_ENFORCE_MODEL"],
+                  "OLLAMA_SAKURA_MODEL", "GLOSSARY_ENFORCE_MODEL", "OLLAMA_POLISH_MODEL",
+                  "POLISH_CTX_BEFORE", "POLISH_CTX_AFTER", "UNIT_CONTINUOUS_GAP",
+                  "UNIT_MAX_GAP", "UNIT_MAX_DUR", "UNIT_MAX_CHARS"],
     "tts": ["TTS_PREFERRED_MODEL", "TTS_REF_MIN_DURATION", "TTS_REF_MAX_DURATION",
             "TTS_CLONE_MIN_SIMILARITY", "TTS_F0_GATE", "TTS_F0_RATIO_RANGE",
             "OSD_REF_MAX_OVERLAP"],
@@ -141,11 +144,17 @@ STEP_CODE: dict[str, list[str]] = {
     "osd": ["ai_movie.osd.run_osd"],
     "asr": ["ai_movie.asr.transcribe_all", "ai_movie.asr._finalize_segments",
             "ai_movie.segmenter.split_into_sentences", "ai_movie.diarize.diarize_file",
-            "ai_movie.diarize._refine_with_channel", "ai_movie.diarize.split_by_pitch"],
+            "ai_movie.diarize._refine_with_channel", "ai_movie.diarize.split_by_pitch",
+            "ai_movie.asr._transcribe_chunk", "ai_movie.diarize._pick_embed_source",
+            "run_pipeline._asr_source", "run_pipeline._vocals_trusted",
+            "run_pipeline._drop_silent_segments"],
     "glossary": ["ai_movie.glossary.build_glossary"],
-    "translate": ["ai_movie.translator.translate_segments",
+    "translate": ["ai_movie.translator.translate_segments", "run_pipeline._translate_by_units",
                   "ai_movie.translator.enforce_glossary",
-                  "ai_movie.translator._sakura_translate"],
+                  "ai_movie.translator._sakura_translate",
+                  "ai_movie.translator._polish_flagged",
+                  "ai_movie.units.joins", "ai_movie.units.group_units",
+                  "ai_movie.units.split_translation", "ai_movie.units.flag_line"],
     "tts": ["ai_movie.tts.run_cloned_synthesis", "ai_movie.tts.build_seg_refs",
             "ai_movie.diarize.extract_speaker_references",
             "ai_movie.tts.verify_clone_quality"],
@@ -173,6 +182,9 @@ STEP_CODE: dict[str, list[str]] = {
 
 # Files (relative to ROOT) whose bytes a stage depends on.
 STEP_FILES: dict[str, list[str]] = {
+    # units.py keeps its rules in module-level regexes and character sets,
+    # which a function-source hash cannot see.
+    "translate": ["ai_movie/units.py"],
     "lipsync": ["patches/musetalk_rotation_align.patch",
                 "patches/musetalk_target_face.patch",
                 "patches/musetalk_quality.patch",
@@ -290,9 +302,9 @@ def _args_extra(step: str, args) -> dict:
         return {}
     pick = {
         "asr": ["language", "asr_backend", "num_speakers", "no_diarize",
-                "dialogue_refine", "dialogue_model"],
+                "dialogue_refine", "dialogue_model", "asr_audio", "gender_source"],
         "glossary": ["translate_helper"],
-        "translate": ["engines", "chosen_engine"],
+        "translate": ["engines", "chosen_engine", "no_units"],
         "tts": ["voice_mode", "no_ref_probe"],
         "compact": ["no_compact", "voice_mode"],
         "faces": ["faces_bind"],
@@ -487,18 +499,67 @@ def step_osd(ctx: Ctx, args) -> None:
     ctx.put("osd", doc)
 
 
+def _vocals_trusted(audio: Path, vocals: str | None) -> bool:
+    """Did separation keep the voice?  Same energy test diarization uses
+    (``diarize._pick_embed_source``): a gutted vocals track must not drive
+    either transcription or the silence gate."""
+    if not vocals or not Path(vocals).exists():
+        return False
+    from ai_movie import diarize as diarize_mod
+    mix = diarize_mod._load_mono16k(audio)
+    voc = diarize_mod._load_mono16k(vocals)
+    return diarize_mod._pick_embed_source(mix, voc, [(0.0, len(mix) / 16000.0)]) is not mix
+
+
+def _asr_source(audio: Path, vocals: str | None, want: str,
+                trusted: bool) -> tuple[Path, str]:
+    """Pick the file Whisper hears.  On v3.0.0 output_test the vocals scored
+    worse against the burned-in subtitles (median 0.857 vs 0.909) — UVR
+    artefacts cost more than the removed music — hence config default."""
+    if want == "vocals" and trusted:
+        return Path(vocals), "vocals"
+    return audio, "mix"
+
+
+def _drop_silent_segments(segments: list[dict], vocals: str, floor_db: float) -> list[dict]:
+    """Remove segments whose separated-vocal level is digital silence.
+
+    Whisper invents stock phrases over silence (v3.0.0 test_2: 「ありがとう
+    ございました」 at -78 dBFS).  Energy says nothing about the film, so the
+    gate transfers to any material.
+    """
+    import numpy as np
+    from ai_movie import diarize as diarize_mod
+    voc = diarize_mod._load_mono16k(vocals)
+    kept = []
+    for seg in segments:
+        a, b = int(float(seg["start"]) * 16000), int(float(seg["end"]) * 16000)
+        chunk = voc[max(a, 0):max(b, a + 1)]
+        rms = float(np.sqrt(np.mean(chunk ** 2))) if chunk.size else 0.0
+        db = 20 * np.log10(rms) if rms > 0 else -120.0
+        if db < floor_db:
+            log(f"  silence gate: dropped [{seg['start']:.1f}s] {seg.get('text', '')!r} "
+                f"({db:.1f} dBFS)")
+            continue
+        kept.append(seg)
+    return kept
+
+
 def step_asr(ctx: Ctx, args) -> None:
     from ai_movie import asr as asr_mod
     from ai_movie import diarize as diarize_mod
+    from ai_movie.config import ASR_SILENCE_DBFS
 
     audio = Path(ctx.state["demux"]["audio"])
     vocals = ctx.state.get("separate", {}).get("vocals")
     overlap = (ctx.state.get("osd") or {}).get("regions") or []
+    trusted = _vocals_trusted(audio, vocals)
+    asr_audio, asr_tag = _asr_source(audio, vocals, args.asr_audio, trusted)
 
     # Pass 1: transcribe and split on punctuation / pauses only.
-    log("ASR: transcribing…")
+    log(f"ASR: transcribing ({asr_tag})…")
     res = asr_mod.transcribe_all(
-        [audio], language=args.language, backend=args.asr_backend,
+        [asr_audio], language=args.language, backend=args.asr_backend,
         diarize=False,
         file_progress_cb=lambda i, p: log(f"  ASR {p}%") if p % 25 == 0 else None,
     )
@@ -514,7 +575,7 @@ def step_asr(ctx: Ctx, args) -> None:
         diar = diarize_mod.diarize_file(
             audio, vocals_path=vocals, segments=segments,
             num_speakers=args.num_speakers, progress_cb=log,
-            overlap_regions=overlap)
+            overlap_regions=overlap, gender_source=args.gender_source)
 
         if args.dialogue_refine:
             diar = diarize_mod.refine_speakers_with_dialogue(
@@ -528,6 +589,12 @@ def step_asr(ctx: Ctx, args) -> None:
             source=str(audio), diarization=diar)
         log(f"After speaker-aware re-split: {len(segments)} segments")
 
+    if trusted:
+        n0 = len(segments)
+        segments = _drop_silent_segments(segments, vocals, ASR_SILENCE_DBFS)
+        if len(segments) != n0:
+            log(f"Silence gate: {n0 - len(segments)} segment(s) removed")
+
     (ctx.work / "asr_words.json").write_text(
         json.dumps(words, ensure_ascii=False), encoding="utf-8")
 
@@ -540,7 +607,8 @@ def step_asr(ctx: Ctx, args) -> None:
             segments, audio, ctx.deliver, prefix="01_spk")
 
     ctx.put("asr", {"segments": segments, "diarization": diar,
-                    "language": args.language})
+                    "language": args.language, "asr_audio": asr_tag,
+                    "gender_source": (diar or {}).get("gender_source")})
 
 
 def step_glossary(ctx: Ctx, args) -> None:
@@ -552,27 +620,82 @@ def step_glossary(ctx: Ctx, args) -> None:
     ctx.put("glossary", terms)
 
 
+def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
+                        engine: str, gloss: dict, polish_rows: list[dict],
+                        unit_rows: list[dict]) -> list[str]:
+    """Translate each sentence unit once and split its Chinese back.
+
+    See ai_movie/units.py: the segment count never changes, so every stage
+    after translate keeps indexing by position.  A unit whose Chinese cannot
+    be split without cutting a word falls back to per-segment translation
+    of its members — exactly the pre-unit behaviour.
+    """
+    from ai_movie import units as units_mod
+
+    pseudo = [{**segs[u[0]],
+               "text": "".join((segs[i].get("text") or "") for i in u),
+               "end": segs[u[-1]]["end"]} for u in units]
+    zh_units = translator.translate_segments(
+        pseudo, engine=engine, glossary=gloss, report=polish_rows,
+        progress_cb=lambda d, t: log(f"  {engine}: {d}/{t}") if d % 20 == 0 else None)
+    out = [""] * len(segs)
+    fallback: list[int] = []
+    for k, (u, zh) in enumerate(zip(units, zh_units)):
+        pieces = [zh] if len(u) == 1 else units_mod.split_translation(
+            zh, [units_mod.visible_len(segs[i].get("text")) for i in u])
+        unit_rows.append({"unit": k, "idxs": " ".join(map(str, u)),
+                          "ja": pseudo[k]["text"], "zh": zh,
+                          "pieces": " | ".join(pieces) if pieces else "",
+                          "fallback": pieces is None})
+        if pieces is None:
+            fallback.extend(u)
+            continue
+        for i, piece in zip(u, pieces):
+            out[i] = piece
+    if fallback:
+        log(f"  {len(fallback)} segment(s) in unsplittable units: translating them individually")
+        redo = translator.translate_segments(
+            [segs[i] for i in fallback], engine=engine, glossary=gloss, report=None)
+        for i, zh in zip(fallback, redo):
+            out[i] = zh
+    for k, u in enumerate(units):
+        for i in u:
+            segs[i]["unit_id"] = k
+    return out
+
+
 def step_translate(ctx: Ctx, args) -> None:
+    import csv
+
     from ai_movie import translator
+    from ai_movie import units as units_mod
 
     segs = [dict(s) for s in ctx.state["asr"]["segments"]]
     gloss = ctx.state.get("glossary") or {}
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
+    units = [[i] for i in range(len(segs))] if args.no_units \
+        else units_mod.group_units(segs)
+    log(f"Sentence units: {len(units)} for {len(segs)} segments "
+        f"({sum(1 for u in units if len(u) > 1)} multi-segment)")
 
     variants: dict[str, list[str]] = {}
+    reports: dict[str, tuple[list[dict], list[dict]]] = {}
     for eng in engines:
-        log(f"Translating with engine '{eng}' ({len(segs)} segments)…")
+        log(f"Translating with engine '{eng}' ({len(units)} units)…")
         t0 = time.time()
+        polish_rows: list[dict] = []
+        unit_rows: list[dict] = []
         try:
-            out = translator.translate_segments(
-                segs, engine=eng, glossary=gloss,
-                progress_cb=lambda d, t, e=eng: log(f"  {e}: {d}/{t}")
-                if d % 20 == 0 else None,
-            )
+            out = _translate_by_units(translator, segs, units, eng, gloss,
+                                      polish_rows, unit_rows)
         except Exception as exc:                        # noqa: BLE001
             log(f"  engine {eng} FAILED: {type(exc).__name__}: {exc}")
             continue
         variants[eng] = out
+        reports[eng] = (polish_rows, unit_rows)
+        if polish_rows:
+            acc = sum(1 for r in polish_rows if r["status"] == "accepted")
+            log(f"  polish: {len(polish_rows)} flagged, {acc} rewritten")
         log(f"  {eng} done in {time.time() - t0:.0f}s")
         tagged = [{**s, "text_translated": t} for s, t in zip(segs, out)]
         artifacts.export_srt(tagged, ctx.deliver / f"02_zh_{eng}.srt",
@@ -589,8 +712,18 @@ def step_translate(ctx: Ctx, args) -> None:
     log(f"Using '{chosen}' for downstream stages")
     for s, t in zip(segs, variants[chosen]):
         s["text_translated"] = t
-    ctx.put("translate", {"segments": segs, "variants": variants,
-                          "chosen": chosen})
+    polish_rows, unit_rows = reports[chosen]
+    for name, rows in (("02_polish_report.csv", polish_rows), ("02_units.csv", unit_rows)):
+        if rows:
+            with open(ctx.deliver / name, "w", newline="", encoding="utf-8-sig") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows(rows)
+    ctx.put("translate", {"segments": segs, "variants": variants, "chosen": chosen,
+                          "units": units,
+                          "polish": {"flagged": len(polish_rows),
+                                     "accepted": sum(1 for r in polish_rows
+                                                     if r["status"] == "accepted")}})
 
 
 def _synthesize(ctx: Ctx, args, segs: list[dict], idxs: list[int],
@@ -1120,6 +1253,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="re-run steps even if state already has them")
     ap.add_argument("--language", default="ja")
     ap.add_argument("--asr-backend", default="openai-whisper")
+    from ai_movie.config import ASR_AUDIO_SOURCE, DIARIZE_GENDER_SOURCE
+    ap.add_argument("--asr-audio", default=ASR_AUDIO_SOURCE, choices=["vocals", "mix"],
+                    help="audio Whisper transcribes; gender is measured separately")
+    ap.add_argument("--gender-source", default=DIARIZE_GENDER_SOURCE,
+                    choices=["mix", "vocals"],
+                    help="audio pitch/timbre gender is measured on")
     ap.add_argument("--num-speakers", type=int, default=None)
     ap.add_argument("--no-diarize", action="store_true")
     # OFF by default: the only local model strong enough for this task
@@ -1132,7 +1271,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Default to sakura only: the gpt-oss polish stage cannot complete on
     # this ROCm build (see Documentation/v2-quality-upgrade.md).  Pass a
     # comma-separated list to compare engines in one run.
-    ap.add_argument("--engines", default="sakura")
+    ap.add_argument("--engines", default="sakura+qwen")
+    ap.add_argument("--no-units", action="store_true",
+                    help="translate segment by segment instead of by sentence unit")
     ap.add_argument("--chosen-engine", default=None)
     ap.add_argument("--no-ref-probe", action="store_true",
                     help="skip probing candidate reference clips (faster, "

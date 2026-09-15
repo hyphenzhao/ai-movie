@@ -141,6 +141,31 @@ ASR_PAUSE_SPLIT_SEC = 0.45
 ASR_SENTENCE_END = "。！？!?…♪"
 ASR_SOFT_BREAK = "、，,"
 
+# Which audio Whisper hears.  Measured against the burned-in subtitles of
+# output_test (same code, only this switch changed): mix median 0.909 with 14
+# lines < 0.70; UVR vocals median 0.857 with 19 — separation artefacts cost
+# Whisper more than the removed music helps.  "vocals" stays selectable.
+ASR_AUDIO_SOURCE = "mix"             # "mix" | "vocals"
+# Where pitch/timbre gender is measured.  Separation shifts the spectrum up:
+# the same male speaker measured 132 Hz on the vocals and 107 Hz on the mix.
+DIARIZE_GENDER_SOURCE = "mix"        # "mix" | "vocals"
+
+# A segment whose separated-vocal level is below this is digital silence:
+# Whisper invented it (v3.0.0 test_2 had 「ありがとうございました」 at -78 dBFS).
+# Film-independent by construction — it measures energy, not words.
+ASR_SILENCE_DBFS = -60.0
+
+# Sentence units (ai_movie/units.py): adjacent segments are translated as
+# one utterance, then split back, when the first has no sentence-final mark
+# and either there was no pause at all (< UNIT_CONTINUOUS_GAP: the character
+# cap cut running speech) or a short pause follows a clause connective.
+# Values chosen by a Sakura A/B on v3.0.0 output_test — see
+# Documentation/v3.1-asr-translation.md.
+UNIT_CONTINUOUS_GAP = 0.05
+UNIT_MAX_GAP = 0.30
+UNIT_MAX_DUR = 12.0
+UNIT_MAX_CHARS = 60
+
 # Domain hint / proper-noun spellings fed to Whisper as ``initial_prompt``.
 #
 # EMPTY BY DEFAULT — measured, not assumed.  A hint of
@@ -371,7 +396,10 @@ MIX_MATCH_CLAMP_DB = 3.0
 
 # Final two-pass ffmpeg loudnorm target.
 MIX_TARGET_LUFS = -16.0
-MIX_TRUE_PEAK_DB = -1.0
+# -2 dBTP, not -1: the WAV mix lands exactly on target, but AAC encoding of
+# the delivered MP4 overshoots by ~1 dB (v3.0.0 measured -1.0 dBTP in the WAV,
+# -0.2 in the v1 MP4 and 0.0 in the v2 MP4).
+MIX_TRUE_PEAK_DB = -2.0
 
 # ── Lip Sync settings ──────────────────────────────────────────
 
@@ -490,6 +518,17 @@ TRANSLATION_SCENE_HINT = (
 OLLAMA_GPTOSS_MODEL = "huihui_ai/gpt-oss-abliterated:120b"
 OLLAMA_SAKURA_MODEL = "quantumcookie/Sakura-qwen2.5-v1.0:14b"
 
+# Context polish of flagged lines only (translator._polish_flagged).  The
+# env override lets the release runner fall back automatically when the
+# model fails its smoke test.
+import os as _os
+OLLAMA_POLISH_MODEL = _os.environ.get(
+    "AI_MOVIE_POLISH_MODEL",
+    "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest")
+POLISH_CTX_BEFORE = 4
+POLISH_CTX_AFTER = 2
+POLISH_TIMEOUT = 300
+
 # Approximate resident size (GB) per ollama model — used to decide whether
 # other models must be evicted first.  Hy-MT2-30B (57 GB) and gpt-oss-120b
 # (88 GB) cannot coexist in 122 GB.
@@ -498,6 +537,7 @@ OLLAMA_MODEL_SIZE_GB = {
     "dolphin-mixtral:8x22b": 80.0,
     "dolphin-mixtral:8x7b": 27.0,
     "quantumcookie/Sakura-qwen2.5-v1.0:14b": 13.0,
+    "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest": 24.0,
 }
 
 # Evict other loaded ollama models before running one bigger than this.

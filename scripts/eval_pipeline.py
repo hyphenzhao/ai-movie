@@ -5,7 +5,7 @@ Reads the state file written by ``scripts/run_pipeline.py`` and prints (and
 writes) a pass/fail table, so "is it good enough yet?" is a measurement
 rather than an impression.
 
-    python scripts/eval_pipeline.py workspace/<name>/state.json [--stage 1]
+    python scripts/eval_pipeline.py workspace/<name>/state.json [--out ACCEPTANCE.md] [--json eval.json]
 """
 
 from __future__ import annotations
@@ -573,33 +573,41 @@ def eval_qc(state: dict, rep: Report) -> None:
                  f"{qv['PASS']}/{qv['WARN']}/{qv['FAIL']} of {qv['n']}")
 
 
-def eval_mix(state: dict, rep: Report) -> None:
-    m = state.get("mix") or {}
-    a = m.get("audio")
-    if not a or not Path(a).exists():
-        return
+def _audio_checks(path: str, rep: Report, suffix: str, label: str) -> None:
+    import re as _re
     import subprocess as _sp
     try:
         out = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                       "-show_entries", "stream=sample_rate,channels", "-of", "csv=p=0", a],
+                       "-show_entries", "stream=sample_rate,channels", "-of", "csv=p=0", path],
                       capture_output=True, text=True, timeout=60).stdout.strip()
         sr, ch = out.split(",")[:2]
-        rep.check("E2", "final mix is stereo at ≥ 44.1 kHz",
+        rep.check(f"E2{suffix}", f"{label} is stereo at ≥ 44.1 kHz",
                   int(ch) >= 2 and int(sr) >= 44100, f"{sr} Hz × {ch} ch")
     except Exception as exc:                            # noqa: BLE001
-        rep.note("E2", "final mix format", f"probe failed: {exc}")
+        rep.note(f"E2{suffix}", f"{label} format", f"probe failed: {exc}")
     try:
-        r = _sp.run(["ffmpeg", "-hide_banner", "-nostats", "-i", a, "-af", "ebur128=peak=true",
-                     "-f", "null", "-"], capture_output=True, text=True, timeout=600)
-        import re as _re
+        r = _sp.run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-map", "0:a:0",
+                     "-af", "ebur128=peak=true", "-f", "null", "-"],
+                    capture_output=True, text=True, timeout=600)
         mI = _re.findall(r"I:\s+(-?[0-9.]+) LUFS", r.stderr)
         mP = _re.findall(r"Peak:\s+(-?[0-9.]+) dBFS", r.stderr)
         if mI and mP:
             lufs, tp = float(mI[-1]), float(mP[-1])
-            rep.check("E3", "integrated loudness within −16 ± 1.5 LUFS and true peak ≤ −1 dBTP",
+            rep.check(f"E3{suffix}",
+                      f"{label} loudness within −16 ± 1.5 LUFS and true peak ≤ −1 dBTP",
                       abs(lufs + 16.0) <= 1.5 and tp <= -0.9, f"{lufs} LUFS, {tp} dBTP")
     except Exception:                                   # noqa: BLE001
         pass
+
+
+def eval_mix(state: dict, rep: Report) -> None:
+    a = (state.get("mix") or {}).get("audio")
+    if a and Path(a).exists():
+        _audio_checks(a, rep, "", "final mix")
+    # v2 has no standalone mix file; its audio lives in the delivered video.
+    v2 = (state.get("vc") or {}).get("video")
+    if v2 and Path(v2).exists():
+        _audio_checks(v2, rep, "v", "v2 video audio")
 
 
 def eval_compose(state: dict, rep: Report) -> None:
@@ -613,6 +621,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("state")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--json", default=None,
+                    help="also write every check as JSON (key/desc/ok/value)")
     args = ap.parse_args()
 
     state = json.loads(Path(args.state).read_text(encoding="utf-8"))
@@ -641,6 +651,12 @@ def main() -> int:
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text("# 验收结果\n\n```\n" + text + "\n```\n", encoding="utf-8")
     print(f"\nwritten: {out}")
+    if args.json:
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(
+            json.dumps(rep.rows, ensure_ascii=False, indent=1, default=str),
+            encoding="utf-8")
+        print(f"written: {args.json}")
     return 0 if not any(r["ok"] is False for r in rep.rows) else 1
 
 

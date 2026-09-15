@@ -52,6 +52,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--remote", default="gdrive")
     ap.add_argument("--drive-folder", default=DRIVE_FOLDER)
+    ap.add_argument("--drive-subdir", default="",
+                    help="upload into this subfolder (e.g. v3.1.0) instead of the Drive root")
+    ap.add_argument("--extra", action="append", default=[],
+                    help="extra report file to copy into the demo folder (repeatable)")
     args = ap.parse_args()
 
     from make_demo_clips import make_clips, resolve_source
@@ -94,6 +98,9 @@ def main() -> int:
         p = deliver / fn
         if p.exists():
             shutil.copy2(p, folder / fn)
+    for extra in args.extra:
+        if Path(extra).exists():
+            shutil.copy2(extra, folder / Path(extra).name)
     print(f"folder: {folder} → {sorted(p.name for p in folder.iterdir())}")
 
     if args.upload or args.dry_run:
@@ -102,11 +109,12 @@ def main() -> int:
             print("rclone not installed (expected ~/.local/bin/rclone)")
             return 2
         common = ["--drive-root-folder-id", args.drive_folder, "--checksum", "-P"]
+        base = f"{args.drive_subdir.strip('/')}/" if args.drive_subdir else ""
         cmds = [
-            [rclone, "copy", str(final), f"{args.remote}:", *common],
-            [rclone, "copy", str(folder) + "/", f"{args.remote}:{folder.name}", *common,
+            [rclone, "copy", str(final), f"{args.remote}:{base}", *common],
+            [rclone, "copy", str(folder) + "/", f"{args.remote}:{base}{folder.name}", *common,
              "--transfers", "4"],
-            [rclone, "lsl", f"{args.remote}:", "--drive-root-folder-id", args.drive_folder],
+            [rclone, "lsl", f"{args.remote}:{base}", "--drive-root-folder-id", args.drive_folder],
         ]
         for c in cmds:
             print("$ " + " ".join(c))

@@ -1641,6 +1641,99 @@ def _hymt_translate(
 
 
 # Engine table: (draft_fn_key, polish_model_key or None)
+_FLAG_HINTS = {
+    "F1_pronoun": "译文里出现了人称代词（你/我/他/她…），但日文原文没有主语；请结合上下文确认指代，没有依据就删掉或改正",
+    "F2_question": "译文的疑问/陈述语气和原文不一致",
+    "F3_kana": "译文残留日文假名，请译成中文",
+}
+# F4_length stays a metric only: on v3.0.0 those lines were ASR garbage, which
+# no amount of Chinese rewriting can repair.
+
+
+def _polish_flagged(
+    segments: list[dict],
+    drafts: list[str],
+    *,
+    model: str,
+    base_url: str,
+    glossary: dict | None,
+    report: list[dict] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Re-check only the lines a film-independent rule flags as suspicious.
+
+    Polishing every line lets an LLM "improve" the ~80 % that were already
+    right (LLM post-editing over-corrects on low-error input), so each
+    request carries one flagged line, the reason it was flagged, the four
+    finished lines before it and the next two Japanese lines — the look-
+    ahead a fragment needs.  Output is one plain line, never JSON: weaker
+    models degenerate on structured output.  A candidate replaces the draft
+    only if it passes the same fidelity guards as compact_translation, so
+    this pass can decline to act but cannot invent content.
+    """
+    from ai_movie.config import POLISH_CTX_AFTER, POLISH_CTX_BEFORE, POLISH_TIMEOUT
+    from ai_movie.glossary import format_for_prompt
+    from ai_movie.units import flag_line, polish_edit_ok
+
+    out = [d or "" for d in drafts]
+    for i, seg in enumerate(segments):
+        if cancel_check and cancel_check():
+            break
+        ja = (seg.get("text") or "").strip()
+        draft = out[i].strip()
+        if not ja or not draft:
+            continue
+        flags = [f for f in flag_line(ja, draft) if f in _FLAG_HINTS]
+        if not flags:
+            continue
+        row = {"idx": i, "flags": ",".join(flags), "ja": ja, "draft": draft,
+               "candidate": "", "status": "error"}
+        before = "\n".join(
+            f"「{(segments[j].get('text') or '').strip()}」→「{out[j]}」"
+            for j in range(max(0, i - POLISH_CTX_BEFORE), i) if out[j])
+        after = "\n".join(
+            f"「{(segments[j].get('text') or '').strip()}」"
+            for j in range(i + 1, min(len(segments), i + 1 + POLISH_CTX_AFTER)))
+        gl = format_for_prompt(glossary or {}, [ja])
+        pins = [v["zh"] for k, v in (glossary or {}).items()
+                if v.get("zh") and v["zh"] in draft]
+        prompt = (
+            (f"【术语表（必须遵守）】\n{gl}\n" if gl else "")
+            + (f"【前文（已定稿）】\n{before}\n" if before else "")
+            + (f"【后文（仅供理解语境，不要翻译）】\n{after}\n" if after else "")
+            + f"【待校对】\n原文：{ja}\n草稿：{draft}\n"
+            + "【疑点】\n" + "\n".join(f"- {_FLAG_HINTS[f]}" for f in flags if f in _FLAG_HINTS)
+            + "\n\n只允许删除或替换人称代词、调整语气词和标点（残留假名时可把该词译成中文）；"
+              "草稿里的其他词一个字都不要改，不要添加原文没有的信息。"
+              "如果草稿其实没错，就原样输出草稿。只输出校对后的这一句中文，不要输出前文、后文或解释。"
+        )
+        try:
+            raw = _call_ollama_chat(
+                model,
+                [{"role": "system", "content": "你是日译中字幕校对。只输出一行中文译文。"},
+                 {"role": "user", "content": prompt}],
+                base_url, timeout=POLISH_TIMEOUT, think=False,
+                options={"num_predict": max(96, len(draft) * 4), "temperature": 0.2})
+            cand = next(iter(_clean_ollama_output(raw or "").strip().splitlines()), "").strip()
+        except Exception as exc:                        # noqa: BLE001
+            row["candidate"] = f"{type(exc).__name__}: {exc}"
+            if report is not None:
+                report.append(row)
+            continue
+        row["candidate"] = cand
+        ok = polish_edit_ok(draft, cand, flags) and all(t in cand for t in pins)
+        if not cand or cand == draft:
+            row["status"] = "unchanged"
+        elif ok:
+            out[i] = cand
+            row["status"] = "accepted"
+        else:
+            row["status"] = "rejected"
+        if report is not None:
+            report.append(row)
+    return out
+
+
 TRANSLATE_ENGINES = {
     "sakura":         ("sakura", None),
     "sakura+gptoss":  ("sakura", "gptoss"),
@@ -1648,6 +1741,7 @@ TRANSLATE_ENGINES = {
     "hy-mt2":         ("hymt2", None),
     "hy-mt2+gptoss":  ("hymt2", "gptoss"),
     "hy-mt2+sakura":  ("hymt2", "sakura"),
+    "sakura+qwen":    ("sakura", "qwen"),
 }
 
 ENGINE_LABELS = {
@@ -1657,6 +1751,7 @@ ENGINE_LABELS = {
     "hy-mt2":        "Hy-MT2-30B 直译（原方案）",
     "hy-mt2+gptoss": "Hy-MT2 直译 + gpt-oss-120B 润色",
     "hy-mt2+sakura": "Hy-MT2 直译 + Sakura 润色",
+    "sakura+qwen":   "Sakura 直译 + Qwen3.6 可疑句上下文校对（推荐）",
 }
 
 
@@ -1857,6 +1952,7 @@ def translate_segments(
     scene_hint: str | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    report: list[dict] | None = None,
 ) -> list[str]:
     """Translate *segments* with one of :data:`TRANSLATE_ENGINES`.
 
@@ -1866,7 +1962,7 @@ def translate_segments(
     model can never be resident at the same time on a 122 GB box.
     """
     from ai_movie.config import (
-        OLLAMA_BASE_URL, OLLAMA_GPTOSS_MODEL, OLLAMA_SAKURA_MODEL,
+        OLLAMA_BASE_URL, OLLAMA_GPTOSS_MODEL, OLLAMA_POLISH_MODEL, OLLAMA_SAKURA_MODEL,
     )
 
     if engine not in TRANSLATE_ENGINES:
@@ -1874,7 +1970,8 @@ def translate_segments(
                          f"(known: {', '.join(TRANSLATE_ENGINES)})")
     base_url = base_url or OLLAMA_BASE_URL
     draft_key, polish_key = TRANSLATE_ENGINES[engine]
-    models = {"gptoss": OLLAMA_GPTOSS_MODEL, "sakura": OLLAMA_SAKURA_MODEL}
+    models = {"gptoss": OLLAMA_GPTOSS_MODEL, "sakura": OLLAMA_SAKURA_MODEL,
+              "qwen": OLLAMA_POLISH_MODEL}
 
     # ── draft ───────────────────────────────────────────────────────
     if draft_key == "hymt2":
@@ -1902,8 +1999,13 @@ def translate_segments(
     # ── polish ──────────────────────────────────────────────────────
     m = models[polish_key]
     with exclusive_engine("ollama", ollama_model=m, base_url=base_url):
-        polished = _llm_polish(segments, drafts, model=m, base_url=base_url,
-                               glossary=glossary, progress_cb=progress_cb,
-                               cancel_check=cancel_check)
+        if polish_key == "qwen":
+            polished = _polish_flagged(segments, drafts, model=m, base_url=base_url,
+                                       glossary=glossary, report=report,
+                                       cancel_check=cancel_check)
+        else:
+            polished = _llm_polish(segments, drafts, model=m, base_url=base_url,
+                                   glossary=glossary, progress_cb=progress_cb,
+                                   cancel_check=cancel_check)
     return enforce_glossary(segments, polished, glossary or {},
                             base_url=base_url)

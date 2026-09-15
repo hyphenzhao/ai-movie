@@ -56,6 +56,7 @@ from ai_movie.config import (
     DIARIZE_AHC_THRESHOLD,
     DIARIZE_DEVICE,
     DIARIZE_GENDER_HZ,
+    DIARIZE_GENDER_SOURCE,
     DIARIZE_GENDER_REL_MIN_HZ,
     DIARIZE_MAX_SPEAKERS,
     DIARIZE_PERIOD,
@@ -611,6 +612,7 @@ def diarize_file(
     device: str = DIARIZE_DEVICE,
     progress_cb: Callable[[str], None] | None = None,
     overlap_regions: list | None = None,
+    gender_source: str = DIARIZE_GENDER_SOURCE,
 ) -> dict:
     """Diarize one audio file.
 
@@ -624,8 +626,14 @@ def diarize_file(
         ASR segments to use as labelling units.  Strongly preferred over
         sliding windows — they already end at pauses.
     vocals_path:
-        Separated vocals.  Pitch is measured here (music wrecks pYIN);
-        it is rejected automatically if separation gutted the speech.
+        Separated vocals, used for the ECAPA speaker-identity split (and for
+        gender too when ``gender_source="vocals"``).  Rejected automatically
+        if separation gutted the speech.
+    gender_source:
+        ``"mix"`` measures pitch and the timbre classifier on the original
+        audio; ``"vocals"`` on the separated track.  Separation shifts the
+        spectrum upward and has made male voices read as female, which is
+        why the default is the mix.
 
     Returns::
 
@@ -647,6 +655,8 @@ def diarize_file(
         except Exception:                               # noqa: BLE001
             vocals = None
     pitch_audio = _pick_embed_source(audio, vocals, spans)
+    gender_audio = audio if gender_source == "mix" else pitch_audio
+    gender_tag = "mix" if gender_audio is audio else "vocals"
 
     units = _units_from(spans, segments)
     if not units:
@@ -654,7 +664,10 @@ def diarize_file(
                 "backend": "f0"}
 
     _say("音高分析中…")
-    f0, ok, fps = pitch_track(pitch_audio, cache_key=str(audio_path))
+    _say(f"性别测量音源：{gender_tag}")
+    # The key names the array, not just the file: extract_speaker_references
+    # tracks the vocals under the same audio path.
+    f0, ok, fps = pitch_track(gender_audio, cache_key=f"{audio_path}|{gender_tag}")
     u_f0 = [unit_f0(f0, ok, fps, s, e) for s, e in units]
 
     voiced = [(v, e - s) for v, (s, e) in zip(u_f0, units) if v]
@@ -703,7 +716,7 @@ def diarize_file(
                 confs[i] = 0.0
             if exclude:
                 _say(f"重叠语音：{len(exclude)} 个单元不参与声道分类")
-        genders, chan_info = _refine_with_channel(pitch_audio, units,
+        genders, chan_info = _refine_with_channel(gender_audio, units,
                                                   genders, confs,
                                                   exclude=exclude)
         if chan_info.get("overridden"):
@@ -783,6 +796,7 @@ def diarize_file(
         "backend": "f0+channel" + ("+ecapa" if sub_info else "")
                    + ("+osd" if overlap_regions else ""),
         "pitch": pinfo,
+        "gender_source": gender_tag,
         "cut_hz": cut,
         "subsplit": sub_info,
         "channel": chan_info,
@@ -1274,7 +1288,7 @@ def extract_speaker_references(
             voc = None
 
     f0, ok, fps = pitch_track(voc if voc is not None else orig,
-                              cache_key=str(audio_path))
+                              cache_key=f"{audio_path}|{'vocals' if voc is not None else 'mix'}")
 
     # ── build candidate runs (consecutive same-speaker segments) ────
     by_spk: dict[str, list[list[dict]]] = {}
