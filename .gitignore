@@ -68,3 +68,6 @@ vendor/tts_transformers/
 vendor/osd_venv/
 deliver/
 asset/hf_token
+
+# 测试视频与外部参考字幕（不入库）
+inputs/
