@@ -46,7 +46,12 @@ def probe(model: str, timeout: int) -> dict:
         return res
     t0 = time.time()
     try:
-        with T.exclusive_engine("ollama", ollama_model=model, base_url=OLLAMA_BASE_URL):
+        # stdout carries exactly one thing — the chosen model name — because
+        # the release runner captures it with $(...).  Engine chatter would
+        # otherwise end up inside AI_MOVIE_POLISH_MODEL and every polish
+        # request would come back HTTP 400 (it did, on the first v3.1.0 run).
+        with T.exclusive_engine("ollama", ollama_model=model, base_url=OLLAMA_BASE_URL,
+                                log_cb=lambda m: print(f"[engine] {m}", file=sys.stderr)):
             for ja, draft in PROBES:
                 try:
                     raw = T._call_ollama_chat(

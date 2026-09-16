@@ -1703,9 +1703,10 @@ def _polish_flagged(
             + (f"【后文（仅供理解语境，不要翻译）】\n{after}\n" if after else "")
             + f"【待校对】\n原文：{ja}\n草稿：{draft}\n"
             + "【疑点】\n" + "\n".join(f"- {_FLAG_HINTS[f]}" for f in flags if f in _FLAG_HINTS)
-            + "\n\n只允许删除或替换人称代词、调整语气词和标点（残留假名时可把该词译成中文）；"
-              "草稿里的其他词一个字都不要改，不要添加原文没有的信息。"
-              "如果草稿其实没错，就原样输出草稿。只输出校对后的这一句中文，不要输出前文、后文或解释。"
+            + "\n\n规则：优先直接删掉没有依据的人称代词，其余每个字原样保留；"
+              "实在不能删就换成正确的代词。不要改写句子，不要补充原文没有的信息。\n"
+              "示例：原文「好きなのかも。」草稿「我可能喜欢上你了。」→ 输出「我可能喜欢上了。」\n"
+              "如果草稿确实没问题，就原样输出草稿。只输出这一句中文，不要输出前文、后文或解释。"
         )
         try:
             raw = _call_ollama_chat(
@@ -1713,8 +1714,25 @@ def _polish_flagged(
                 [{"role": "system", "content": "你是日译中字幕校对。只输出一行中文译文。"},
                  {"role": "user", "content": prompt}],
                 base_url, timeout=POLISH_TIMEOUT, think=False,
-                options={"num_predict": max(96, len(draft) * 4), "temperature": 0.2})
+                options={"num_predict": max(96, len(draft) * 4), "temperature": 0.0,
+                         "seed": 7})
             cand = next(iter(_clean_ollama_output(raw or "").strip().splitlines()), "").strip()
+            # One stricter retry: the guard only accepts deletions and
+            # function-word swaps, so a rejected rewrite usually just means
+            # the model reworded when it should have deleted.
+            if cand and not polish_edit_ok(draft, cand, flags):
+                raw2 = _call_ollama_chat(
+                    model,
+                    [{"role": "system", "content": "你是日译中字幕校对。只输出一行中文译文。"},
+                     {"role": "user", "content": prompt
+                      + "\n\n注意：上一次的改写改动了太多字。这次只允许删除多余的人称代词，"
+                        "其他字符一个都不要改。"}],
+                    base_url, timeout=POLISH_TIMEOUT, think=False,
+                    options={"num_predict": max(96, len(draft) * 4), "temperature": 0.0,
+                             "seed": 11})
+                cand2 = next(iter(_clean_ollama_output(raw2 or "").strip().splitlines()), "").strip()
+                if cand2 and polish_edit_ok(draft, cand2, flags):
+                    cand = cand2
         except Exception as exc:                        # noqa: BLE001
             row["candidate"] = f"{type(exc).__name__}: {exc}"
             if report is not None:

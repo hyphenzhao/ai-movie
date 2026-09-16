@@ -41,9 +41,23 @@ if ! ollama list | awk 'NR>1{print $1}' | grep -qx "$MODEL"; then
 fi
 ollama list | awk 'NR>1{print $1}' | grep -qx "$MODEL" \
   || echo "WARNING: $MODEL still not downloaded after the wait — smoke test falls back"
-if CHOSEN=$($PY scripts/smoke_polish_model.py --model "$MODEL" --json "$REL/smoke.json"); then
+if CHOSEN=$($PY scripts/smoke_polish_model.py --model "$MODEL" --json "$REL/smoke.json" | tail -n 1); then
+  case "$CHOSEN" in
+    *[![:print:]]*|"") die "smoke test returned no usable model name: '$CHOSEN'" ;;
+  esac
   export AI_MOVIE_POLISH_MODEL="$CHOSEN"
   echo "polish model: $CHOSEN"
+  # prove the name survives the round trip before six hours of GPU work
+  $PY -c "
+import os, sys
+sys.path.insert(0, '.')
+from ai_movie import translator as T
+from ai_movie.config import OLLAMA_BASE_URL
+m = os.environ['AI_MOVIE_POLISH_MODEL']
+r = T._call_ollama_chat(m, [{'role': 'user', 'content': '只回复：好'}], OLLAMA_BASE_URL,
+                        timeout=120, think=False, options={'num_predict': 8})
+print('polish round-trip ok:', (r or '').strip()[:20])
+" || die "polish model $CHOSEN does not answer through the pipeline path"
 else
   die "no polish model answers (see $REL/smoke.json)"
 fi
