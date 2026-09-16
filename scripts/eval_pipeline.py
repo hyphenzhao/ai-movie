@@ -330,6 +330,15 @@ def eval_lipsync_frames(state: dict, rep: Report, *, samples: int = 30,
     # is what made an earlier version report a 267 ms drift that isn't there.
     anchored = sorted(int(k) for k in frames_map)
     anchored_set = set(anchored)
+    # …but a target box is not a promise that MuseTalk regenerated the frame:
+    # the plan anchors every tracked frame, while lip_sync only processes
+    # `sync_ranges`, and the gate skips profile/small faces inside those.  On
+    # test_2 only 1953 of 2837 anchored frames lie inside a range, so five of
+    # six "unchanged" samples were frames nothing ever touched.  D4 therefore
+    # samples the frames lip-sync actually worked on.
+    sync_ranges = plan.get("sync_ranges") or []
+    processed = [f for f in anchored
+                 if any(a <= f / fps <= b for a, b in sync_ranges)] or anchored
     guard = int(round(2.0 * fps))       # stay well clear of clip boundaries
     n_total = int(plan.get("n_frames") or (max(anchored) + 1 if anchored else 0))
     unanchored = [i for i in range(0, n_total)
@@ -356,7 +365,7 @@ def eval_lipsync_frames(state: dict, rep: Report, *, samples: int = 30,
     # wanders — which is what made an earlier version of this check report a
     # 10-frame drift that did not exist.  Gaps and unbound speakers are
     # untouched, so they give the true timeline offset.
-    un_idx, an_idx = pick(unanchored), pick(anchored)
+    un_idx, an_idx = pick(unanchored), pick(processed)
 
     def diff_at(idx, off):
         fa = read_at(cap_a, idx)
