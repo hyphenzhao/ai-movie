@@ -19,7 +19,7 @@ PY="$ROOT/.venv/bin/python"
 REL="$ROOT/workspace/_release/$VER"
 BASE="$ROOT/workspace/_archive_v3.0.0"
 FILMS="${FILMS:-output_test test_1 test_2}"
-MODEL="fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest"
+MODEL="${POLISH_MODEL:-ttempvnn/HauhauCS-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4-K-M:latest}"
 mkdir -p "$REL"
 exec > >(tee -a "$REL/run.log") 2>&1
 
@@ -30,7 +30,7 @@ ASR_ARGS=""
 
 stage "1: polish model"
 if ! ollama list | awk 'NR>1{print $1}' | grep -qx "$MODEL"; then
-  for _ in $(seq 1 90); do                       # up to 90 min, then fall back
+  for _ in $(seq 1 360); do                      # up to 6 h (flaky VPN), then fall back
     ollama list | awk 'NR>1{print $1}' | grep -qx "$MODEL" && break
     if ! pgrep -f "pull_retry.sh|ollama pull" >/dev/null; then
       echo "download not running — starting it"

@@ -9,6 +9,7 @@ Supports two backends:
 import logging
 import os
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
@@ -963,6 +964,15 @@ def build_speech_track(
     return output_path
 
 
+def encoded_true_peak(path: Path) -> float | None:
+    """True peak (dBTP) of the first audio stream of an encoded file."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+                        "-map", "0:a:0", "-af", "ebur128=peak=true", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    peaks = re.findall(r"Peak:\s+(-?[0-9.]+) dBFS", r.stderr)
+    return float(peaks[-1]) if peaks else None
+
+
 def compose_video(
     video_path: Path,
     audio_path: Path,
@@ -973,19 +983,35 @@ def compose_video(
 
     Copies the video stream without re-encoding; re-encodes audio to AAC 192k.
     *progress_cb* is called with a status string at key steps.
+
+    The WAV is already normalised to ``MIX_TRUE_PEAK_DB``, but a lossy
+    encoder reconstructs peaks slightly higher than the samples it was given
+    — measured on v3.1.0, AAC 192k added 0.6 dB on one film and 2.0 dB on
+    another, pushing the delivered track to +0.2 dBTP.  Lowering the mix
+    target for everyone would cost loudness on material that never clips, so
+    instead the encoded result is measured and, only when it overshoots,
+    re-encoded with exactly the attenuation it needs.
     """
+    from ai_movie.config import MIX_TRUE_PEAK_DB
+
     if progress_cb:
         progress_cb("FFmpeg 合成中…")
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-i", str(audio_path),
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "192k",
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-shortest",
-        str(output_path),
-    ], capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace")[-500:])
+    ceiling = max(MIX_TRUE_PEAK_DB, -1.0)      # delivery limit, not the mix target
+    gain_db = 0.0
+    for attempt in range(3):
+        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+        if gain_db:
+            cmd += ["-af", f"volume={gain_db:.2f}dB"]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_path)]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.decode(errors="replace")[-500:])
+        tp = encoded_true_peak(output_path)
+        if tp is None or tp <= ceiling:
+            return output_path
+        gain_db += round(ceiling - 0.3 - tp, 2)
+        if progress_cb:
+            progress_cb(f"编码后真峰值 {tp:+.1f} dBTP 超出 {ceiling:.1f}，"
+                        f"以 {gain_db:.2f} dB 重新编码")
     return output_path

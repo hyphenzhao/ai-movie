@@ -542,16 +542,38 @@ def eval_cuts(state: dict, rep: Report) -> None:
     if not frames:
         return
     from ai_movie.faces import boxes_disjoint
-    jumps = 0
+    # A shot can legitimately change lip-sync target: when two people trade
+    # lines inside one shot the box moves to whoever speaks next, and it
+    # moves during the silence *before* that line starts.  What is broken is
+    # a box that jumps away and comes straight back — one or two frames
+    # animating the wrong face.  So a jump only counts when it does not
+    # persist.  (v3.1.0: test_2's two "jumps" both sat on S0→S1 turns and
+    # held for 12+ frames, and they only appeared because the gender fix
+    # finally found the second speaker.)
+    persist = 10
+    jumps, switches = 0, 0
     for k, box in frames.items():
         f = int(k)
         nxt = frames.get(str(f + 1))
         if nxt is None or (f + 1) in cuts:
             continue
-        if boxes_disjoint(box, nxt):
+        if not boxes_disjoint(box, nxt):
+            continue
+        returned = False
+        for d in range(2, persist + 2):
+            later = frames.get(str(f + d))
+            if later is None or (f + d) in cuts:
+                break
+            if not boxes_disjoint(box, later):
+                returned = True
+                break
+        if returned:
             jumps += 1
-    rep.check("D8", "no target-box jump between consecutive frames inside a shot",
-              jumps == 0, jumps)
+        else:
+            switches += 1
+    if switches:
+        rep.note("D8b", "target switched to another face and stayed (speaker turn)", switches)
+    rep.check("D8", "no flickering target box inside a shot", jumps == 0, jumps)
 
 
 def eval_qc(state: dict, rep: Report) -> None:

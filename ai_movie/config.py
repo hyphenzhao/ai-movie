@@ -524,7 +524,7 @@ OLLAMA_SAKURA_MODEL = "quantumcookie/Sakura-qwen2.5-v1.0:14b"
 import os as _os
 OLLAMA_POLISH_MODEL = _os.environ.get(
     "AI_MOVIE_POLISH_MODEL",
-    "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest")
+    "ttempvnn/HauhauCS-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4-K-M:latest")
 POLISH_CTX_BEFORE = 4
 POLISH_CTX_AFTER = 2
 POLISH_TIMEOUT = 300
@@ -537,7 +537,7 @@ OLLAMA_MODEL_SIZE_GB = {
     "dolphin-mixtral:8x22b": 80.0,
     "dolphin-mixtral:8x7b": 27.0,
     "quantumcookie/Sakura-qwen2.5-v1.0:14b": 13.0,
-    "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest": 24.0,
+    "ttempvnn/HauhauCS-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4-K-M:latest": 24.0,
 }
 
 # Evict other loaded ollama models before running one bigger than this.

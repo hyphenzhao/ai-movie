@@ -254,15 +254,19 @@ def polish_edit_ok(draft: str, cand: str, flags: list[str]) -> bool:
         if not cjk or not (0.6 <= len(cand) / kept <= 1.6 + len(draft) / kept):
             return False
         return sum(1 for c in cjk if c in set(draft)) / len(cjk) >= 0.5
+    # Deleting can only ever remove something the Japanese did not have, so
+    # any deletion is allowed; inserting or substituting is how a "fix"
+    # invents content (电视剧 → 电影 deletes 视剧 *and* inserts 影), so only
+    # function words may be inserted.
     sm = difflib.SequenceMatcher(None, draft, cand, autojunk=False)
     for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == "equal":
-            continue
-        if any(c not in _DELETABLE for c in draft[i1:i2]):
+        if op != "equal" and any(c not in _INSERTABLE for c in cand[j1:j2]):
             return False
-        if any(c not in _INSERTABLE for c in cand[j1:j2]):
-            return False
-    return True
+    # …but over-deleting leaves broken Chinese ("因为有她在背后支持着我" →
+    # "因为有支持着"), so keep at least half the line and refuse a dangling tail.
+    if len(cand) < 0.55 * len(draft):
+        return False
+    return cand.rstrip("。！？!?…，、,") [-1:] not in set("着地得把被和与在给对从让")
 
 
 def sentence_ends(text: str | None) -> int:
