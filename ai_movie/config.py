@@ -186,7 +186,17 @@ ASR_INITIAL_PROMPT: dict[str, str] = {}
 ASR_DIARIZE = True
 
 # "ecapa" — local models/speechbrain-ecapa (no download, no HF token).
-DIARIZE_BACKEND = "ecapa"
+# "pyannote": pyannote segmentation + clustering decides *who* (worker in the
+# OSD venv, see ai_movie/diar_worker.py), our pitch decides the voice type;
+# "ecapa": the original pitch-gender + ECAPA-within-gender path.  pyannote is
+# the trial default from v3.2: it found the interviewer on test_1 that the
+# ECAPA path never did.  Flip back here if it proves worse.
+DIARIZE_BACKEND = "pyannote"
+# Report lines whose confidently-classified on-screen face disagrees with the
+# voice's gender label while the acoustic evidence is weak.  Recorded at the
+# faces step (04_face_gender_conflicts.csv + state) for the review tools to
+# apply; not applied automatically because faces run after TTS.
+DIARIZE_FACE_FEEDBACK = True
 
 # ECAPA embedding device.  CPU is plenty (192-d embeddings on 1.5 s windows)
 # and avoids ROCm/MIOpen JIT stalls on gfx1151.

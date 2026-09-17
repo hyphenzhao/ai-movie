@@ -45,6 +45,8 @@ a minute, and the speaker column of ``01_speakers.csv`` is editable.
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -54,6 +56,7 @@ import numpy as np
 
 from ai_movie.config import (
     DIARIZE_AHC_THRESHOLD,
+    DIARIZE_BACKEND,
     DIARIZE_DEVICE,
     DIARIZE_GENDER_HZ,
     DIARIZE_GENDER_SOURCE,
@@ -602,6 +605,169 @@ def _smooth_labels(units: list[tuple[float, float]], labels: list[str],
     return out
 
 
+def _run_diar_worker(audio_path: str | Path, *, num_speakers: int | None,
+                     timeout: int = 1800) -> dict:
+    """Run :mod:`ai_movie.diar_worker` inside the pyannote venv."""
+    import subprocess
+    import tempfile
+    from ai_movie.config import OSD_VENV
+    py = Path(OSD_VENV) / "bin" / "python"
+    if not py.exists():
+        raise RuntimeError(f"pyannote venv missing: {py}")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+        out = Path(fh.name)
+    cmd = [str(py), "-m", "ai_movie.diar_worker", str(audio_path), str(out)]
+    if num_speakers:
+        cmd += ["--num-speakers", str(num_speakers)]
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    doc = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
+    out.unlink(missing_ok=True)
+    if not doc.get("turns"):
+        raise RuntimeError(doc.get("error") or "worker produced no turns")
+    return doc
+
+
+def _diarize_pyannote(
+    audio_path: str | Path,
+    units: list[tuple[float, float]],
+    u_f0: list[float | None],
+    cut: float | None,
+    embed_audio: np.ndarray,
+    *,
+    num_speakers: int | None,
+    device: str,
+    progress_cb: Callable[[str], None] | None = None,
+) -> tuple[list[str], dict]:
+    """Label *units* with pyannote's speaker clusters; gender stays ours.
+
+    pyannote's segmentation model is overlap-aware and its clustering was
+    trained for many-speaker material, which is exactly where the pitch +
+    ECAPA path lost speakers (test_1: it found one, pyannote finds the
+    interviewer too).  Two corrections are applied on top:
+
+    * **Dominant speaker per unit.**  A unit gets the cluster that covers
+      most of it, so an overlapped line is dubbed as the person who says
+      most of it instead of guessing.
+    * **Merge over-splits.**  Agglomerative clustering without the (gated)
+      PLDA occasionally splits one voice in two — on test_2 two "speakers"
+      sat 0.32 apart in ECAPA space while every real pair was ≥ 0.65.  Any
+      pair closer than ``DIARIZE_AHC_THRESHOLD`` is merged.
+
+    Gender comes from the per-cluster F0 median against the film's own pitch
+    cut, not from the cluster label: pyannote knows *who*, pitch knows
+    *which voice type* to synthesise.
+    """
+    def _say(msg: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+
+    doc = _run_diar_worker(audio_path, num_speakers=num_speakers)
+    turns = doc["turns"]
+    _say(f"pyannote：{len(doc['speakers'])} 个簇，{doc.get('seconds')} s")
+
+    # dominant cluster per unit; units nothing covers take the nearest turn
+    raw: list[str | None] = []
+    for s, e in units:
+        acc: dict[str, float] = {}
+        for t in turns:
+            ov = min(e, t["end"]) - max(s, t["start"])
+            if ov > 0:
+                acc[t["speaker"]] = acc.get(t["speaker"], 0.0) + ov
+        if acc:
+            raw.append(max(acc, key=acc.get))
+            continue
+        mid = (s + e) / 2
+        near = min(turns, key=lambda t: min(abs(mid - t["start"]), abs(mid - t["end"])))
+        raw.append(near["speaker"])
+
+    # merge clusters that ECAPA says are one voice
+    clusters = sorted(set(raw))
+    merged = {c: c for c in clusters}
+    cents: dict[str, np.ndarray] = {}
+    for c in clusters:
+        spans = [u for u, r in zip(units, raw) if r == c]
+        try:
+            embs, _ = embed_windows(embed_audio, spans, device=device)
+        except Exception:                               # noqa: BLE001
+            embs = np.zeros((0, 192), np.float32)
+        if len(embs):
+            v = embs.mean(0)
+            cents[c] = v / (np.linalg.norm(v) + 1e-9)
+    changed = True
+    while changed:
+        changed = False
+        keys = sorted({merged[c] for c in clusters if c in cents})
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = keys[i], keys[j]
+                if a not in cents or b not in cents:
+                    continue
+                dist = 1.0 - float(cents[a] @ cents[b])
+                if dist < DIARIZE_AHC_THRESHOLD:
+                    for c in clusters:
+                        if merged[c] == b:
+                            merged[c] = a
+                    _say(f"合并簇 {b}→{a}（ECAPA 距离 {dist:.2f}）")
+                    changed = True
+                    break
+            if changed:
+                break
+    canon = [merged[r] for r in raw]
+
+    # Gender per *unit*, not per cluster.  An off-camera interviewer's short
+    # questions get absorbed into the actress's cluster (output_test: the
+    # 107 Hz male vanished into two "female" clusters), so a cluster can hold
+    # two voice types.  A unit with enough pitch evidence keeps its own
+    # gender and becomes its own speaker inside that cluster; the rest follow
+    # the cluster's majority.  Same-gender identity still comes from pyannote.
+    thr = cut if cut is not None else DIARIZE_GENDER_HZ
+    cl_major: dict[str, str] = {}
+    for c in sorted(set(canon)):
+        vals = [v for v, r in zip(u_f0, canon) if r == c and v]
+        med = float(np.median(vals)) if vals else thr
+        cl_major[c] = "female" if med >= thr else "male"
+    # Units whose own pitch contradicts their cluster are pooled into one
+    # speaker per gender: pyannote already failed to separate that voice, so
+    # spreading its lines over "male/SPEAKER_00" and "male/SPEAKER_01" would
+    # invent two interviewers where there is one.
+    labels = []
+    for (s, e), v, c in zip(units, u_f0, canon):
+        if v and (e - s) >= 0.6:
+            g = "female" if v >= thr else "male"
+        else:
+            g = cl_major[c]
+        labels.append(f"{g}/{c}" if g == cl_major[c] else f"{g}/other")
+    # …unless pyannote already has a cluster of that gender and the pooled
+    # lines sound like it (test_2: the pooled male lines sat next to the
+    # male cluster, and two "men" would have meant two cloned voices).
+    for g in ("male", "female"):
+        pooled = [u for u, l in zip(units, labels) if l == f"{g}/other"]
+        homes = [c for c, mg in cl_major.items() if mg == g and c in cents]
+        if not pooled or not homes:
+            continue
+        try:
+            embs, _ = embed_windows(embed_audio, pooled, device=device)
+        except Exception:                               # noqa: BLE001
+            continue
+        if not len(embs):
+            continue
+        v = embs.mean(0)
+        v = v / (np.linalg.norm(v) + 1e-9)
+        best = min(homes, key=lambda c: 1.0 - float(cents[c] @ v))
+        dist = 1.0 - float(cents[best] @ v)
+        if dist < DIARIZE_AHC_THRESHOLD:
+            labels = [f"{g}/{best}" if l == f"{g}/other" else l for l in labels]
+            _say(f"{g} 零散段并入簇 {best}（ECAPA 距离 {dist:.2f}）")
+    labels = _smooth_labels(units, labels)
+    info = {"backend": doc.get("backend"), "raw_clusters": clusters,
+            "merged": {k: v for k, v in merged.items() if k != v},
+            "cluster_gender": cl_major, "worker_seconds": doc.get("seconds"),
+            "unit_gender_overrides": sum(1 for l, c in zip(labels, canon)
+                                         if not l.startswith(cl_major[c]))}
+    return labels, info
+
+
 def diarize_file(
     audio_path: str | Path,
     *,
@@ -613,6 +779,7 @@ def diarize_file(
     progress_cb: Callable[[str], None] | None = None,
     overlap_regions: list | None = None,
     gender_source: str = DIARIZE_GENDER_SOURCE,
+    backend: str = DIARIZE_BACKEND,
 ) -> dict:
     """Diarize one audio file.
 
@@ -727,10 +894,19 @@ def diarize_file(
 
         genders = _smooth_labels(units, genders)
 
-    # ── split same-gender speakers with ECAPA (optional refinement) ──
+    # ── who is speaking: pyannote clusters, or ECAPA within each gender ──
     labels = list(genders)
     sub_info: dict = {}
-    if num_speakers is None or num_speakers > len(set(genders)):
+    if backend == "pyannote":
+        try:
+            labels, sub_info = _diarize_pyannote(
+                audio_path, units, u_f0, cut, pitch_audio,
+                num_speakers=num_speakers, device=device, progress_cb=progress_cb)
+            chan_info = {**chan_info, "backend": "pyannote"}
+        except Exception as exc:                        # noqa: BLE001
+            _say(f"pyannote 说话人日志失败，回退到音高+ECAPA：{type(exc).__name__}: {exc}")
+            backend = "ecapa"
+    if backend != "pyannote" and (num_speakers is None or num_speakers > len(set(genders))):
         try:
             labels, sub_info = _split_same_gender(
                 pitch_audio, units, genders, num_speakers=num_speakers,
@@ -793,7 +969,8 @@ def diarize_file(
         "turns": turns,
         "speakers": speakers,
         "num_speakers": len(speakers),
-        "backend": "f0+channel" + ("+ecapa" if sub_info else "")
+        "backend": ("pyannote+f0" if backend == "pyannote" else
+                    "f0+channel" + ("+ecapa" if sub_info else ""))
                    + ("+osd" if overlap_regions else ""),
         "pitch": pinfo,
         "gender_source": gender_tag,

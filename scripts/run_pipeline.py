@@ -146,6 +146,7 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.segmenter.split_into_sentences", "ai_movie.diarize.diarize_file",
             "ai_movie.diarize._refine_with_channel", "ai_movie.diarize.split_by_pitch",
             "ai_movie.asr._transcribe_chunk", "ai_movie.diarize._pick_embed_source",
+            "ai_movie.diarize._diarize_pyannote", "ai_movie.diarize._run_diar_worker",
             "run_pipeline._asr_source", "run_pipeline._vocals_trusted",
             "run_pipeline._drop_silent_segments"],
     "glossary": ["ai_movie.glossary.build_glossary"],
@@ -167,7 +168,7 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.composer.segment_slots"],
     "mix": ["ai_movie.composer.mix_audio", "ai_movie.composer.build_speech_track",
             "ai_movie.composer.loudnorm_two_pass"],
-    "faces": ["ai_movie.faces.build_face_plan", "ai_movie.faces.detect_face_tracks",
+    "faces": ["run_pipeline._face_gender_conflicts", "ai_movie.faces.build_face_plan", "ai_movie.faces.detect_face_tracks",
               "ai_movie.faces.gate_frames", "ai_movie.faces.bind_speakers_to_tracks",
               "ai_movie.faces.bind_segments_to_tracks", "ai_movie.faces.interpolate_track",
               "ai_movie.shots.detect_cuts"],
@@ -185,6 +186,7 @@ STEP_FILES: dict[str, list[str]] = {
     # units.py keeps its rules in module-level regexes and character sets,
     # which a function-source hash cannot see.
     "translate": ["ai_movie/units.py"],
+    "asr": ["ai_movie/diar_worker.py"],
     "lipsync": ["patches/musetalk_rotation_align.patch",
                 "patches/musetalk_target_face.patch",
                 "patches/musetalk_quality.patch",
@@ -302,7 +304,8 @@ def _args_extra(step: str, args) -> dict:
         return {}
     pick = {
         "asr": ["language", "asr_backend", "num_speakers", "no_diarize",
-                "dialogue_refine", "dialogue_model", "asr_audio", "gender_source"],
+                "dialogue_refine", "dialogue_model", "asr_audio", "gender_source",
+                "diarize_backend"],
         "glossary": ["translate_helper"],
         "translate": ["engines", "chosen_engine", "no_units"],
         "tts": ["voice_mode", "no_ref_probe"],
@@ -575,7 +578,8 @@ def step_asr(ctx: Ctx, args) -> None:
         diar = diarize_mod.diarize_file(
             audio, vocals_path=vocals, segments=segments,
             num_speakers=args.num_speakers, progress_cb=log,
-            overlap_regions=overlap, gender_source=args.gender_source)
+            overlap_regions=overlap, gender_source=args.gender_source,
+            backend=args.diarize_backend)
 
         if args.dialogue_refine:
             diar = diarize_mod.refine_speakers_with_dialogue(
@@ -1086,9 +1090,61 @@ def step_faces(ctx: Ctx, args) -> None:
          "anchored_frames": len(plan["frames"]), "n_frames": plan["n_frames"],
          "gate": plan.get("gate"), "segment_gated": plan.get("segment_gated")},
         ctx.deliver / "04_face_plan_summary.json")
+    conflicts = _face_gender_conflicts(ctx, plan, segs)
+    if conflicts:
+        artifacts.export_csv(conflicts, ctx.deliver / "04_face_gender_conflicts.csv")
+        log(f"  画面性别与声音性别冲突 {len(conflicts)} 段（声学证据弱、人脸判断强）"
+            f" → 04_face_gender_conflicts.csv")
     ctx.put("faces", {"plan_path": str(ctx.work / "face_plan.json"),
                       "speaker_track": plan["speaker_track"],
-                      "tracks": rows})
+                      "tracks": rows, "gender_conflicts": conflicts})
+
+
+def _face_gender_conflicts(ctx: Ctx, plan: dict, segs: list[dict],
+                           *, face_conf: float = 0.8, voice_conf: float = 0.5) -> list[dict]:
+    """Lines whose on-screen face contradicts the voice's gender label.
+
+    The face classifier sees the person; the diarizer only hears a pitch.
+    When a segment is bound to a face track the classifier is sure about
+    (conf ≥ *face_conf*) and the acoustic label for that segment is weak
+    (unit conf < *voice_conf*), the picture is the better witness.  This
+    step only *records* the disagreement: faces run after TTS, so flipping
+    the label here would leave already-synthesised audio in the wrong voice.
+    Applying it is the web editor's / review_speakers' job, which restamps
+    asr and lets tts re-run.  (DIARIZE_FACE_FEEDBACK gates the report.)
+    """
+    from ai_movie.config import DIARIZE_FACE_FEEDBACK
+    if not DIARIZE_FACE_FEEDBACK:
+        return []
+    tracks = {t["id"]: t for t in plan.get("tracks") or []}
+    units = (ctx.state.get("asr", {}).get("diarization") or {}).get("units") or []
+
+    def unit_conf(seg: dict) -> float | None:
+        mid = (float(seg["start"]) + float(seg["end"])) / 2
+        for u in units:
+            if float(u["start"]) - 0.3 <= mid <= float(u["end"]) + 0.3:
+                return float(u.get("conf") or 0.0)
+        return None
+
+    out = []
+    for key, tid in (plan.get("segment_track") or {}).items():
+        i = int(key)
+        if tid is None or i >= len(segs):
+            continue
+        tr = tracks.get(int(tid))
+        seg = segs[i]
+        if not tr or not tr.get("gender") or (tr.get("conf") or 0) < face_conf:
+            continue
+        if tr["gender"] == seg.get("gender"):
+            continue
+        vc = unit_conf(seg)
+        if vc is not None and vc >= voice_conf:
+            continue
+        out.append({"idx": i, "start": round(float(seg["start"]), 2),
+                    "speaker": seg.get("speaker"), "voice_gender": seg.get("gender"),
+                    "voice_conf": vc, "track": int(tid), "face_gender": tr["gender"],
+                    "face_conf": tr.get("conf"), "text": (seg.get("text") or "")[:30]})
+    return out
 
 
 def step_lipsync(ctx: Ctx, args) -> None:
@@ -1253,12 +1309,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="re-run steps even if state already has them")
     ap.add_argument("--language", default="ja")
     ap.add_argument("--asr-backend", default="openai-whisper")
-    from ai_movie.config import ASR_AUDIO_SOURCE, DIARIZE_GENDER_SOURCE
+    from ai_movie.config import ASR_AUDIO_SOURCE, DIARIZE_BACKEND, DIARIZE_GENDER_SOURCE
     ap.add_argument("--asr-audio", default=ASR_AUDIO_SOURCE, choices=["vocals", "mix"],
                     help="audio Whisper transcribes; gender is measured separately")
     ap.add_argument("--gender-source", default=DIARIZE_GENDER_SOURCE,
                     choices=["mix", "vocals"],
                     help="audio pitch/timbre gender is measured on")
+    ap.add_argument("--diarize-backend", default=DIARIZE_BACKEND,
+                    choices=["pyannote", "ecapa"],
+                    help="who-is-speaking: pyannote clusters (worker) or pitch+ECAPA")
     ap.add_argument("--num-speakers", type=int, default=None)
     ap.add_argument("--no-diarize", action="store_true")
     # OFF by default: the only local model strong enough for this task
