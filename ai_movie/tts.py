@@ -952,6 +952,7 @@ def run_vc_conversion(
     source_key: str = "audio_fit",
     model_choice: str = "cosyvoice3",
     min_seconds: float = 0.7,
+    chunk_seconds: float = 1.5,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[int, dict]:
@@ -995,6 +996,10 @@ def run_vc_conversion(
     seg_sources: dict[int, str] = {}
     results: dict[int, dict] = {}
 
+    import soundfile as _sf
+
+    # ── which lines can be converted at all ─────────────────────────
+    convertible: dict[int, tuple[str, str, float]] = {}      # i → (src, ref, dur)
     for i, seg in enumerate(segments):
         src = seg.get(source_key) or seg.get("audio")
         if not src or not Path(src).exists():
@@ -1007,16 +1012,57 @@ def run_vc_conversion(
             results[i] = {"audio": src, "mode": "builtin", "vc": False}
             continue
         try:
-            import soundfile as _sf
-            if _sf.info(str(src)).duration < min_seconds:
+            dur = _sf.info(str(src)).duration
+        except Exception:                               # noqa: BLE001
+            dur = min_seconds
+        convertible[i] = (str(src), ref_audio, dur)
+
+    # ── chunk short lines with their neighbours ─────────────────────
+    #
+    # Converting each line on its own made a monologue sound like several
+    # people: every line under `min_seconds` (17 of 33 fallbacks on
+    # output_test) and most short lines that failed conversion kept the
+    # built-in voice, so the timbre flipped back and forth mid-speech.  A
+    # short line is only short in isolation — joined to the neighbouring
+    # lines of the same speaker it becomes a ≥1.5 s chunk that converts
+    # reliably, and the chunk is split back at the silences inserted
+    # between the lines.
+    chunks = _vc_chunks(segments, convertible, min_seconds=min_seconds,
+                        target_seconds=chunk_seconds)
+    chunk_dir = ensure_dir(output_dir / "chunks")
+    chunk_meta: dict[int, dict] = {}                     # synthetic id → layout
+    for members in chunks:
+        first = members[0]
+        if len(members) == 1:
+            i = first
+            src, ref_audio, dur = convertible[i]
+            if dur < min_seconds:
                 results[i] = {"audio": src, "mode": "builtin", "vc": False,
                               "skipped": "too short to convert safely"}
                 continue
-        except Exception:                               # noqa: BLE001
-            pass
-        seg_texts.append((i, seg.get("text_translated") or ""))
-        seg_refs[i] = (ref_audio, None, "vc")
-        seg_sources[i] = str(src)
+            seg_texts.append((i, segments[i].get("text_translated") or ""))
+            seg_refs[i] = (ref_audio, None, "vc")
+            seg_sources[i] = src
+            continue
+        cid = _VC_CHUNK_BASE + first
+        layout = _write_vc_chunk([convertible[i][0] for i in members],
+                                 chunk_dir / f"chunk_{members[0]:04d}_{members[-1]:04d}.wav")
+        if layout is None:                              # mixed sample rates etc.
+            for i in members:
+                src, ref_audio, dur = convertible[i]
+                if dur < min_seconds:
+                    results[i] = {"audio": src, "mode": "builtin", "vc": False,
+                                  "skipped": "too short to convert safely"}
+                else:
+                    seg_texts.append((i, segments[i].get("text_translated") or ""))
+                    seg_refs[i] = (ref_audio, None, "vc")
+                    seg_sources[i] = src
+            continue
+        chunk_meta[cid] = {"members": members, **layout}
+        seg_texts.append((cid, "。".join((segments[i].get("text_translated") or "")
+                                         for i in members)))
+        seg_refs[cid] = (convertible[first][1], None, "vc")
+        seg_sources[cid] = layout["path"]
 
     if not seg_texts:
         return results
@@ -1028,7 +1074,21 @@ def run_vc_conversion(
         output_dir, progress_cb=progress_cb, cancel_check=cancel_check,
         seg_refs=seg_refs, seg_sources=seg_sources,
     )
-    for i, r in items.items():
+    for key, r in items.items():
+        if key in chunk_meta:
+            meta = chunk_meta[key]
+            pieces = _split_vc_chunk(r.get("audio"), meta, output_dir) if r.get("audio") else None
+            for n, i in enumerate(meta["members"]):
+                if pieces and pieces[n]:
+                    results[i] = {"audio": pieces[n], "mode": "vc", "vc": True,
+                                  "voice": Path(seg_refs[key][0]).name,
+                                  "chunk": [meta["members"][0], meta["members"][-1]]}
+                else:
+                    results[i] = {"audio": convertible[i][0], "mode": "builtin",
+                                  "vc": False,
+                                  "tts_error": r.get("tts_error") or "chunk vc failed"}
+            continue
+        i = key
         if r.get("audio"):
             results[i] = {"audio": r["audio"], "mode": "vc", "vc": True,
                           "voice": Path(seg_refs[i][0]).name}
@@ -1039,6 +1099,112 @@ def run_vc_conversion(
                           "vc": False,
                           "tts_error": r.get("tts_error") or "vc failed"}
     return results
+
+
+_VC_CHUNK_BASE = 1_000_000       # synthetic indices for chunked conversions
+_VC_SEPARATOR_S = 0.45           # silence between lines inside a chunk
+_VC_MAX_CHUNK_S = 12.0           # keep conversions local and stable
+
+
+def _vc_chunks(segments: list[dict], convertible: dict[int, tuple[str, str, float]],
+               *, min_seconds: float, target_seconds: float) -> list[list[int]]:
+    """Group consecutive convertible lines of one speaker so that no group
+    is shorter than *target_seconds* when it can be helped.
+
+    A line already ≥ *target_seconds* stays alone unless the next line is
+    too short to convert on its own — then it adopts it.  Greedy and
+    strictly in order, so every member of a chunk is a neighbour."""
+    order = sorted(convertible)
+    groups: list[list[int]] = []
+    for i in order:
+        dur = convertible[i][2]
+        if groups:
+            g = groups[-1]
+            prev = g[-1]
+            same = (segments[prev].get("speaker") == segments[i].get("speaker")
+                    and convertible[prev][1] == convertible[i][1]
+                    and i == prev + 1)
+            g_dur = sum(convertible[j][2] for j in g)
+            span = float(segments[i]["end"]) - float(segments[g[0]]["start"])
+            if same and span <= _VC_MAX_CHUNK_S and (g_dur < target_seconds or dur < min_seconds):
+                g.append(i)
+                continue
+        groups.append([i])
+    return groups
+
+
+def _write_vc_chunk(sources: list[str], path: Path) -> dict | None:
+    """Concatenate line audio with silence between; return the layout used
+    to split the converted result again (None if the inputs disagree on
+    sample rate — then the lines convert individually)."""
+    import numpy as np
+    import soundfile as _sf
+    audio, sr, bounds, pos = [], None, [], 0
+    for src in sources:
+        x, r = _sf.read(src, dtype="float32")
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+        if sr is None:
+            sr = r
+        elif r != sr:
+            return None
+        gap = int(_VC_SEPARATOR_S * sr)
+        if audio:
+            audio.append(np.zeros(gap, dtype="float32"))
+            pos += gap
+        bounds.append((pos, pos + len(x)))
+        audio.append(x)
+        pos += len(x)
+    _sf.write(str(path), np.concatenate(audio), sr)
+    return {"path": str(path), "sr": sr, "bounds": bounds, "total": pos}
+
+
+def _split_vc_chunk(converted: str, meta: dict, output_dir: Path) -> list[str | None]:
+    """Cut the converted chunk back into per-line files.
+
+    Conversion preserves timing to within ~40 ms, so each boundary is
+    expected at the same *fraction* of the output as in the input; the cut
+    goes at the quietest 100 ms window within ±250 ms of that point, which
+    lands inside the inserted silence.  Each piece is then trimmed of the
+    silence it inherited so the downstream duration-pinning stretches
+    speech, not padding.
+    """
+    import numpy as np
+    import soundfile as _sf
+    try:
+        y, sr = _sf.read(converted, dtype="float32")
+    except Exception:                                   # noqa: BLE001
+        return [None] * len(meta["members"])
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    scale = len(y) / max(meta["total"], 1)
+    win = int(0.1 * sr)
+    search = int(0.25 * sr)
+    cuts = []
+    for (a0, a1), (b0, b1) in zip(meta["bounds"], meta["bounds"][1:]):
+        expected = int(((a1 + b0) / 2) * scale)          # middle of the gap
+        lo, hi = max(0, expected - search), min(len(y) - win, expected + search)
+        if hi <= lo:
+            cuts.append(expected)
+            continue
+        frames = np.lib.stride_tricks.sliding_window_view(y[lo:hi + win], win)[::win // 4]
+        energy = (frames ** 2).mean(axis=1)
+        cuts.append(lo + int(np.argmin(energy)) * (win // 4) + win // 2)
+    edges = [0, *cuts, len(y)]
+    thr = 10 ** (-45 / 20)
+    pad = int(0.04 * sr)
+    out: list[str | None] = []
+    for n, i in enumerate(meta["members"]):
+        piece = y[edges[n]:edges[n + 1]]
+        idx = np.where(np.abs(piece) > thr)[0]
+        if len(idx) == 0:
+            out.append(None)
+            continue
+        piece = piece[max(0, idx[0] - pad):min(len(piece), idx[-1] + pad)]
+        dst = output_dir / f"seg_{i + 1:04d}.wav"
+        _sf.write(str(dst), piece, sr)
+        out.append(str(dst))
+    return out
 
 
 def select_best_reference(
