@@ -36,12 +36,44 @@ _COMMON_WORDS = {
 }
 
 
-def load_rows(countries: tuple[str, ...] = ("jp", "kr", "vn", "th")) -> list[dict]:
+_HAS_KANJI = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _javtxt_rows() -> list[dict]:
+    """javtxt's 日/中/英 triples in the same shape as the Wikidata rows.
+
+    It covers performers currently working — the ones Wikidata misses — but
+    publishes no kana reading, so these rows are pinnable under the fallback
+    rule in :func:`_canonical_forms` and contribute no hotword readings.
+    """
+    path = NAMES_DIR / "javtxt.json"
+    if not path.exists():
+        return []
+    out = []
+    for r in json.loads(path.read_text(encoding="utf-8")):
+        out.append({"qid": f"javtxt:{r['id']}", "country": "jp", "lang": "ja",
+                    "native": r.get("ja", ""), "kana": "", "zh": r.get("zh", ""),
+                    "en": r.get("en", ""), "gender": "female",
+                    "born": r.get("born", ""),
+                    "native_aliases": r.get("aliases") or [], "zh_aliases": [],
+                    "source": "javtxt"})
+    return out
+
+
+def load_rows(countries: tuple[str, ...] = ("jp", "kr", "vn", "th"),
+              *, mainstream: bool = False) -> list[dict]:
+    """Performer rows.  *mainstream* adds the separate screen-actor library,
+    which is an order of magnitude bigger and off by default."""
     rows: list[dict] = []
     for cc in countries:
         path = NAMES_DIR / f"{cc}.json"
         if path.exists():
             rows += json.loads(path.read_text(encoding="utf-8"))
+        if mainstream:
+            extra = NAMES_DIR / f"{cc}_mainstream.json"
+            if extra.exists():
+                rows += json.loads(extra.read_text(encoding="utf-8"))
+    rows += _javtxt_rows()
     return rows
 
 
@@ -53,7 +85,14 @@ def _canonical_forms(row: dict) -> list[str]:
     than a one-word stage name.
     """
     kana = row.get("kana") or ""
+    native = _SPACES.sub("", row.get("native") or "")
     if " " not in kana and "　" not in kana:
+        # No reading to vouch for the label (javtxt rows).  Accept a stage
+        # name only when it carries kanji and is long enough to be a full
+        # name — 「河北彩花」 yes, bare kana like 「めぐり」 (also the ordinary
+        # word 巡り) no.
+        if len(native) >= 3 and _HAS_KANJI.search(native) and native not in _COMMON_WORDS:
+            return [native]
         return []
     forms = []
     for form in (row.get("native"), kana, _SPACES.sub("", kana)):

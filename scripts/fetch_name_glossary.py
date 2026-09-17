@@ -43,7 +43,12 @@ ENDPOINT = "https://query.wikidata.org/sparql"
 UA = "ai-movie-glossary/1.0 (local dubbing pipeline; contact: repo owner)"
 
 # occupation → "pornographic actor"; country of citizenship per market.
-OCCUPATION = "wd:Q488111"
+OCCUPATION = "wd:Q488111"          # pornographic actor
+# Mainstream screen actors, kept in their own files: the end goal is adult
+# *advertising* translation, where a well-known face may be a regular actor.
+# ~13.7k people have both a Chinese and a native label (jp 8140, kr 4236,
+# th 1142, vn 169), so this stays a separate, opt-in library.
+MAINSTREAM_OCCUPATION = "wd:Q33999"
 COUNTRIES = {
     "jp": ("wd:Q17", "ja"),
     "kr": ("wd:Q884", "ko"),
@@ -51,6 +56,7 @@ COUNTRIES = {
     "th": ("wd:Q869", "th"),
 }
 PAGE = 500
+PAGE_PAUSE = 3.0                   # between pages, so WDQS does not throttle us
 
 QUERY = """
 SELECT ?p ?native ?kana ?zh ?zhHans ?zhCn ?en ?gender ?born
@@ -75,7 +81,24 @@ LIMIT %(limit)d OFFSET %(offset)d
 """
 
 
-def sparql(query: str, tries: int = 4) -> list[dict]:
+MAINSTREAM_QUERY = """
+SELECT ?p ?native ?kana ?zh ?zhHans ?zhCn ?en ?gender ?born WHERE {
+  ?p wdt:P106 %(occ)s ; wdt:P27 %(country)s ; rdfs:label ?zh .
+  FILTER(lang(?zh)="zh")
+  OPTIONAL { ?p rdfs:label ?native FILTER(lang(?native)="%(lang)s") }
+  OPTIONAL { ?p rdfs:label ?zhHans FILTER(lang(?zhHans)="zh-hans") }
+  OPTIONAL { ?p rdfs:label ?zhCn   FILTER(lang(?zhCn)="zh-cn") }
+  OPTIONAL { ?p rdfs:label ?en     FILTER(lang(?en)="en") }
+  OPTIONAL { ?p wdt:P1814 ?kana }
+  OPTIONAL { ?p wdt:P21/rdfs:label ?gender FILTER(lang(?gender)="en") }
+  OPTIONAL { ?p wdt:P569 ?bornDate BIND(YEAR(?bornDate) AS ?born) }
+}
+ORDER BY ?p
+LIMIT %(limit)d OFFSET %(offset)d
+"""
+
+
+def sparql(query: str, tries: int = 6) -> list[dict]:
     url = f"{ENDPOINT}?{urllib.parse.urlencode({'query': query})}"
     req = urllib.request.Request(url, headers={
         "Accept": "application/sparql-results+json", "User-Agent": UA})
@@ -86,17 +109,24 @@ def sparql(query: str, tries: int = 4) -> list[dict]:
                 return json.loads(r.read().decode("utf-8"))["results"]["bindings"]
         except Exception as exc:                        # noqa: BLE001
             last = exc
-            time.sleep(5 * (attempt + 1))               # be polite to WDQS
+            code = getattr(exc, "code", None)
+            # 429 means we are the problem: back off far harder than for a 502
+            time.sleep((60 if code == 429 else 15) * (attempt + 1))
     raise SystemExit(f"Wikidata query failed after {tries} tries: {last}")
 
 
-def fetch_country(cc: str) -> list[dict]:
+def fetch_country(cc: str, *, occupation: str = OCCUPATION,
+                  page: int = PAGE, save_to: Path | None = None,
+                  query: str | None = None) -> list[dict]:
+    """Page through one country.  Mainstream actors are 10x the rows of
+    performers and WDQS answers the aliases aggregate with 502s at 500/page,
+    so callers pass a smaller page and a file to flush into as it goes."""
     country, lang = COUNTRIES[cc]
     rows: list[dict] = []
     offset = 0
     while True:
-        q = QUERY % {"occ": OCCUPATION, "country": country, "lang": lang,
-                     "limit": PAGE, "offset": offset}
+        q = (query or QUERY) % {"occ": occupation, "country": country,
+                                "lang": lang, "limit": page, "offset": offset}
         batch = sparql(q)
         for b in batch:
             def val(key: str) -> str:
@@ -119,10 +149,14 @@ def fetch_country(cc: str) -> list[dict]:
             }
             if row["native"] or row["en"]:
                 rows.append(row)
-        if len(batch) < PAGE:
+        if save_to is not None:
+            save_to.write_text(json.dumps(rows, ensure_ascii=False, indent=1),
+                               encoding="utf-8")
+        if len(batch) < page:
             break
-        offset += PAGE
+        offset += page
         print(f"  {cc}: {len(rows)} rows so far…", flush=True)
+        time.sleep(PAGE_PAUSE)
     return rows
 
 
@@ -176,6 +210,8 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--country", default="jp",
                     help="comma-separated: " + ",".join(COUNTRIES))
+    ap.add_argument("--mainstream", action="store_true",
+                    help="fetch mainstream screen actors into <cc>_mainstream.json instead")
     ap.add_argument("--build", action="store_true",
                     help="(re)build glossary_seed.json + hotwords.json from cached rows")
     ap.add_argument("--fetch", action="store_true", help="query Wikidata (default unless --build)")
@@ -185,6 +221,19 @@ def main() -> int:
     if not ccs:
         raise SystemExit(f"--country must name one of {list(COUNTRIES)}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.mainstream:
+        for cc in ccs:
+            print(f"fetching mainstream {cc}…", flush=True)
+            dest = OUT_DIR / f"{cc}_mainstream.json"
+            rows = fetch_country(cc, occupation=MAINSTREAM_OCCUPATION,
+                                 page=300, save_to=dest, query=MAINSTREAM_QUERY)
+            rows = [r for r in rows if r["zh"] and not r["zh"].isascii()]
+            dest.write_text(json.dumps(rows, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+            print(f"  {cc}: {len(rows)} actors with a Chinese name "
+                  f"→ {OUT_DIR / f'{cc}_mainstream.json'}")
+        return 0
 
     if args.fetch or not args.build:
         for cc in ccs:
