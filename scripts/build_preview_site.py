@@ -45,12 +45,12 @@ FILMS = {
 
 RELEASES = [
     {
-        "id": "v3.1.0",
-        "title": "v3.1.0— 当前版本",
-        "date": "2026-09-16",
-        "note": "性别改用原声测量、静音幻听门；按句子单元翻译（被切断的整句合并翻译后"
-                "按词拆回）；只对可疑句做上下文校对；输出真峰值留 AAC 余量（−2 dBTP）。"
-                "三部片全自动重跑并通过验收门。",
+        "id": "v3.2.0",
+        "title": "v3.2.0— 当前版本",
+        "date": "2026-09-18",
+        "note": "语音转换改为分块（短句并入相邻段整体转换，回退内置音色 33→1）；"
+                "说话人日志改为 pyannote 簇 + 逐段音高性别，test_1 首次认出第二个说话人；"
+                "重叠段只配主说话人。三部片全自动重跑并通过验收门。",
         "items": [
             ("output_test", "原片", "inputs/output_test.mp4"),
             ("output_test", "v1 内置音色", "workspace/output_test/output/output_test_dubbed.mp4"),
@@ -69,8 +69,28 @@ RELEASES = [
         ],
     },
     {
+        "id": "v3.1.0",
+        "title": "v3.1.0— 上一版本",
+        "date": "2026-09-17",
+        "note": "性别改用原声测量、静音幻听门；按句子单元翻译（被切断的整句合并翻译后"
+                "按词拆回）；只对可疑句做上下文校对；输出真峰值留 AAC 余量（−2 dBTP）。",
+        "items": [
+            ("output_test", "v1 内置音色", "workspace/_archive_v3.1.0/output_test/output/output_test_dubbed.mp4"),
+            ("output_test", "v2 原声音色", "workspace/_archive_v3.1.0/output_test/output/v2_cloned_dubbed.mp4"),
+            ("test_1", "v1 内置音色", "workspace/_archive_v3.1.0/test_1/output/test_1_dubbed.mp4"),
+            ("test_1", "v2 原声音色", "workspace/_archive_v3.1.0/test_1/output/v2_cloned_dubbed.mp4"),
+            ("test_2", "v1 内置音色", "workspace/_archive_v3.1.0/test_2/output/test_2_dubbed.mp4"),
+            ("test_2", "v2 原声音色", "workspace/_archive_v3.1.0/test_2/output/v2_cloned_dubbed.mp4"),
+        ],
+        "demos": [
+            ("output_test", "workspace/_archive_v3.1.0/output_test/deliver/output_test_dubbed"),
+            ("test_1", "workspace/_archive_v3.1.0/test_1/deliver/test_1_dubbed"),
+            ("test_2", "workspace/_archive_v3.1.0/test_2/deliver/test_2_dubbed"),
+        ],
+    },
+    {
         "id": "v3.0.0",
-        "title": "v3.0.0— 上一版本",
+        "title": "v3.0.0",
         "date": "2026-09-13",
         "note": "P0/P1 全部改动：立体声全采样率背景床、台词压缩、F0 参考音门、"
                 "切镜检测、小脸超分、逐段 QC、重叠语音检测。三部片全自动从零重跑。",
