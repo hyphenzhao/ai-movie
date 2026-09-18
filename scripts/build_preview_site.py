@@ -346,12 +346,21 @@ fetch('manifest.json').then(r => r.json()).then(m => {
 """
 
 
+def _upload_enabled() -> bool:
+    sys.path.insert(0, str(ROOT))
+    from ai_movie import config
+    return config.PUBLISH_UPLOAD
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--upload", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     build()
+    if args.upload and not _upload_enabled():
+        print(f"upload skipped: local-only mode, site built at {OUT} (set AI_MOVIE_UPLOAD=1 to rsync)")
+        args.upload = False
     if args.upload or args.dry_run:
         cmd = ["rsync", "-aL", "--info=progress2", "--partial", "--inplace",
                "-e", "ssh -o BatchMode=yes -o Compression=no",

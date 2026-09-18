@@ -29,6 +29,8 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
+from ai_movie import config                     # noqa: E402
+
 DRIVE_FOLDER = "187u7Emwab8T_oc4FEfdFjBoRe1On7igO"
 
 
@@ -103,6 +105,9 @@ def main() -> int:
             shutil.copy2(extra, folder / Path(extra).name)
     print(f"folder: {folder} → {sorted(p.name for p in folder.iterdir())}")
 
+    if args.upload and not config.PUBLISH_UPLOAD:
+        print("upload skipped: local-only mode (set AI_MOVIE_UPLOAD=1 to push to Drive)")
+        args.upload = False
     if args.upload or args.dry_run:
         rclone = _rclone()
         if not rclone:

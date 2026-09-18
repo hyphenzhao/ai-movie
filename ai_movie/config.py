@@ -532,6 +532,10 @@ OLLAMA_SAKURA_MODEL = "quantumcookie/Sakura-qwen2.5-v1.0:14b"
 # env override lets the release runner fall back automatically when the
 # model fails its smoke test.
 import os as _os
+# Finished videos stay on this machine.  The uplink here is ~0.7 MB/s and metered, so the release
+# scripts' ``--upload`` (VPS preview site, Google Drive) is a no-op unless AI_MOVIE_UPLOAD=1.
+PUBLISH_UPLOAD = _os.environ.get("AI_MOVIE_UPLOAD", "0") == "1"
+
 OLLAMA_POLISH_MODEL = _os.environ.get(
     "AI_MOVIE_POLISH_MODEL",
     "ttempvnn/HauhauCS-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4-K-M:latest")
