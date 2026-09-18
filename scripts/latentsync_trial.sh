@@ -13,7 +13,12 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 LS="$ROOT/vendor/LatentSync"
-PY="$ROOT/vendor/latentsync_venv/bin/python"
+# The pipeline's own interpreter: its torch (ROCm 7.2) is the only build on this box with gfx1151 kernels —
+# the rocm6.3 wheels segfault on the first GPU op.  vendor/latentsync_shims supplies what that venv lacks
+# (decord stand-in, kornia_rs stub, links to the pure-Python packages).
+PY="$ROOT/.venv/bin/python"
+export PYTHONPATH="$ROOT/vendor/latentsync_shims${PYTHONPATH:+:$PYTHONPATH}"
+export MIOPEN_FIND_MODE=FAST      # default exhaustive conv search sat >15 min on the first step
 OUT="$ROOT/workspace/_ls_trial"
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/trial.log") 2>&1
@@ -30,7 +35,7 @@ if [ ! -x "$PY" ]; then echo "NOT_READY: venv missing" | tee "$OUT/REPORT.md"; e
 DEV=$("$PY" -c "import torch;print('hip' if getattr(torch.version,'hip',None) else 'cuda' if torch.version.cuda else 'cpu', torch.cuda.is_available())" 2>&1 | tail -1)
 echo "venv torch: $DEV"
 case "$DEV" in *True*) ;; *) echo "NOT_READY: torch in venv cannot see the GPU ($DEV)" | tee "$OUT/REPORT.md"; exit 0;; esac
-"$PY" -c "import diffusers, mediapipe, decord, omegaconf" 2>/dev/null || { echo "NOT_READY: deps incomplete" | tee "$OUT/REPORT.md"; exit 0; }
+"$PY" -c "import diffusers, decord, omegaconf, kornia, DeepCache, insightface.app" 2>/dev/null || { echo "NOT_READY: deps incomplete" | tee "$OUT/REPORT.md"; exit 0; }
 
 # ── clips: the stretch each film's face gate skipped the most ───────
 "$ROOT/.venv/bin/python" - "$OUT" <<'PYEOF'
@@ -60,6 +65,7 @@ for film in ("test_1", "test_2"):
     print(film, f"clip from {a:.1f}s, segment {i} had {gated[str(i)]} gated frames")
 PYEOF
 
+export HF_HUB_OFFLINE=1          # everything it needs is on disk; never pull models over the metered link
 # ── run ────────────────────────────────────────────────────────────
 cd "$LS"
 for film in test_1 test_2; do
