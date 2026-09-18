@@ -251,7 +251,13 @@ def _absorb_fragments(segments: list[dict], *, min_duration: float,
             continue
 
         prev = out[-1]
-        can_prev = (prev.get("speaker", "") == seg.get("speaker", "")
+        # A one-character / sub-0.25 s scrap carries no usable speaker
+        # evidence: the speaker-aware re-split once cut 「ぐらと」 into
+        # 「ぐ」(S0)「ら」(S1, 0.00 s)「と」(S0, 0.10 s), and the 0.10 s
+        # 「と」 became a line of its own (translated 「……」, synthesised as
+        # 0.0 s of audio).  Such a scrap always rejoins its predecessor.
+        scrap = dur < 0.25 or _visible_len(seg["text"]) <= 1
+        can_prev = ((prev.get("speaker", "") == seg.get("speaker", "") or scrap)
                     and seg["end"] - prev["start"] <= max_duration)
         if can_prev:
             prev["end"] = seg["end"]

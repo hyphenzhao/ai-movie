@@ -143,7 +143,8 @@ STEP_CODE: dict[str, list[str]] = {
                  "ai_movie.composer.separate_for_pipeline"],
     "osd": ["ai_movie.osd.run_osd"],
     "asr": ["ai_movie.asr.transcribe_all", "ai_movie.asr._finalize_segments",
-            "ai_movie.segmenter.split_into_sentences", "ai_movie.diarize.diarize_file",
+            "ai_movie.segmenter.split_into_sentences", "ai_movie.segmenter._absorb_fragments",
+            "ai_movie.diarize.diarize_file",
             "ai_movie.diarize._refine_with_channel", "ai_movie.diarize.split_by_pitch",
             "ai_movie.asr._transcribe_chunk", "ai_movie.diarize._pick_embed_source",
             "ai_movie.diarize._diarize_pyannote", "ai_movie.diarize._run_diar_worker",
@@ -730,6 +731,12 @@ def step_translate(ctx: Ctx, args) -> None:
                                                      if r["status"] == "accepted")}})
 
 
+def _visible_chars(text: str) -> int:
+    """Characters that would actually be spoken — punctuation excluded."""
+    import re as _re
+    return len(_re.sub(r"[\s　、。，．！？!?…·・「」『』（）()\-—～~\"'“”‘’]", "", text or ""))
+
+
 def _synthesize(ctx: Ctx, args, segs: list[dict], idxs: list[int],
                 refs: dict[str, dict], out_dir: Path) -> int:
     """Synthesize ``segs[i]`` for every i in *idxs* with the run's voice routing.
@@ -743,6 +750,9 @@ def _synthesize(ctx: Ctx, args, segs: list[dict], idxs: list[int],
 
     seg_texts = [(i, (segs[i].get("text_translated") or "").strip())
                  for i in idxs]
+    # A line with no visible characters (「……」 for a swallowed 「と」) has
+    # nothing to say; synthesising it yields a 0.0 s file that fails QC.
+    seg_texts = [(i, t) for i, t in seg_texts if _visible_chars(t)]
     seg_refs, modes = tts_mod.build_seg_refs(
         segs, refs, force_sft=(args.voice_mode == "sft"))
     for i in idxs:
