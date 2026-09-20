@@ -272,3 +272,26 @@ def polish_edit_ok(draft: str, cand: str, flags: list[str]) -> bool:
 def sentence_ends(text: str | None) -> int:
     """Count sentence terminators, treating a trailing run as one."""
     return len(re.findall(r"[。！？!?…]+", text or ""))
+
+
+# ── non-lexical vocalisations ───────────────────────────────────────
+# Moans, sighs, laughs ("あっ", "んん…", "はぁはぁ", "ふふ").  They are dubbed like any other line, but
+# there is no articulation worth re-drawing, so the face plan leaves those frames alone (no lip-sync,
+# hence nothing for the enhance pass to restore).
+_NONLEX_BASE = set("あいうえおんはひふへほ")
+_NONLEX_WORDS = {"はい", "いいえ", "いえ", "いい", "ええ", "うん", "ううん", "おい", "あい", "へえ", "ほう",
+                 "はあい", "いいえい", "おお", "ほほう", "あう", "いう", "おう", "おはよう"}
+_SMALL = str.maketrans("ぁぃぅぇぉゃゅょゎ", "あいうえおやゆよわ")
+
+
+def is_nonlexical(ja: str) -> bool:
+    """True when *ja* is only interjection sounds (no word content)."""
+    t = "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in (ja or ""))
+    t = t.translate(_SMALL)
+    base = "".join(c for c in t if "ぁ" <= c <= "ゖ" or "一" <= c <= "鿿" or c.isalnum())
+    base = base.replace("っ", "")
+    if not base:
+        return True
+    if base in _NONLEX_WORDS:
+        return False
+    return all(c in _NONLEX_BASE for c in base)

@@ -113,6 +113,14 @@ def test_units_on_v300_output_test():
     assert 0 < multi <= len(segs) // 4, multi
 
 
+
+def test_nonlexical_lines_are_only_interjections():
+    from ai_movie.units import is_nonlexical
+    for t in ("あっ", "んん…", "はぁはぁ", "ふふふ", "アァッ！", "", "…"):
+        assert is_nonlexical(t), t
+    for t in ("はい", "うん", "いいえ", "ええ", "はーい", "気持ちいい", "あの、すみません", "いく", "だめ"):
+        assert not is_nonlexical(t), t
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -147,10 +148,15 @@ def detect_face_tracks(
     min_track_frames: int = FACE_TRACK_MIN_FRAMES,
     max_gap: int = FACE_TRACK_MAX_GAP,
     batch: int = 8,
+    scan_ranges: list[list[int]] | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """Detect faces every *det_every* frames and link them into tracks.
+
+    ``scan_ranges`` (sorted, merged ``[first, last]`` frame pairs) limits
+    detection to those frames; the rest are ``grab()``-ed without decoding to
+    BGR so frame indices stay exact.
 
     Boxes are stored in **full-resolution** coordinates even though detection
     runs downscaled.  Returns::
@@ -212,7 +218,19 @@ def detect_face_tracks(
             tracks.append(t)
             active.append({"track": t, "last_kf": frame_idx, "box": f[:4]})
 
+    ranges = [(int(a), int(b)) for a, b in (scan_ranges or [])]
+    ri = 0
     while True:
+        if ranges:
+            while ri < len(ranges) and idx + 1 > ranges[ri][1]:
+                ri += 1
+            if ri >= len(ranges):
+                break                                   # nothing left to scan
+            if idx + 1 < ranges[ri][0] or (idx + 1) % det_every:
+                if not cap.grab():
+                    break
+                idx += 1
+                continue
         ok, frame = cap.read()
         if not ok:
             break
@@ -802,8 +820,12 @@ def bind_segments_to_tracks(
     *,
     video_path: str | Path | None = None,
     min_presence: float = 0.5,
+    only: set[int] | None = None,
 ) -> dict[int, int]:
     """Per-SEGMENT face choice for speakers with no global track.
+
+    ``only`` restricts the pass to those segment indices (used for lines
+    whose globally bound track is not on screen during the line).
 
     One-track-per-speaker is an interview assumption: a single continuous
     shot in which each person is one long track.  Cut-heavy footage breaks
@@ -828,7 +850,7 @@ def bind_segments_to_tracks(
     n_motion = 0
     for i, seg in enumerate(segments):
         spk = seg.get("speaker") or ""
-        if spk not in speakers:
+        if spk not in speakers or (only is not None and i not in only):
             continue
         want = seg.get("gender") or seg.get("tts_gender") or "female"
         a = int(float(seg["start"]) * fps)
@@ -874,6 +896,26 @@ def bind_segments_to_tracks(
 
 
 # ── the plan ───────────────────────────────────────────────────────
+
+def _scan_ranges(video_path: str | Path, segments: list[dict], margin_s: float) -> list[list[int]]:
+    """Merged ``[first, last]`` frame ranges around the lines that will be lip-synced.
+
+    Bounds are snapped outward to whole seconds so a nudged segment time does
+    not invalidate the tracks cache.
+    """
+    info = probe_video(video_path)
+    fps, n = float(info["fps"]), int(info["n_frames"])
+    spans = sorted((math.floor(float(s["start"]) - margin_s), math.ceil(float(s["end"]) + margin_s))
+                   for s in segments if not s.get("no_lipsync"))
+    merged: list[list[int]] = []
+    for a, b in spans:
+        fa, fb = max(0, int(a * fps)), min(n - 1, int(b * fps))
+        if merged and fa <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], fb)
+        else:
+            merged.append([fa, fb])
+    return merged
+
 
 def _tracks_cache_key(video_path: str | Path, det_kw: dict) -> str:
     """Fingerprint the inputs that detection + gender voting depend on."""
@@ -956,6 +998,9 @@ def build_face_plan(
         if progress_cb:
             progress_cb(m)
 
+    from ai_movie.config import FACE_SCAN_MARGIN_S, FACE_SCAN_SPEECH_ONLY
+    if FACE_SCAN_SPEECH_ONLY and "scan_ranges" not in det_kw:
+        det_kw["scan_ranges"] = _scan_ranges(video_path, segments, FACE_SCAN_MARGIN_S)
     cache_path = Path(tracks_cache) if tracks_cache else None
     key = _tracks_cache_key(video_path, det_kw)
     plan = _load_tracks_cache(cache_path, key) if cache_path else None
@@ -1035,6 +1080,24 @@ def build_face_plan(
         seg_bindings = bind_segments_to_tracks(
             plan, tg, segments, per_track, unbound, video_path=video_path)
 
+    # Speech-only scanning (and cut-heavy footage) fragments an actor into one track per stretch, so a
+    # speaker's global track is often simply not on screen for a given line.  Those lines get the
+    # per-segment choice too instead of passing through.
+    uncovered: set[int] = set()
+    for i, seg in enumerate(segments):
+        tid = bindings.get(seg.get("speaker") or "")
+        if tid is None or i in seg_bindings or seg.get("no_lipsync"):
+            continue
+        a, b = int(float(seg["start"]) * plan["fps"]), int(float(seg["end"]) * plan["fps"])
+        if not any(f in per_track[tid] for f in range(a, b + 1)):
+            uncovered.add(i)
+    if uncovered:
+        extra = bind_segments_to_tracks(
+            plan, tg, segments, per_track, {segments[i].get("speaker") or "" for i in uncovered},
+            video_path=video_path, only=uncovered)
+        seg_bindings.update(extra)
+        _log(f"bound track off screen for {len(uncovered)} lines → {len(extra)} re-anchored per segment")
+
     per_track_yaw = {t["id"]: interpolate_scalar(t.get("yaw") or {}, plan["n_frames"],
                                                  det_every=plan.get("det_every", 5),
                                                  cuts=cuts)
@@ -1054,7 +1117,11 @@ def build_face_plan(
     # smooth transition; the plan has to cover that padding too, otherwise the
     # padded frames pass through unmodified and leave a visible seam.
     pad = int(round(pad_seconds * fps))
+    n_nonlex = 0
     for i, seg in enumerate(segments):
+        if seg.get("no_lipsync"):
+            n_nonlex += 1
+            continue
         spk = seg.get("speaker") or ""
         tid = seg_bindings.get(i, bindings.get(spk))
         if tid is None:
@@ -1098,6 +1165,8 @@ def build_face_plan(
             got += 1
         if got:
             ranges.append((float(seg["start"]), float(seg["end"])))
+    if n_nonlex:
+        _log(f"non-lexical lines left untouched: {n_nonlex} segments")
     if n_gated:
         _log(f"yaw/size gate: {n_gated} frames pass through "
              f"(|yaw|>{yaw_max:.0f}° or width<{min_width_sr if min_width_sr is not None else min_width}px) "

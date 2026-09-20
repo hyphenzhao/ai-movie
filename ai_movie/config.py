@@ -448,6 +448,14 @@ FACE_TRACK_MAX_GAP = 3      # keyframes a track may go unmatched
 
 # insightface genderage.onnx (1.3 MB) — bbox-only attribute model, run via
 # onnxruntime.  "heuristic" disables face gender (all tracks "unknown").
+# Long films are mostly silence: chunk 2 of a 172-min film had 18 s of speech in 8 min, yet face
+# detection scanned all 14,500 frames (27 of the chunk's 65 minutes).  Only the frames within
+# FACE_SCAN_MARGIN_S of a line that will be lip-synced are scanned; interjection-only lines
+# (units.is_nonlexical) are dubbed but not lip-synced, so they are not scanned or enhanced either.
+FACE_SCAN_SPEECH_ONLY = True
+FACE_SCAN_MARGIN_S = 2.0
+FACE_SKIP_NONLEXICAL = True
+
 FACE_GENDER_BACKEND = "insightface"
 FACE_GENDER_MODEL = str(ROOT_DIR / "models" / "insightface" / "genderage.onnx")
 FACE_GENDER_SAMPLES = 24    # frames voted per track

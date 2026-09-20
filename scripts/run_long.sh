@@ -20,6 +20,7 @@ mkdir -p "$SPLIT" "$ROOT/deliver/${NAME}_full"
 LOG="$SPLIT/run_long.log"
 exec > >(tee -a "$LOG") 2>&1
 export HF_HUB_OFFLINE=1
+STALL_MIN="${STALL_MIN:-40}"                        # minutes without log output = hung
 MIN_SPEECH_MIN="${MIN_SPEECH_MIN:-0.03}"          # < ~2 s of detected speech → nothing to dub
 
 say() { echo; echo "##### [$(date '+%m-%d %H:%M:%S')] $NAME · $* #####"; }
@@ -43,8 +44,27 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
   if [ -s "$FINAL" ] && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then echo "p$IDX: already done"; continue; fi
   say "chunk p$IDX (speech $SPEECH min)"
   C0=$(date +%s)
-  bash scripts/run_v3.sh "$CN" < /dev/null
-  RC=$?
+  # Watchdog: on 09-19 chunk 3 sat silently at "ASR: transcribing" for 33 h (no kernel/GPU error, machine
+  # alive).  A chunk whose log stops growing for STALL_MIN minutes is killed and retried; the stage cache
+  # makes the retry start where it stopped.
+  RC=1
+  for TRY in 1 2 3; do
+    setsid bash scripts/run_v3.sh "$CN" < /dev/null &
+    PID=$!
+    while kill -0 "$PID" 2>/dev/null; do
+      sleep 60
+      AGE=$(( $(date +%s) - $(stat -c %Y "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null || date +%s) ))
+      if [ "$AGE" -gt $(( STALL_MIN * 60 )) ]; then
+        echo "p$IDX: no log output for $((AGE/60)) min → killing try $TRY"
+        kill -TERM -- "-$PID" 2>/dev/null; sleep 10; kill -KILL -- "-$PID" 2>/dev/null
+        echo "$IDX stall try$TRY $(date '+%m-%d %H:%M')" >> "$SPLIT/status.txt"
+        break
+      fi
+    done
+    wait "$PID"; RC=$?
+    [ $RC -eq 0 ] && [ -s "$FINAL" ] && break
+    [ "$TRY" -lt 3 ] && echo "p$IDX: try $TRY ended rc=$RC, retrying"
+  done
   if [ $RC -eq 0 ] && [ -s "$FINAL" ]; then echo "$IDX dub ok $(( ($(date +%s)-C0)/60 ))min" >> "$SPLIT/status.txt"
   else echo "p$IDX: pipeline rc=$RC → passthrough for this chunk"; echo "$IDX pass failed_rc$RC" >> "$SPLIT/status.txt"; fi
 done < "$SPLIT/chunks.tsv"

@@ -117,7 +117,7 @@ STEP_CONFIG: dict[str, list[str]] = {
     "mix": ["MIX_DUCK_DB", "MIX_DUCK_ATTACK_MS", "MIX_DUCK_RELEASE_MS",
             "MIX_MATCH_LOUDNESS", "MIX_MATCH_CLAMP_DB", "MIX_TARGET_LUFS",
             "MIX_TRUE_PEAK_DB"],
-    "faces": ["FACE_DET_EVERY", "FACE_DET_MAX_WIDTH", "FACE_DET_CONF", "FACE_TRACK_IOU",
+    "faces": ["FACE_SCAN_SPEECH_ONLY", "FACE_SCAN_MARGIN_S", "FACE_SKIP_NONLEXICAL", "FACE_DET_EVERY", "FACE_DET_MAX_WIDTH", "FACE_DET_CONF", "FACE_TRACK_IOU",
               "FACE_TRACK_MIN_FRAMES", "FACE_TRACK_MAX_GAP", "FACE_GENDER_SAMPLES",
               "FACE_GENDER_MIN_CONF", "FACE_BIND_MIN_SCORE", "FACE_YAW_MAX",
               "FACE_MIN_WIDTH", "FACE_MIN_WIDTH_SR", "FACE_GATE_SMOOTH",
@@ -169,7 +169,7 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.composer.segment_slots"],
     "mix": ["ai_movie.composer.mix_audio", "ai_movie.composer.build_speech_track",
             "ai_movie.composer.loudnorm_two_pass"],
-    "faces": ["run_pipeline._face_gender_conflicts", "ai_movie.faces.build_face_plan", "ai_movie.faces.detect_face_tracks",
+    "faces": ["ai_movie.faces._scan_ranges", "ai_movie.units.is_nonlexical", "run_pipeline._face_gender_conflicts", "ai_movie.faces.build_face_plan", "ai_movie.faces.detect_face_tracks",
               "ai_movie.faces.gate_frames", "ai_movie.faces.bind_speakers_to_tracks",
               "ai_movie.faces.bind_segments_to_tracks", "ai_movie.faces.interpolate_track",
               "ai_movie.shots.detect_cuts"],
@@ -1078,6 +1078,13 @@ def step_faces(ctx: Ctx, args) -> None:
     free_gpu_for_local_work(log_cb=log)
 
     segs = _timeline_segments(ctx)
+    from ai_movie.config import FACE_SKIP_NONLEXICAL
+    if FACE_SKIP_NONLEXICAL:
+        from ai_movie.units import is_nonlexical
+        segs = [dict(s, no_lipsync=True) if is_nonlexical(s.get("text", "")) else s for s in segs]
+        n_skip = sum(1 for s in segs if s.get("no_lipsync"))
+        if n_skip:
+            log(f"  {n_skip}/{len(segs)} interjection-only lines: dubbed, picture left untouched")
     override = parse_faces_bind(getattr(args, "faces_bind", None))
     if override:
         log(f"  speaker→track override: {override}")
