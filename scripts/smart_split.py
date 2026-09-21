@@ -166,7 +166,9 @@ def cut(video: Path, doc: dict, out_dir: Path, name: str) -> None:
         c["file"] = str(dst)
         if dst.exists() and dst.stat().st_size > 0:
             continue
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-to", f"{c['end']:.3f}",
+        # +2 ms: a start time that rounds to just *below* the keyframe's pts makes ffmpeg copy from the previous
+        # keyframe instead — 9 of 22 chunks of the first film began a whole GOP (8.34 s) early that way.
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start'] + 0.002:.3f}", "-to", f"{c['end'] + 0.002:.3f}",
                         "-i", str(video), "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
                         "-avoid_negative_ts", "make_zero", str(dst)], check=True)
 

@@ -41,7 +41,7 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
   ln -sfn "$FILE" "$ROOT/inputs/$CN.mp4"
   FINAL="$ROOT/workspace/$CN/output/v2_cloned_dubbed.mp4"
   if [ "$MODE" = "pass" ]; then echo "p$IDX: no speech ($SPEECH min) → passthrough"; echo "$IDX pass nospeech" >> "$SPLIT/status.txt"; continue; fi
-  if [ -s "$FINAL" ] && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then echo "p$IDX: already done"; continue; fi
+  if { [ -s "$FINAL" ] || grep -q "^$IDX dub v1_only" "$SPLIT/status.txt" 2>/dev/null; } && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then echo "p$IDX: already done"; continue; fi
   say "chunk p$IDX (speech $SPEECH min)"
   C0=$(date +%s)
   # Watchdog: on 09-19 chunk 3 sat silently at "ASR: transcribing" for 33 h (no kernel/GPU error, machine
@@ -63,9 +63,40 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
     done
     wait "$PID"; RC=$?
     [ $RC -eq 0 ] && [ -s "$FINAL" ] && break
+    if [ $RC -eq 0 ] && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then
+      # Ran clean but has no cloned version: a chunk with a few seconds of speech offers no reference
+      # window.  Borrow the references of the chunk that had the most to choose from (same cast), so the
+      # voice does not flip to the built-in one for this stretch — retrying would change nothing.
+      DONOR=$($PY - "$ROOT" "$NAME" <<'PYEOF'
+import json, sys
+from pathlib import Path
+root, name = Path(sys.argv[1]), sys.argv[2]
+best = None
+for p in sorted((root / "workspace").glob(f"{name}_p*/refs_auto/refs.json")):
+    try:
+        d = json.loads(p.read_text())
+    except ValueError:
+        continue
+    picked = {k: v for k, v in (d.get("picked") or {}).items() if v and Path(v).exists()}
+    n = sum(len(v or []) for v in (d.get("candidates") or {}).values())
+    if picked and (best is None or (len(picked), n) > best[0]):
+        best = ((len(picked), n), p)
+print(best[1] if best else "")
+PYEOF
+)
+      if [ -n "$DONOR" ]; then
+        echo "p$IDX: no reference window in this chunk → borrowing $DONOR"
+        $PY -u scripts/run_vc_version.py "$ROOT/workspace/$CN/state.json" --refs-json "$DONOR" \
+            >> "$ROOT/workspace/$CN/run_v3.log" 2>&1
+        [ -s "$FINAL" ] && echo "$IDX vc borrowed_refs" >> "$SPLIT/status.txt"
+      fi
+      break
+    fi
     [ "$TRY" -lt 3 ] && echo "p$IDX: try $TRY ended rc=$RC, retrying"
   done
   if [ $RC -eq 0 ] && [ -s "$FINAL" ]; then echo "$IDX dub ok $(( ($(date +%s)-C0)/60 ))min" >> "$SPLIT/status.txt"
+  elif [ $RC -eq 0 ] && [ -s "$ROOT/workspace/$CN/output/${CN}_dubbed.mp4" ]; then
+    echo "p$IDX: no cloned version → the built-in-voice dub is used for this chunk"; echo "$IDX dub v1_only" >> "$SPLIT/status.txt"
   else echo "p$IDX: pipeline rc=$RC → passthrough for this chunk"; echo "$IDX pass failed_rc$RC" >> "$SPLIT/status.txt"; fi
 done < "$SPLIT/chunks.tsv"
 
@@ -80,10 +111,26 @@ def run(c): subprocess.run(c, check=True)
 def probe(p, entries, stream):
     return subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries", entries,
                            "-of", "csv=p=0", str(p)], capture_output=True, text=True).stdout.strip()
+# A chunk file that is longer than planned starts one GOP early (see smart_split.cut): that lead duplicates
+# the previous chunk's tail and has to come off again, in whole frames.
+import bisect
+ks = json.loads((split / "keyframes.json").read_text()) if (split / "keyframes.json").exists() else []
+lead = {}
+for c in plan["chunks"]:
+    have = float(probe(c["file"], "format=duration", "v:0") or 0)
+    if ks and have - (c["end"] - c["start"]) > 1.0:
+        j = bisect.bisect_left(ks, c["start"] - 1e-3)
+        if j > 0:
+            lead[c["index"]] = c["start"] - ks[j - 1] if abs(ks[j] - c["start"]) < 2e-3 else 0.0
+lead = {k: v for k, v in lead.items() if v > 0.05}
+if lead:
+    print("chunks that start a GOP early → trimmed:", {k: round(v, 3) for k, v in lead.items()})
 finals, offsets = {}, []
 for c in plan["chunks"]:
     w = root / "workspace" / f"{name}_p{c['index']:02d}"
     f = w / "output" / "v2_cloned_dubbed.mp4"
+    if not (f.exists() and f.stat().st_size):
+        f = w / "output" / f"{name}_p{c['index']:02d}_dubbed.mp4"      # built-in voices beat no dub at all
     if f.exists() and f.stat().st_size and (w / "state.json").exists():
         finals[c["index"]] = f
         st = json.loads((w / "state.json").read_text())
@@ -97,13 +144,25 @@ print(f"dubbed chunks {len(finals)}/{len(plan['chunks'])}; passthrough gain {gai
 parts = []
 for c in plan["chunks"]:
     i = c["index"]; src = finals.get(i)
+    ss = ["-ss", f"{lead[i] - 0.005:.3f}"] if i in lead else []         # output seek: frame-accurate
     if src is None:
         src = split / "pass" / f"{name}_p{i:02d}.mp4"; src.parent.mkdir(exist_ok=True)
         if not src.exists():
             vf = ["-vf", f"scale={wh.replace(',', ':')}"] if wh else []
-            run(["ffmpeg", "-y", "-v", "error", "-i", c["file"], "-map", "0:v:0", "-map", "0:a:0", *vf,
+            tmp = src.with_suffix(".part.mp4")                          # a killed encode must not look finished
+            run(["ffmpeg", "-y", "-v", "error", "-i", c["file"], *ss, "-map", "0:v:0", "-map", "0:a:0", *vf,
                  "-r", fps, "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p",
-                 "-af", f"volume={gain}dB,alimiter=limit=0.89", "-ar", "44100", "-ac", "2", "-c:a", "aac", "-b:a", "192k", str(src)])
+                 "-af", f"volume={gain}dB,alimiter=limit=0.89", "-ar", "44100", "-ac", "2", "-c:a", "aac", "-b:a", "192k", str(tmp)])
+            tmp.replace(src)
+    elif ss:
+        trimmed = split / "trim" / f"{name}_p{i:02d}.mp4"; trimmed.parent.mkdir(exist_ok=True)
+        if not trimmed.exists():
+            tmp = trimmed.with_suffix(".part.mp4")
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(src), *ss, "-map", "0:v:0", "-map", "0:a:0",
+                 "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "192k", str(tmp)])
+            tmp.replace(trimmed)
+        src = trimmed
     ts = split / "ts" / f"p{i:02d}.ts"; ts.parent.mkdir(exist_ok=True)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-c", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "mpegts", str(ts)])
     parts.append(ts)
@@ -120,9 +179,12 @@ for c in plan["chunks"]:
     st = json.loads(sp.read_text())
     segs = ((st.get("vc") or {}).get("segments") or (st.get("fit") or {}).get("segments")
             or (st.get("translate") or {}).get("segments") or (st.get("asr") or {}).get("segments") or [])
+    off = c["start"] - lead.get(c["index"], 0.0)
     for n, s in enumerate(segs):
-        rows.append([c["index"], n, round(c["start"] + s["start"], 2), round(c["start"] + s["end"], 2),
-                     s.get("speaker", ""), s.get("gender", ""), s.get("text", ""), s.get("translation", "")])
+        if s["end"] <= lead.get(c["index"], 0.0):
+            continue                                                    # inside the trimmed lead
+        rows.append([c["index"], n, round(off + s["start"], 2), round(off + s["end"], 2),
+                     s.get("speaker", ""), s.get("gender", ""), s.get("text", ""), s.get("text_translated") or s.get("translation", "")])
 full = root / "deliver" / f"{name}_full"
 with open(full / "segments_full.csv", "w", newline="", encoding="utf-8-sig") as fh:
     w = csv.writer(fh); w.writerow(["chunk", "seg", "start", "end", "speaker", "gender", "ja", "zh"]); w.writerows(rows)

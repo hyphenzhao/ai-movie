@@ -421,11 +421,17 @@ def _load_silero_vad():
     try:
         import torch
 
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-        )
+        # Prefer the copy already in the hub cache: the default path asks GitHub on every load, and a
+        # dropped connection silently turned VAD off (→ whole-file transcription) for that run.
+        local = Path(torch.hub.get_dir()) / "snakers4_silero-vad_master"
+        if (local / "hubconf.py").exists():
+            model, utils = torch.hub.load(repo_or_dir=str(local), model="silero_vad", source="local")
+        else:
+            model, utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                force_reload=False,
+            )
         _VAD_CACHE["model"] = model
         _VAD_CACHE["utils"] = utils
         return model, utils
