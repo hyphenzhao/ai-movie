@@ -669,7 +669,16 @@ def _collect(result: dict, offset: float, which: str, all_segs: list[dict],
     words, because ``_finalize_segments`` rebuilds sentences from the word
     stream; ``segmenter._flush`` aggregates them back per sentence.
     """
-    for seg in result.get("segments", []):
+    from ai_movie.content import raw_hallucination
+    segs_in = result.get("segments", [])
+    # A Whisper loop repeats one sentence over consecutive segments ("お腹が空いたら…" ×5): every copy goes.
+    folded = [raw_hallucination(sg.get("text", ""), fold_only=True) for sg in segs_in]
+    looped = {t for t in set(folded) if t and folded.count(t) >= 3}
+    for seg, ft in zip(segs_in, folded):
+        words_ = seg.get("words") or []
+        mean_p = (sum(float(w.get("probability", 0.0)) for w in words_) / len(words_)) if words_ else 0.0
+        if ft in looped or raw_hallucination(seg.get("text", ""), pass_=which, mean_prob=mean_p):
+            continue                        # stock phrase / loop: never enters the word stream
         extra = {"nsp": round(float(seg.get("no_speech_prob", 0.0)), 3),
                  "alp": round(float(seg.get("avg_logprob", 0.0)), 3),
                  "cr": round(float(seg.get("compression_ratio", 0.0)), 3),
@@ -799,7 +808,14 @@ def _sweep_pass(model, audio_np, speech_segs, language, all_segs, all_words, err
         if alt_audio is not None:
             alt = _transcribe_sweep(model, alt_audio[a:b], language, errors)
             alt_text = "".join(sg.get("text", "") for sg in (alt or {}).get("segments", [])).strip()
-        _collect(res, w["start"], "sweep", all_segs, all_words, alt_text=alt_text)
+        tmp_s, tmp_w = [], []
+        _collect(res, w["start"], "sweep", tmp_s, tmp_w, alt_text=alt_text)
+        spans = [(float(v["start"]), float(v["end"])) for v in speech_segs]
+
+        def inside(t):
+            return any(a <= t <= b for a, b in spans)
+        all_words += [x for x in tmp_w if not inside((x["s"] + x["e"]) / 2)]      # the VAD pass owns those
+        all_segs += [x for x in tmp_s if not inside((x["start"] + x["end"]) / 2)]
     return len(wins), n_txt
 
 

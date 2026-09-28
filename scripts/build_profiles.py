@@ -109,7 +109,8 @@ def main() -> int:
                           "face": ids.get(tid) if tid is not None else None, "track": tid,
                           "thumb_frame": None})
             r = refs.get(spk) or {}
-            cand_refs[(name, spk)] = [p for p in [r.get("ref_audio"), *(r.get("alternatives") or [])] if p and Path(p).exists()]
+            alts = [(a.get("ref_audio") or a.get("path")) if isinstance(a, dict) else a for a in (r.get("alternatives") or [])]
+            cand_refs[(name, spk)] = [p for p in [r.get("ref_audio"), *alts] if p and Path(p).exists()]
     if not nodes:
         log("no enrolment speakers — nothing to build"); return 1
 

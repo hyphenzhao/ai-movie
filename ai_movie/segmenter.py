@@ -195,7 +195,7 @@ def split_into_sentences(
 
         if not buf:
             buf_speaker = spk
-        buf.append({"w": token, "s": w_start, "e": w_end, "p": w.get("p")})
+        buf.append({**w, "w": token, "s": w_start, "e": w_end, "p": w.get("p")})   # keep Whisper scores / pass
 
         stripped = token.strip()
         # (1) Sentence-final punctuation → cut after this word.

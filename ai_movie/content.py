@@ -39,7 +39,8 @@ _STOCK_LINES = {
     "ご清聴ありがとうございました", "ご静聴ありがとうございました",
     "ありがとうございました", "ありがとうございます", "どうもありがとうございました",
     "おやすみなさい", "お疲れ様でした", "お疲れさまでした", "失礼します", "失礼しました",
-    "ご視聴ありがとうございました", "またね", "バイバイ",
+    "ご視聴ありがとうございました", "またね", "バイバイ", "ごちそうさまでした", "いただきます",
+    "はじめまして", "よろしくお願いします",
 }
 _PUNCT = r"[\s、。，,．.！!？?…‥・「」『』（）()～~♪♬\-—]"
 _CJK = re.compile(r"[぀-ヿ一-鿿]")
@@ -48,6 +49,24 @@ _CJK = re.compile(r"[぀-ヿ一-鿿]")
 def fold(text: str) -> str:
     t = re.sub(_PUNCT, "", text or "")
     return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in t)
+
+
+def raw_hallucination(text: str, *, pass_: str = "vad", mean_prob: float = 0.0,
+                      fold_only: bool = False) -> bool | str:
+    """Whole-line stock output check on a *raw* Whisper segment, before the
+    sentence re-split scatters 「ご視聴ありがとうございました」 across word
+    boundaries and speaker turns (「ご視」｜「聴ありがとうございました」).
+    With ``fold_only`` returns the folded text instead (for loop detection)."""
+    ft = fold(text).rstrip("。")
+    if fold_only:
+        return ft
+    if not ft:
+        return False
+    if any(p in text for p in _HALLUCINATION_PHRASES):
+        return True
+    if ft in _STOCK_LINES:
+        return not (pass_ == "vad" and mean_prob >= 0.8)
+    return False
 
 
 def _repeat_unit(t: str) -> tuple[str, int]:
@@ -141,11 +160,22 @@ def classify_segments(segments: list[dict], *, vocals: str | None = None,
             i, j = int(a * 50), max(int(a * 50) + 1, int(b * 50))
             seg = lv[i:j]
             return float(np.percentile(seg, 95)) if seg.size else None
+    # the same folded text in ≥ 3 segments within 30 s is a decoder loop, whatever each copy scores
+    folded = [fold(s.get("text", "")) for s in segments]
+    looped = set()
+    for i, ft in enumerate(folded):
+        if len(ft) < 4:
+            continue
+        same = [j for j in range(len(segments)) if folded[j] == ft and abs(float(segments[j]["start"]) - float(segments[i]["start"])) <= 30]
+        if len(same) >= 3:
+            looped.update(same)
     kept = []
     n_drop = n_nl = 0
-    for s in segments:
+    for i, s in enumerate(segments):
         e = p95(float(s["start"]), float(s["end"])) if p95 else None
         r = classify(s, vocals_p95_db=e)
+        if i in looped and r["content"] != "nonlexical":
+            r = {"content": "drop", "reasons": r["reasons"] + ["repeated line (loop)"]}
         if r["content"] == "drop":
             n_drop += 1
             if log:

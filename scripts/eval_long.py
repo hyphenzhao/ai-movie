@@ -53,8 +53,11 @@ def _probe(p: Path, entries: str) -> str:
                           capture_output=True, text=True).stdout.strip().split("\n")[0]
 
 
-def film_segments(film: str) -> tuple[list[dict], dict]:
-    """Kept segments on the film timeline + chunk meta (type, offsets)."""
+def film_segments(film: str, stage: str | None = None) -> tuple[list[dict], dict]:
+    """Kept segments on the film timeline + chunk meta (type, offsets).
+
+    *stage* forces one state key (``asr`` to measure transcription coverage
+    before the rest of the chain has been re-run)."""
     split = ROOT / "workspace" / film / "_split"
     plan = json.loads((split / "plan.json").read_text())
     ks = json.loads((split / "keyframes.json").read_text()) if (split / "keyframes.json").exists() else []
@@ -71,8 +74,9 @@ def film_segments(film: str) -> tuple[list[dict], dict]:
                     lead = c["start"] - ks[j - 1]
         sp = w / "state.json"
         st = json.loads(sp.read_text()) if sp.exists() else {}
-        chunk_segs = ((st.get("vc") or {}).get("segments") or (st.get("fit") or {}).get("segments")
-                      or (st.get("asr") or {}).get("segments") or [])
+        chunk_segs = ((st.get(stage) or {}).get("segments") or []) if stage else (
+            (st.get("vc") or {}).get("segments") or (st.get("fit") or {}).get("segments")
+            or (st.get("asr") or {}).get("segments") or [])
         speech = sum(s["end"] - s["start"] for s in chunk_segs)
         spk = len((((st.get("asr") or {}).get("diarization") or {}).get("speakers")) or {})
         meta[i] = {"start": c["start"], "end": c["end"], "lead": lead, "state": bool(st),
@@ -118,8 +122,8 @@ def cue_distance(cue_iv: list[tuple[float, float]], t0: float, t1: float) -> flo
     return best
 
 
-def evaluate(film: str) -> dict:
-    segs, meta = film_segments(film)
+def evaluate(film: str, stage: str | None = None) -> dict:
+    segs, meta = film_segments(film, stage)
     truth, read = cues(film)
     kept = [s for s in segs if not s.get("keep_original")]
     kept_iv = [(s["t0"], s["t1"]) for s in kept]
@@ -204,8 +208,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("film")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--stage", default=None, help="measure this state key's segments (e.g. asr) instead of the delivered ones")
+    ap.add_argument("--per-chunk", action="store_true", help="also print L1 per chunk")
     args = ap.parse_args()
-    res = evaluate(args.film)
+    res = evaluate(args.film, args.stage)
+    if args.per_chunk:
+        segs, meta = film_segments(args.film, args.stage)
+        truth, _ = cues(args.film)
+        kept = [(s["t0"], s["t1"]) for s in segs if not s.get("keep_original")]
+        for i, m in sorted(meta.items()):
+            cs = [(c["start"], c["end"]) for c in truth if m["start"] <= c["start"] < m["end"]]
+            if cs:
+                print(f"  p{i:02d} {m['type']:9s} cues {sum(coverage(cs, kept))}/{len(cs)}")
     out = args.out or (ROOT / "deliver" / f"{args.film}_full")
     out.mkdir(parents=True, exist_ok=True)
     lines = [f"# {args.film} 全片验收 — {'通过' if res['passed'] else '未通过'}", "",

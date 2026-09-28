@@ -159,7 +159,7 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.diarize._diarize_pyannote", "ai_movie.diarize._run_diar_worker",
             "run_pipeline._asr_source", "run_pipeline._vocals_trusted",
             "run_pipeline._drop_silent_segments", "ai_movie.content.classify",
-            "ai_movie.content.classify_segments", "ai_movie.units.is_nonlexical",
+            "ai_movie.content.classify_segments", "ai_movie.content.raw_hallucination", "ai_movie.asr._collect", "ai_movie.asr._sweep_pass", "ai_movie.units.is_nonlexical",
             "ai_movie.segmenter.is_hallucination", "ai_movie.segmenter._flush",
             "ai_movie.asr._transcribe_whisper_gpu", "ai_movie.asr._sweep_windows",
             "ai_movie.asr._transcribe_sweep"],
