@@ -24,6 +24,9 @@ STALL_MIN="${STALL_MIN:-40}"                        # minutes without log output
 MIN_SPEECH_MIN="${MIN_SPEECH_MIN:-0.03}"          # < ~2 s of detected speech → nothing to dub
 
 say() { echo; echo "##### [$(date '+%m-%d %H:%M:%S')] $NAME · $* #####"; }
+# Film-level event log (JSON lines, with a host snapshot): what started, what ended, with which result.
+ev() { $PY -m ai_movie.runlog "$SPLIT/events.jsonl" "$@" 2>/dev/null || true; }
+ev film_start video="$VIDEO" pid=$$
 T0=$(date +%s)
 
 say "1: plan + cut"
@@ -69,6 +72,7 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
   if { [ -s "$FINAL" ] || grep -q "^$IDX dub v1_only" "$SPLIT/status.txt" 2>/dev/null; } && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then echo "p$IDX: already done"; continue; fi
   say "chunk p$IDX (speech $SPEECH min)"
   C0=$(date +%s)
+  ev chunk_start chunk="$CN" speech_min="$SPEECH"
   # Watchdog: on 09-19 chunk 3 sat silently at "ASR: transcribing" for 33 h (no kernel/GPU error, machine
   # alive).  A chunk whose log stops growing for STALL_MIN minutes is killed and retried; the stage cache
   # makes the retry start where it stopped.
@@ -83,6 +87,7 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
         echo "p$IDX: no log output for $((AGE/60)) min → killing try $TRY"
         kill -TERM -- "-$PID" 2>/dev/null; sleep 10; kill -KILL -- "-$PID" 2>/dev/null
         echo "$IDX stall try$TRY $(date '+%m-%d %H:%M')" >> "$SPLIT/status.txt"
+        ev chunk_stall chunk="$CN" try="$TRY" silent_min="$((AGE/60))"
         break
       fi
     done
@@ -93,6 +98,7 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
     fi
     [ "$TRY" -lt 3 ] && echo "p$IDX: try $TRY ended rc=$RC, retrying"
   done
+  ev chunk_end chunk="$CN" rc="$RC" minutes="$(( ($(date +%s)-C0)/60 ))" final="$([ -s "$FINAL" ] && echo yes || echo no)" run="$(readlink "$ROOT/workspace/$CN/runs/latest" 2>/dev/null)"
   if [ $RC -eq 0 ] && [ -s "$FINAL" ]; then echo "$IDX dub ok $(( ($(date +%s)-C0)/60 ))min" >> "$SPLIT/status.txt"
   elif [ $RC -eq 0 ] && [ -s "$ROOT/workspace/$CN/output/${CN}_dubbed.mp4" ]; then
     echo "p$IDX: no cloned version → the built-in-voice dub is used for this chunk"; echo "$IDX dub v1_only" >> "$SPLIT/status.txt"
@@ -191,4 +197,5 @@ with open(full / "segments_full.csv", "w", newline="", encoding="utf-8-sig") as 
 print(f"{len(rows)} segments → {full / 'segments_full.csv'}")
 PYEOF
 cp -f "$SPLIT/status.txt" "$ROOT/deliver/${NAME}_full/chunk_status.txt" 2>/dev/null
+ev film_end minutes="$(( ($(date +%s) - T0) / 60 ))"
 say "LONG_DONE in $(( ($(date +%s) - T0) / 60 )) min"

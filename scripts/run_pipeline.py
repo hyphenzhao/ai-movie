@@ -227,6 +227,29 @@ def log(msg: str) -> None:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _stage_summary(state: dict, step: str) -> dict | None:
+    """A few numbers per stage for the run record (counts, not content)."""
+    st = state.get(step) or {}
+    segs = st.get("segments")
+    out: dict = {}
+    if isinstance(segs, list):
+        out["segments"] = len(segs)
+        if step == "asr":
+            out["kept_original"] = sum(1 for x in segs if x.get("keep_original"))
+            out["sweep"] = sum(1 for x in segs if x.get("pass") == "sweep")
+            out["speakers"] = len(((st.get("diarization") or {}).get("speakers")) or {})
+        if step in ("tts", "fit"):
+            out["with_audio"] = sum(1 for x in segs if x.get("audio") or x.get("audio_fit"))
+    if step == "faces":
+        out["anchored_frames"] = st.get("anchored_frames")
+    if step == "qc":
+        out.update({k: (v.get("summary") or {}).get("FAIL") for k, v in st.items() if isinstance(v, dict) and v.get("summary")})
+    for k in ("video", "audio"):
+        if isinstance(st.get(k), str):
+            out[k] = st[k]
+    return out or None
+
+
 def emit(kind: str, **fields) -> None:
     """Structured event (JSON mode only): step_start/step_done/cached/stale/took/error."""
     if _JSON_LOG:
@@ -629,8 +652,25 @@ def step_asr(ctx: Ctx, args) -> None:
 
     # Content, not confidence, decides what goes on: hallucinations out, vocalisations kept as the
     # original voice, everything else dubbed (ai_movie/content.py).
-    from ai_movie.content import classify_segments
+    from ai_movie.content import classify, classify_segments
+    before = [dict(s) for s in segments]
     segments = classify_segments(segments, vocals=vocals if trusted else None, log=log)
+    kept = {(round(float(s["start"]), 2), round(float(s["end"]), 2), s.get("text")): s for s in segments}
+    rows = []
+    for s in before:
+        k = kept.get((round(float(s["start"]), 2), round(float(s["end"]), 2), s.get("text")))
+        if k is not None:
+            decision, why = k.get("content"), "; ".join(k.get("content_reasons") or [])
+        else:                                   # dropped: re-derive the reason (energy / loop drops read as such)
+            r = classify(s)
+            decision = "drop"
+            why = "; ".join(r["reasons"]) if r["content"] == "drop" else "energy floor or repeated line"
+        rows.append({"start": s["start"], "end": s["end"], "decision": decision, "reason": why,
+                     "pass": s.get("pass", "vad"), "asr_conf": s.get("asr_conf"),
+                     "no_speech_prob": s.get("no_speech_prob"), "avg_logprob": s.get("avg_logprob"),
+                     "compression_ratio": s.get("compression_ratio"), "speaker": s.get("speaker"),
+                     "text": s.get("text"), "alt_text": s.get("alt_text")})
+    artifacts.export_csv(rows, ctx.deliver / "01_content.csv")
 
     (ctx.work / "asr_words.json").write_text(
         json.dumps(words, ensure_ascii=False), encoding="utf-8")
@@ -1562,27 +1602,52 @@ def main() -> int:
         "qc": lambda: step_qc(ctx, args),
     }
 
-    for s in steps:
-        if s not in dispatch:
-            log(f"unknown step: {s}")
-            return 2
-        _CUR_STEP = s
-        if ctx.has(s) and not args.force:
-            log(f"· {s} (cached)")
-            emit("cached", step=s)
-            continue
-        log(f"▶ {s}")
-        emit("step_start", step=s)
-        t0 = time.time()
-        try:
-            dispatch[s]()
-        except BaseException as exc:                    # noqa: BLE001
-            emit("error", step=s, error=f"{type(exc).__name__}: {exc}")
-            raise
-        took = time.time() - t0
-        log(f"  {s} took {took:.0f}s")
-        emit("step_done", step=s, took=round(took, 1))
-    _CUR_STEP = None
+    # Run record (ai_movie/runlog.py): manifest + events + the state this run replaces.  Only when a
+    # stage will actually execute — a fully cached invocation leaves no trace beyond the console.
+    from ai_movie.runlog import RunLog
+    will_run = [s for s in steps if s in dispatch and (args.force or not ctx.has(s))]
+    rl = RunLog(ctx.work, ctx.name, sys.argv, steps) if will_run else None
+    if rl:
+        rl.archive_state()
+        log(f"run {rl.run_id} → {rl.dir}")
+    status = "failed"
+    try:
+        for s in steps:
+            if s not in dispatch:
+                log(f"unknown step: {s}")
+                status = "bad_step"
+                return 2
+            _CUR_STEP = s
+            if ctx.has(s) and not args.force:
+                log(f"· {s} (cached)")
+                emit("cached", step=s)
+                if rl:
+                    rl.stage_cached(s)
+                continue
+            log(f"▶ {s}")
+            emit("step_start", step=s)
+            if rl:
+                rl.stage_start(s, why="forced" if args.force else "stale or missing")
+            t0 = time.time()
+            try:
+                dispatch[s]()
+            except BaseException as exc:                # noqa: BLE001
+                emit("error", step=s, error=f"{type(exc).__name__}: {exc}")
+                if rl:
+                    rl.stage_error(s, exc)
+                status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+                raise
+            took = time.time() - t0
+            log(f"  {s} took {took:.0f}s")
+            emit("step_done", step=s, took=round(took, 1))
+            if rl:
+                rl.stage_end(s, took, ((ctx.state.get("_fp") or {}).get(s) or {}).get("hash"),
+                             _stage_summary(ctx.state, s))
+        _CUR_STEP = None
+        status = "ok"
+    finally:
+        if rl:
+            rl.close(status)
 
     log(f"Deliverables: {ctx.deliver}")
     return 0
