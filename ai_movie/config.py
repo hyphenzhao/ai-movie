@@ -504,6 +504,18 @@ FACE_BIND_MIN_SCORE = 0.35
 # less visible than a blurred blob.  Yaw comes from insightface's 1k3d68
 # (3-D 68-pt landmarks, onnxruntime on CPU) at every detection keyframe.
 FACE_POSE_MODEL = str(ROOT_DIR / "models" / "insightface" / "1k3d68.onnx")
+# ArcFace identity embedding (insightface buffalo_l w600k_r50, on disk) — links the same actor across
+# chunks of a long film where voice embeddings alone cannot (interview vs scene audio: cosine ≈ 0.28).
+FACE_ID_MODEL = str(ROOT_DIR / "models" / "insightface" / "w600k_r50.onnx")
+FACE_ID_SAMPLES = 8            # keyframes embedded per track (largest, most frontal)
+
+# Film-wide speaker profiles (ai_movie/profiles.py, scripts/build_profiles.py, enrol stage)
+PROFILE_MIN_SPEECH_S = 20.0    # a chunk speaker needs this much clean speech to found a profile
+PROFILE_VOICE_LINK_DIST = 0.55 # same person when voice centroids are this close (diarization's merge scale)
+PROFILE_FACE_MIN_COS = 0.5     # … or their bound faces match this well (ArcFace cosine)
+PROFILE_MIN_SCORE = 0.30       # assignment: best profile must score at least this …
+PROFILE_MARGIN = 0.08          # … and lead the runner-up by this; otherwise the gender's default profile
+PROFILE_ENROL_DENSITY = 0.35   # chunks with this speech fraction (interview-like) build the profiles
 FACE_YAW_MAX = 55.0         # deg; |yaw| above this → pass through
 FACE_MIN_WIDTH = 80         # px; faces narrower than this → pass through
                             # (measured: <80 px stays at 0.45 sharpness even

@@ -8,6 +8,7 @@
 #   bash scripts/run_v3.sh <name> [--upload]
 #   PIPE_ARGS="--asr-audio mix" bash scripts/run_v3.sh <name>   # extra run_pipeline flags
 #   DRIVE_SUBDIR=v3.1.0 bash scripts/run_v3.sh <name> --upload   # Drive version folder
+#   PROFILES=workspace/FILM/profiles.json bash scripts/run_v3.sh <name>   # long film: shared speaker profiles
 # Expects inputs/<name>.mp4.  Logs to workspace/<name>/run_v3.log.
 set -uo pipefail
 NAME="${1:?usage: run_v3.sh <name> [--upload]}"
@@ -16,6 +17,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 PY="$ROOT/.venv/bin/python"
 PIPE_ARGS="${PIPE_ARGS:-}"
+PROFILES="${PROFILES:-}"                      # film-wide profiles.json → enrol stage + shared clone refs
+if [ -n "$PROFILES" ] && [ -s "$PROFILES" ]; then PIPE_ARGS="$PIPE_ARGS --profiles $PROFILES"; fi
 DRIVE_SUBDIR="${DRIVE_SUBDIR:-}"
 VIDEO="$ROOT/inputs/$NAME.mp4"
 WORK="$ROOT/workspace/$NAME"
@@ -32,11 +35,16 @@ stage "A: v1 pipeline (all stages)"
 # shellcheck disable=SC2086  # PIPE_ARGS is a deliberate word list
 $PY -u scripts/run_pipeline.py "$VIDEO" --name "$NAME" $PIPE_ARGS || die "pipeline"
 
-stage "B: auto-select VC references (F0 gate)"
-$PY -u scripts/auto_select_refs.py "$STATE" || die "ref selection"
+if [ -n "${PROFILES:-}" ] && [ -s "${PROFILES:-}" ]; then
+  stage "C: v2 (voice conversion, film-wide profiles)"
+  $PY -u scripts/run_vc_version.py "$STATE" --profiles "$PROFILES" || die "vc version"
+else
+  stage "B: auto-select VC references (F0 gate)"
+  $PY -u scripts/auto_select_refs.py "$STATE" || die "ref selection"
 
-stage "C: v2 (voice conversion)"
-$PY -u scripts/run_vc_version.py "$STATE" --refs-json "$WORK/refs_auto/refs.json" || die "vc version"
+  stage "C: v2 (voice conversion)"
+  $PY -u scripts/run_vc_version.py "$STATE" --refs-json "$WORK/refs_auto/refs.json" || die "vc version"
+fi
 
 stage "D: QC (v1 + v2), verification, acceptance"
 # shellcheck disable=SC2086

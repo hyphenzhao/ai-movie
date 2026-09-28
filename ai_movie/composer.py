@@ -894,7 +894,9 @@ def mix_audio(
                     stats["loudnorm"] = {"mode": "speech-gated", "speech_frac": round(speech_frac, 3),
                                          "gain_db": round(gain, 2)}
                 r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(tmp),
-                                    "-af", f"volume={gain:.2f}dB,alimiter=limit={10 ** (true_peak_db / 20):.3f}:attack=5:release=50",
+                                    # level=false: alimiter's default auto-level would push the output back up
+                                    "-af", f"volume={gain:.2f}dB,alimiter=limit={10 ** ((true_peak_db - 2.0) / 20):.3f}"
+                                           f":attack=5:release=50:level=false",
                                     "-ar", str(int(sr)), "-c:a", "pcm_s24le", str(output_path)],
                                    capture_output=True, text=True, timeout=1800)
                 ok = r.returncode == 0

@@ -19,6 +19,7 @@ Stages: demux, separate, osd, asr, glossary, translate, tts, compact, fit,
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -34,7 +35,7 @@ from ai_movie import artifacts                      # noqa: E402
 from ai_movie.config import WORKSPACE_DIR           # noqa: E402
 from ai_movie.utils import ensure_dir               # noqa: E402
 
-ALL_STEPS = ["demux", "separate", "osd", "asr", "glossary", "translate",
+ALL_STEPS = ["demux", "separate", "osd", "asr", "enrol", "glossary", "translate",
              "tts", "compact", "fit", "mix", "faces", "lipsync", "enhance",
              "compose", "qc"]
 
@@ -76,11 +77,12 @@ STEP_DEPS: dict[str, list[str]] = {
     "asr": ["demux", "separate", "osd"],
     "glossary": ["asr"],
     "translate": ["asr", "glossary"],
-    "tts": ["translate"],
+    "enrol": ["asr"],
+    "tts": ["translate", "enrol"],
     "compact": ["tts"],
     "fit": ["compact", "tts"],
     "mix": ["fit", "separate"],
-    "faces": ["fit"],
+    "faces": ["fit", "enrol"],
     "lipsync": ["fit", "faces"],
     "enhance": ["lipsync", "faces"],
     "compose": ["enhance", "mix"],
@@ -102,6 +104,9 @@ STEP_CONFIG: dict[str, list[str]] = {
             "ASR_SWEEP_MAX_WINDOW_S", "ASR_SWEEP_FLOOR_DBFS", "ASR_SWEEP_TEMPERATURES",
             "CONTENT_MAX_CPS", "CONTENT_NSP_DROP", "CONTENT_LOGPROB_DROP", "CONTENT_AGREE_MIN",
             "CONTENT_CONFLICT_MAX", "CONTENT_ENERGY_FLOOR_DBFS"],
+    "enrol": ["PROFILE_MIN_SCORE", "PROFILE_MARGIN", "PROFILE_FACE_MIN_COS", "PROFILE_VOICE_LINK_DIST",
+              "PROFILE_MIN_SPEECH_S", "DIARIZE_AHC_THRESHOLD", "FACE_DET_CONF", "FACE_SCAN_MARGIN_S",
+              "FACE_ID_SAMPLES"],
     "glossary": ["GLOSSARY_AUTO_EXTRACT", "GLOSSARY_MAX_TERMS", "GLOSSARY_MIN_COUNT"],
     "translate": ["TRANSLATION_CTX_BEFORE", "TRANSLATION_CTX_AFTER",
                   "OLLAMA_SAKURA_MODEL", "GLOSSARY_ENFORCE_MODEL", "OLLAMA_POLISH_MODEL",
@@ -158,6 +163,10 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.segmenter.is_hallucination", "ai_movie.segmenter._flush",
             "ai_movie.asr._transcribe_whisper_gpu", "ai_movie.asr._sweep_windows",
             "ai_movie.asr._transcribe_sweep"],
+    "enrol": ["run_pipeline.step_enrol", "ai_movie.profiles.assign_profiles",
+              "ai_movie.profiles.speaker_centroids", "ai_movie.faces.embed_track_identity",
+              "ai_movie.faces._embed_face", "ai_movie.faces.bind_speakers_to_tracks",
+              "ai_movie.diarize.embed_windows"],
     "glossary": ["ai_movie.glossary.build_glossary"],
     "translate": ["ai_movie.translator.translate_segments", "run_pipeline._translate_by_units",
                   "ai_movie.translator.enforce_glossary",
@@ -317,9 +326,10 @@ def _args_extra(step: str, args) -> dict:
         "asr": ["language", "asr_backend", "num_speakers", "no_diarize",
                 "dialogue_refine", "dialogue_model", "asr_audio", "gender_source",
                 "diarize_backend"],
+        "enrol": ["profiles"],
         "glossary": ["translate_helper"],
         "translate": ["engines", "chosen_engine", "no_units"],
-        "tts": ["voice_mode", "no_ref_probe"],
+        "tts": ["voice_mode", "no_ref_probe", "profiles"],
         "compact": ["no_compact", "voice_mode"],
         "faces": ["faces_bind"],
         "lipsync": ["lipsync_backend", "lipsync_audio_offset_ms", "fusion", "occlusion_mode"],
@@ -336,7 +346,7 @@ def _args_extra(step: str, args) -> dict:
     return out
 
 
-_OPTIONAL_EXTRA = {"faces_bind", "fusion"}
+_OPTIONAL_EXTRA = {"faces_bind", "fusion", "profiles"}
 
 
 def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
@@ -359,6 +369,11 @@ def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
             continue                    # optional upstream absent
         up[dep] = (fps.get(dep) or {}).get("hash", "legacy")
     extra = _args_extra(step, args)
+    if extra.get("profiles"):
+        try:
+            extra["profiles_sha1"] = hashlib.sha1(Path(extra["profiles"]).read_bytes()).hexdigest()
+        except OSError:
+            extra["profiles_sha1"] = None
     n_edit = int((ctx.state.get("_edits") or {}).get(step, 0) or 0)
     if n_edit:
         extra["_edits"] = n_edit
@@ -626,6 +641,59 @@ def step_asr(ctx: Ctx, args) -> None:
     ctx.put("asr", {"segments": segments, "diarization": diar,
                     "language": args.language, "asr_audio": asr_tag,
                     "gender_source": (diar or {}).get("gender_source")})
+
+
+def step_enrol(ctx: Ctx, args) -> None:
+    """Map this chunk's speakers to the film's speaker profiles (long films).
+
+    Without ``--profiles`` the stage is a no-op so short films are unchanged.
+    Evidence per speaker: ECAPA centroid vs the profile's voice centroid,
+    ArcFace identity of the face track the speaker binds to vs the profile's
+    face, and pitch.  ``ai_movie/profiles.py`` holds the rules.
+    """
+    import hashlib as _hl
+    from ai_movie import diarize as dz, faces as faces_mod, profiles as prof
+
+    if not getattr(args, "profiles", None):
+        ctx.put("enrol", {"skipped": True})
+        return
+    ppath = Path(args.profiles)
+    doc = prof.load(ppath)
+    profiles = prof.load_vectors(ppath, doc)
+    asr = ctx.state["asr"]
+    diar = asr.get("diarization") or {}
+    segs = asr["segments"]
+    voc = (ctx.state.get("separate") or {}).get("vocals")
+    mix_a = dz._load_mono16k(ctx.state["demux"]["audio"])
+    audio = mix_a
+    if voc and Path(voc).exists():
+        audio = dz._pick_embed_source(mix_a, dz._load_mono16k(voc), [(0.0, len(mix_a) / 16000.0)])
+    cents = prof.speaker_centroids(diar, audio, min_speech=0.0)
+    speakers = {}
+    for spk, meta in (diar.get("speakers") or {}).items():
+        c = cents.get(spk) or {}
+        speakers[spk] = {"gender": meta.get("gender"), "f0_median": meta.get("f0_median"),
+                         "voice": c.get("voice"), "face": None}
+    face_tracks = {}
+    if faces_mod.id_model_available():
+        try:
+            fplan = faces_mod.build_face_plan(ctx.video, segs, out_json=None,
+                                              tracks_cache=ctx.work / "face_tracks_cache.json",
+                                              progress_cb=lambda m: log(f"  {m}"))
+            ids = faces_mod.embed_track_identity(ctx.video, fplan["_tracks_full"], progress_cb=log)
+            face_tracks = {str(k): v for k, v in (fplan.get("speaker_track") or {}).items()}
+            for spk, tid in (fplan.get("speaker_track") or {}).items():
+                if spk in speakers and tid is not None and tid in ids:
+                    speakers[spk]["face"] = ids[tid]
+        except Exception as exc:                        # noqa: BLE001
+            log(f"  face identity unavailable: {type(exc).__name__}: {exc}")
+    assigned = prof.assign_profiles(speakers, profiles)
+    for spk, a in assigned.items():
+        log(f"  {spk} ({speakers[spk]['gender']}) → {a.get('profile')} [{a.get('how')}, score {a.get('score')}]")
+    rows = [{"speaker": spk, "gender": speakers[spk]["gender"], **a} for spk, a in assigned.items()]
+    artifacts.export_csv(rows, ctx.deliver / "01_profiles.csv")
+    ctx.put("enrol", {"speaker_profile": assigned, "face_tracks": face_tracks,
+                      "profiles": str(ppath), "profiles_sha1": _hl.sha1(ppath.read_bytes()).hexdigest()})
 
 
 def step_glossary(ctx: Ctx, args) -> None:
@@ -1414,6 +1482,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print every stage's cache status as JSON and exit (no writes)")
     ap.add_argument("--faces-bind", default=None,
                     help="override speaker→track binding, e.g. 'S0=3,S1=none'")
+    ap.add_argument("--profiles", default=None,
+                    help="film-wide profiles.json (scripts/build_profiles.py): the enrol stage maps this "
+                         "chunk's speakers to those profiles; tts/vc clone from the profile references")
     return ap
 
 
@@ -1472,6 +1543,7 @@ def main() -> int:
         "separate": lambda: step_separate(ctx),
         "osd": lambda: step_osd(ctx, args),
         "asr": lambda: step_asr(ctx, args),
+        "enrol": lambda: step_enrol(ctx, args),
         "glossary": lambda: step_glossary(ctx, args),
         "translate": lambda: step_translate(ctx, args),
         "tts": lambda: step_tts(ctx, args),

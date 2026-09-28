@@ -497,6 +497,128 @@ def _predict_pose(frame_bgr: np.ndarray, box: list[float]) -> tuple[float, float
     return yaw, roll
 
 
+# ── identity (ArcFace) ─────────────────────────────────────────────
+
+_id_sess = None
+# ArcFace 112×112 alignment template (insightface arcface_dst)
+_ARCFACE_DST = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+                         [41.5493, 92.3655], [70.7299, 92.2041]], np.float32)
+
+
+def id_model_available() -> bool:
+    from ai_movie.config import FACE_ID_MODEL
+    return Path(FACE_ID_MODEL).exists()
+
+
+def _load_id_model():
+    global _id_sess
+    if _id_sess is not None:
+        return _id_sess
+    import onnxruntime as ort
+    from ai_movie.config import FACE_ID_MODEL
+    if not id_model_available():
+        raise FileNotFoundError(f"identity model not found at {FACE_ID_MODEL}")
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    _id_sess = ort.InferenceSession(str(FACE_ID_MODEL), so, providers=["CPUExecutionProvider"])
+    return _id_sess
+
+
+def _landmarks5(frame_bgr: np.ndarray, box: list[float]) -> np.ndarray | None:
+    """Five ArcFace points (eyes, nose, mouth corners) from the 68-point pose model."""
+    sess = _load_pose_model()
+    x1, y1, x2, y2 = box[:4]
+    w, h = x2 - x1, y2 - y1
+    if w <= 2 or h <= 2:
+        return None
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    s = 192.0 / (max(w, h) * 1.5)
+    M = np.array([[s, 0, 96 - s * cx], [0, s, 96 - s * cy]], np.float32)
+    aimg = cv2.warpAffine(frame_bgr, M, (192, 192), borderValue=0.0)
+    blob = cv2.dnn.blobFromImage(aimg, 1.0, (192, 192), (0, 0, 0), swapRB=True)
+    pred = sess.run(None, {sess.get_inputs()[0].name: blob})[0][0]
+    pts = pred.reshape(-1, 3)[-68:, :2].astype(np.float64)
+    # 1k3d68 outputs are in a [-1, 1] box over the 192² crop
+    pts = (pts + 1) * 96.0
+    inv = cv2.invertAffineTransform(M)
+    pts = pts @ inv[:, :2].T + inv[:, 2]
+    five = np.stack([pts[36:42].mean(0), pts[42:48].mean(0), pts[30], pts[48], pts[54]]).astype(np.float32)
+    return five
+
+
+def _embed_face(frame_bgr: np.ndarray, box: list[float]) -> np.ndarray | None:
+    """L2-normalised 512-d ArcFace embedding of one face, or None."""
+    sess = _load_id_model()
+    pts = _landmarks5(frame_bgr, box)
+    if pts is None:
+        return None
+    M, _ = cv2.estimateAffinePartial2D(pts, _ARCFACE_DST, method=cv2.LMEDS)
+    if M is None:
+        return None
+    aimg = cv2.warpAffine(frame_bgr, M, (112, 112), borderValue=0.0)
+    blob = cv2.dnn.blobFromImage(aimg, 1.0 / 127.5, (112, 112), (127.5, 127.5, 127.5), swapRB=True)
+    emb = sess.run(None, {sess.get_inputs()[0].name: blob})[0][0].astype(np.float32)
+    n = float(np.linalg.norm(emb))
+    return emb / n if n > 0 else None
+
+
+def embed_track_identity(video_path: str | Path, tracks: list[dict], *,
+                         n: int | None = None, yaw_max: float = 45.0,
+                         progress_cb: Callable[[str], None] | None = None) -> dict[int, np.ndarray]:
+    """Mean ArcFace embedding per track from its *n* largest, most frontal keyframes.
+
+    Returns ``{track_id: 512-d unit vector}``; tracks with no usable keyframe
+    are absent.  One sequential pass over the video, like ``estimate_track_pose``.
+    """
+    from ai_movie.config import FACE_ID_SAMPLES
+    n = n or FACE_ID_SAMPLES
+    if not id_model_available() or not pose_model_available():
+        _log("identity/pose model unavailable — no face identity")
+        return {}
+    wanted: dict[int, list[tuple[int, list[float]]]] = {}
+    for t in tracks:
+        kfs = t.get("keyframes") or {}
+        yaw = t.get("yaw") or {}
+        cands = []
+        for k, box in kfs.items():
+            y = yaw.get(k, yaw.get(str(k)))
+            if y is not None and abs(float(y)) > yaw_max:
+                continue
+            cands.append((-(box[2] - box[0]) * (box[3] - box[1]), int(k), box))
+        cands.sort()
+        for _, k, box in cands[:n]:
+            wanted.setdefault(k, []).append((t["id"], box))
+    embs: dict[int, list[np.ndarray]] = {}
+    cap = cv2.VideoCapture(str(video_path))
+    todo = sorted(wanted)
+    idx = -1
+    for k in todo:
+        while idx < k:
+            ok = cap.grab() if idx < k - 1 else True
+            idx += 1
+            if not ok:
+                break
+        ok, frame = cap.retrieve() if idx == k else (False, None)
+        if not ok:
+            ok, frame = cap.read()
+            if not ok:
+                break
+        for tid, box in wanted[k]:
+            e = _embed_face(frame, box)
+            if e is not None:
+                embs.setdefault(tid, []).append(e)
+        if progress_cb and k == todo[-1]:
+            progress_cb(f"人脸身份嵌入：{len(embs)} 条轨迹")
+    cap.release()
+    out = {}
+    for tid, es in embs.items():
+        m = np.mean(es, axis=0)
+        nrm = float(np.linalg.norm(m))
+        if nrm > 0:
+            out[tid] = (m / nrm).astype(np.float32)
+    return out
+
+
 def estimate_track_pose(
     video_path: str | Path,
     plan: dict,

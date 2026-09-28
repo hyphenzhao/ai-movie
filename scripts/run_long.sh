@@ -29,11 +29,36 @@ T0=$(date +%s)
 say "1: plan + cut"
 $PY scripts/smart_split.py "$VIDEO" --name "$NAME" --cut || { echo "LONG_FAILED: split"; exit 1; }
 
-say "2: chunks"
-$PY - "$SPLIT/plan.json" "$MIN_SPEECH_MIN" > "$SPLIT/chunks.tsv" <<'PYEOF'
+say "2a: enrolment — dialogue-dense chunks first, then film-wide speaker profiles"
+ENROL=$($PY - "$SPLIT/plan.json" <<'PYEOF'
+import json, sys
+sys.path.insert(0, ".")
+from ai_movie.config import PROFILE_ENROL_DENSITY
+doc = json.load(open(sys.argv[1]))
+dense = [c["index"] for c in doc["chunks"] if c["minutes"] and c["speech_minutes"] / c["minutes"] >= PROFILE_ENROL_DENSITY]
+top = [c["index"] for c in sorted(doc["chunks"], key=lambda c: -c["speech_minutes"])[:2]]
+print(" ".join(f"{i:02d}" for i in sorted(set(dense + top))))
+PYEOF
+)
+echo "enrolment chunks: $ENROL"
+for IDX in $ENROL; do
+  CN="${NAME}_p${IDX}"
+  ln -sfn "$SPLIT/chunks/$CN.mp4" "$ROOT/inputs/$CN.mp4"
+  $PY -u scripts/run_pipeline.py "$ROOT/inputs/$CN.mp4" --name "$CN" --steps demux,separate,osd,asr < /dev/null \
+    || { echo "enrol: $CN asr failed"; echo "$IDX enrol asr_failed" >> "$SPLIT/status.txt"; }
+done
+if [ ! -s "$ROOT/workspace/$NAME/profiles.json" ] || [ "${REBUILD_PROFILES:-0}" = 1 ]; then
+  $PY -u scripts/build_profiles.py "$NAME" < /dev/null && echo "$NAME enrol ok" >> "$SPLIT/status.txt" \
+    || { echo "build_profiles failed — chunks fall back to per-chunk references"; echo "$NAME enrol failed" >> "$SPLIT/status.txt"; }
+fi
+[ -s "$ROOT/workspace/$NAME/profiles.json" ] && export PROFILES="$ROOT/workspace/$NAME/profiles.json"
+
+say "2b: chunks"
+$PY - "$SPLIT/plan.json" "$MIN_SPEECH_MIN" "$ENROL" > "$SPLIT/chunks.tsv" <<'PYEOF'
 import json, sys
 doc = json.load(open(sys.argv[1])); lim = float(sys.argv[2])
-for c in doc["chunks"]:
+enrol = set(int(x) for x in (sys.argv[3].split() if len(sys.argv) > 3 else []))
+for c in sorted(doc["chunks"], key=lambda c: (c["index"] not in enrol, c["index"])):
     print(f"{c['index']:02d}\t{c['file']}\t{'dub' if c['speech_minutes'] >= lim else 'pass'}\t{c['speech_minutes']}")
 PYEOF
 while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
@@ -64,33 +89,7 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
     wait "$PID"; RC=$?
     [ $RC -eq 0 ] && [ -s "$FINAL" ] && break
     if [ $RC -eq 0 ] && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then
-      # Ran clean but has no cloned version: a chunk with a few seconds of speech offers no reference
-      # window.  Borrow the references of the chunk that had the most to choose from (same cast), so the
-      # voice does not flip to the built-in one for this stretch — retrying would change nothing.
-      DONOR=$($PY - "$ROOT" "$NAME" <<'PYEOF'
-import json, sys
-from pathlib import Path
-root, name = Path(sys.argv[1]), sys.argv[2]
-best = None
-for p in sorted((root / "workspace").glob(f"{name}_p*/refs_auto/refs.json")):
-    try:
-        d = json.loads(p.read_text())
-    except ValueError:
-        continue
-    picked = {k: v for k, v in (d.get("picked") or {}).items() if v and Path(v).exists()}
-    n = sum(len(v or []) for v in (d.get("candidates") or {}).values())
-    if picked and (best is None or (len(picked), n) > best[0]):
-        best = ((len(picked), n), p)
-print(best[1] if best else "")
-PYEOF
-)
-      if [ -n "$DONOR" ]; then
-        echo "p$IDX: no reference window in this chunk → borrowing $DONOR"
-        $PY -u scripts/run_vc_version.py "$ROOT/workspace/$CN/state.json" --refs-json "$DONOR" \
-            >> "$ROOT/workspace/$CN/run_v3.log" 2>&1
-        [ -s "$FINAL" ] && echo "$IDX vc borrowed_refs" >> "$SPLIT/status.txt"
-      fi
-      break
+      break                     # ran clean; no cloned version = no usable reference (built-in voice stays)
     fi
     [ "$TRY" -lt 3 ] && echo "p$IDX: try $TRY ended rc=$RC, retrying"
   done
