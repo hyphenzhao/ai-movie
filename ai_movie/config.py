@@ -284,6 +284,16 @@ TTS_REF_MIN_VOICED_RATIO = 0.6
 
 # Reject the separated-vocals track for a span whose RMS collapsed to below
 # this fraction of the original audio's RMS (Demucs/UVR male suppression).
+# Voice-conversion reference gate (scripts/auto_select_refs.py).  A candidate with no measurable
+# pitch is whisper or noise: on the first long film such clips ranked *first* (ratio None compared as
+# perfect) and every chunk cloned a different voice.  40 pYIN frames at hop 256 / 16 kHz ≈ 0.64 s of
+# voicing; the ratio is voiced frames over all frames of the clip — pYIN's confident-voiced count is
+# strict (the best reference of the first film, 5.1 s of clear speech, scores 0.29), so the ratio only
+# has to rule out breath and noise (the picked-by-bug clips scored 0.00–0.03).
+REF_MIN_VOICED_FRAMES = 40
+REF_MIN_VOICED_RATIO = 0.1
+REF_MIN_PROBES_MEASURABLE = 2
+
 TTS_VOCALS_RMS_MIN_RATIO = 0.25
 
 # Minimum ECAPA cosine similarity between a cloned segment and its speaker

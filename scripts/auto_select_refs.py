@@ -40,8 +40,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ai_movie.config import OSD_REF_MAX_OVERLAP, TTS_GENDER_HZ as GENDER_HZ  # noqa: E402
-from ai_movie.pitch import f0_median as _f0_median                            # noqa: E402
+from ai_movie.config import (OSD_REF_MAX_OVERLAP, REF_MIN_PROBES_MEASURABLE,   # noqa: E402
+                             REF_MIN_VOICED_FRAMES, REF_MIN_VOICED_RATIO,
+                             TTS_GENDER_HZ as GENDER_HZ)
+from ai_movie.pitch import f0_median as _f0_median, gate as _pitch_gate       # noqa: E402
 
 # Generic Chinese probe lines (built-in SFT voices) reused across videos.
 SOURCES = {
@@ -50,6 +52,50 @@ SOURCES = {
 }
 N_CANDIDATES = 3
 MIN_SEG_SECONDS = 2.0
+_PYIN_FPS = 16000 / 256          # pYIN frames per second (pitch.f0_median hop)
+
+
+def candidate_ok(dur: float, voiced: int, med: float | None, gender: str) -> str | None:
+    """Why a window cannot be a reference, or None when it can.
+
+    No measurable pitch means whisper or noise, not a voice to clone: on the
+    first long film such windows were *picked* (their ratio compared as a
+    perfect 1.0) and every chunk ended up with a different cloned voice.
+    """
+    if dur < MIN_SEG_SECONDS:
+        return "short"
+    if med is None:
+        return "no_pitch"
+    if voiced < REF_MIN_VOICED_FRAMES:
+        return f"voiced_frames_{voiced}<{REF_MIN_VOICED_FRAMES}"
+    if voiced / (dur * _PYIN_FPS) < REF_MIN_VOICED_RATIO:
+        return f"voiced_ratio_{voiced / (dur * _PYIN_FPS):.2f}<{REF_MIN_VOICED_RATIO}"
+    lo, hi = GENDER_HZ[gender]
+    if not (lo * 0.9 <= med <= hi * 1.1):
+        return f"f0_{med:.0f}_outside_{gender}"
+    return None
+
+
+def qualify(rows: list[dict], gender: str) -> list[dict]:
+    """Rank probe rows; a row qualifies only when every measurable output
+    passes ``pitch.gate`` (band + ratio 0.8–1.25), at least
+    ``REF_MIN_PROBES_MEASURABLE`` outputs were measurable and the ratio exists.
+    Returns the qualified rows best first and writes ``reject`` on the rest."""
+    ok = []
+    for r_ in rows:
+        outs = [o for o in (r_.get("out_f0") or []) if o is not None]
+        gates = [_pitch_gate(r_.get("f0"), o, gender) for o in outs]
+        if len(outs) < REF_MIN_PROBES_MEASURABLE:
+            r_["reject"] = f"measurable_{len(outs)}<{REF_MIN_PROBES_MEASURABLE}"
+        elif not all(g["ok"] for g in gates):
+            r_["reject"] = next(g["reason"] for g in gates if not g["ok"])
+        elif r_.get("ratio") is None:
+            r_["reject"] = "ratio_unmeasurable"
+        else:
+            r_["reject"] = None
+            ok.append(r_)
+    ok.sort(key=lambda r_: (abs(r_["ratio"] - 1.0), -r_.get("voiced", 0)))
+    return ok
 
 
 def main() -> int:
@@ -110,10 +156,9 @@ def main() -> int:
                 continue
             a = vocals[int(s["start"] * 16000):int(s["end"] * 16000)]
             med, voiced = f0_profile(a)
-            # A measurable F0 in the wrong range means the *other* speaker
-            # dominates this window (the overlap problem) — not a candidate.
-            lo, hi = GENDER_HZ[g]
-            if med is not None and not (lo * 0.9 <= med <= hi * 1.1):
+            why = candidate_ok(d, voiced, med, g)
+            if why:
+                print(f"  {g} seg{i + 1}: skipped ({why})")
                 continue
             scored.append((voiced, d, i, med))
         scored.sort(reverse=True)
@@ -177,9 +222,7 @@ def main() -> int:
         report[g] = rows
         # Qualify: every measurable output in range, and at least one
         # measurable.  Prefer ratio nearest 1.0, then more voiced frames.
-        ok = [r_ for r_ in rows
-              if r_["n_measurable"] > 0 and r_["n_in_range"] == r_["n_measurable"]]
-        ok.sort(key=lambda r_: (abs((r_["ratio"] or 1.0) - 1.0), -r_["voiced"]))
+        ok = qualify(rows, g)
         picked[g] = ok[0]["path"] if ok else None
         print(f"  {g} → {picked[g] and Path(picked[g]).name}"
               f"{'' if picked[g] else ' (none qualified — keep built-in voice)'}")

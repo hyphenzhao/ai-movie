@@ -279,19 +279,37 @@ def sentence_ends(text: str | None) -> int:
 # there is no articulation worth re-drawing, so the face plan leaves those frames alone (no lip-sync,
 # hence nothing for the enhance pass to restore).
 _NONLEX_BASE = set("あいうえおんはひふへほ")
+# Short words that *are* content although they are built from the same kana
 _NONLEX_WORDS = {"はい", "いいえ", "いえ", "いい", "ええ", "うん", "ううん", "おい", "あい", "へえ", "ほう",
-                 "はあい", "いいえい", "おお", "ほほう", "あう", "いう", "おう", "おはよう"}
+                 "はあい", "いいえい", "おお", "ほほう", "あう", "いう", "おう", "おはよう",
+                 "いや", "やだ", "だめ", "もっと", "ねえ", "やめて", "いく", "すごい", "いたい", "ない"}
+_NONLEX_SOUND = _NONLEX_BASE | set("ぐふぶぷぱぴぽぺ")
 _SMALL = str.maketrans("ぁぃぅぇぉゃゅょゎ", "あいうえおやゆよわ")
 
 
-def is_nonlexical(ja: str) -> bool:
-    """True when *ja* is only interjection sounds (no word content)."""
+def _kana_base(ja: str) -> str:
     t = "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in (ja or ""))
     t = t.translate(_SMALL)
     base = "".join(c for c in t if "ぁ" <= c <= "ゖ" or "一" <= c <= "鿿" or c.isalnum())
-    base = base.replace("っ", "")
+    return base.replace("っ", "").replace("ー", "")
+
+
+def is_nonlexical(ja: str) -> bool:
+    """True when *ja* is only interjection sounds (no word content).
+
+    Covers moans/sighs (あっ、んん、はぁはぁ), katakana onomatopoeia
+    (グーグー → ぐぐ, ハァハァ) and any 1–2-kana unit repeated (ぐふぐふ);
+    the short-word whitelist keeps はい / だめ / もっと as content.
+    """
+    base = _kana_base(ja)
     if not base:
         return True
     if base in _NONLEX_WORDS:
         return False
-    return all(c in _NONLEX_BASE for c in base)
+    if all(c in _NONLEX_BASE for c in base):
+        return True
+    # a repeated 1–2-kana *sound* (ぐぐ ← グーグー, ふふ, ぷぷ); repeated words (そうそう) stay content
+    for n in (1, 2):
+        if len(base) >= 2 * n and len(base) % n == 0 and base == base[:n] * (len(base) // n):
+            return all(c in _NONLEX_SOUND for c in base[:n])
+    return False

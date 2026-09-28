@@ -148,8 +148,12 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
         occ, occ_frac = _occluded_in(start, end)
 
         warn, fail = [], []
+        kept_original = bool(s.get("keep_original"))
         asr_conf = s.get("asr_conf")
-        if asr_conf is not None and asr_conf < th["asr_conf_warn"]:
+        # A sweep line confirmed by two independent decodes is content whatever its word
+        # probabilities say (content.classify); a kept-original line was never dubbed.
+        if (asr_conf is not None and asr_conf < th["asr_conf_warn"]
+                and not s.get("sweep_confirmed") and not kept_original):
             warn.append(f"asr_conf<{th['asr_conf_warn']}")
         spk_conf = s.get("speaker_conf")
         if spk_conf is not None and spk_conf < th["speaker_conf_warn"]:
@@ -162,7 +166,9 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
             fail.append(f"truncated>{th['overrun_fail']}s")
         elif overrun > th["overrun_warn"]:
             warn.append(f"truncated>{th['overrun_warn']}s")
-        if s.get("tts_error") or not (s.get("audio") or s.get("audio_fit")):
+        if kept_original:
+            warn.append("kept_original")
+        elif s.get("tts_error") or not (s.get("audio") or s.get("audio_fit")):
             fail.append("no_audio")
         if s.get("tts_fallback"):
             warn.append("clone_fallback_builtin")
@@ -183,7 +189,7 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
             warn.append("compact_rewritten")
         # Lines under 0.7 s keep the built-in voice by design (VC minimum);
         # only a longer line that was not converted is worth a look.
-        if key == "vc" and not s.get("vc") and (end - start) >= 0.7:
+        if key == "vc" and not s.get("vc") and (end - start) >= 0.7 and not kept_original:
             warn.append("vc_kept_builtin")
 
         status = "FAIL" if fail else ("WARN" if warn else "PASS")
