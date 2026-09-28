@@ -708,8 +708,16 @@ def mix_audio(
     true_peak_db: float | None = None,
     loudnorm: bool = True,
     stats: dict | None = None,
+    restore_ranges: list[tuple[float, float]] | None = None,
+    restore_path: Path | str | None = None,
 ) -> Path:
     """Mix TTS speech segments into the background bed at their timestamps.
+
+    ``restore_ranges`` + ``restore_path``: stretches where the original voice
+    is kept (moans, laughs — ``keep_original`` lines).  The bed is the
+    vocals-removed background, so the original vocals (``restore_path``, any
+    rate/channels) are added back at unity over each range ± ``MIX_RESTORE_PAD_MS``
+    with 30 ms fades, and the bed is not ducked there.
 
     Each segment is placed at ``seg['start']`` so the dub stays in sync with
     the picture.  v3 changes, all keyword-only so older callers behave as
@@ -849,11 +857,18 @@ def mix_audio(
     else:
         bg = bg[:total]
 
+    # Original voice back where a line is kept as it was (nothing was synthesized there)
+    restored = _restore_original_ranges(restore_ranges, restore_path, total, sr, n_ch)
+    if restored is not None:
+        speech_mask[restored["mask"] > 0] = 0.0
+
     # Duck background under speech (smooth envelope)
     env = _duck_envelope(speech_mask, sr, duck_attack_ms, duck_release_ms)
     duck_lin = float(10 ** (duck_db / 20)) if match_loudness else bg_gain_speech
     bg_gain = env * duck_lin + (1.0 - env) * bg_gain_silence
     mixed = bg * bg_gain[:, None] + speech_track[:, None]
+    if restored is not None:
+        mixed = mixed + restored["audio"]
 
     if stats is not None:
         stats.update({"gain_db": gains, "sr": int(sr), "channels": int(n_ch),
@@ -861,10 +876,33 @@ def mix_audio(
                       "global_offset_db": round(global_off, 2)})
 
     if loudnorm:
+        from ai_movie.config import MIX_LOUDNORM_MODE, MIX_SPARSE_SPEECH_FRAC
         tmp = Path(str(output_path) + ".premix.wav")
         sf.write(str(tmp), mixed.astype(np.float32), sr, subtype="FLOAT")
-        ok = loudnorm_two_pass(tmp, Path(output_path), target_lufs=target_lufs,
-                               true_peak_db=true_peak_db, sample_rate=int(sr))
+        speech_frac = float(speech_mask.mean()) if len(speech_mask) else 0.0
+        spoken = [(float(sg.get("start", 0)), float(sg.get("fit_end") or sg.get("end", 0)))
+                  for sg in segments if _seg_audio(sg) and not sg.get("keep_original")]
+        ok = False
+        if MIX_LOUDNORM_MODE == "auto" and speech_frac < MIX_SPARSE_SPEECH_FRAC and spoken:
+            # A sparse chunk (a few lines in minutes of bed) must not be integrated to −16 LUFS as a
+            # whole — that lifts the lines to −13.  Set the *spoken* part to the target with one static
+            # gain and let a limiter hold the true peak; the bed follows at its natural level.
+            gated = speech_gated_lufs(tmp, spoken)
+            if gated is not None:
+                gain = target_lufs - gated
+                if stats is not None:
+                    stats["loudnorm"] = {"mode": "speech-gated", "speech_frac": round(speech_frac, 3),
+                                         "gain_db": round(gain, 2)}
+                r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(tmp),
+                                    "-af", f"volume={gain:.2f}dB,alimiter=limit={10 ** (true_peak_db / 20):.3f}:attack=5:release=50",
+                                    "-ar", str(int(sr)), "-c:a", "pcm_s24le", str(output_path)],
+                                   capture_output=True, text=True, timeout=1800)
+                ok = r.returncode == 0
+        if not ok:
+            ok = loudnorm_two_pass(tmp, Path(output_path), target_lufs=target_lufs,
+                                   true_peak_db=true_peak_db, sample_rate=int(sr))
+            if ok and stats is not None:
+                stats["loudnorm"] = {"mode": "ebu-two-pass", "speech_frac": round(speech_frac, 3)}
         tmp.unlink(missing_ok=True)
         if ok:
             return output_path
@@ -877,14 +915,50 @@ def mix_audio(
     return output_path
 
 
+def _restore_original_ranges(ranges, path, total: int, sr: int, n_ch: int,
+                             *, pad_ms: float | None = None, fade_ms: int = 30) -> dict | None:
+    """Original vocals over *ranges*, faded, at the bed's rate/channels.
+
+    Returns ``{"audio": (total, n_ch) array, "mask": (total,) 0/1}`` or None.
+    """
+    import librosa as _librosa
+    from ai_movie.config import MIX_RESTORE_PAD_MS
+    if not ranges or not path or not Path(path).exists():
+        return None
+    pad = (MIX_RESTORE_PAD_MS if pad_ms is None else pad_ms) / 1000.0
+    voc, vsr = sf.read(str(path), dtype="float32", always_2d=True)
+    if vsr != sr:
+        voc = np.stack([_librosa.resample(voc[:, c], orig_sr=vsr, target_sr=sr) for c in range(voc.shape[1])], axis=1)
+    if voc.shape[1] != n_ch:
+        voc = np.repeat(voc.mean(axis=1, keepdims=True), n_ch, axis=1)
+    audio = np.zeros((total, n_ch), dtype=np.float32)
+    mask = np.zeros(total, dtype=np.float32)
+    fade = max(1, int(fade_ms * sr / 1000))
+    for a, b in ranges:
+        i, j = max(0, int((float(a) - pad) * sr)), min(total, len(voc), int((float(b) + pad) * sr))
+        if j - i < 2 * fade:
+            continue
+        piece = voc[i:j].copy()
+        ramp = np.linspace(0, 1, fade, dtype=np.float32)[:, None]
+        piece[:fade] *= ramp
+        piece[-fade:] *= ramp[::-1]
+        audio[i:j] += piece
+        mask[i:j] = 1.0
+    return {"audio": audio, "mask": mask} if mask.any() else None
+
+
 def mix_for_state(state: dict, segments: list[dict], output_path: Path,
                   *, stats: dict | None = None) -> Path:
-    """Mix using whatever bed the workspace has (full-rate stereo preferred)."""
+    """Mix using whatever bed the workspace has (full-rate stereo preferred);
+    ``keep_original`` lines get the film's own vocals back."""
     sep = state.get("separate") or {}
     bg = sep.get("background_full") or sep.get("background")
+    keep = [(float(s["start"]), float(s["end"])) for s in segments if s.get("keep_original")]
     if bg and Path(bg).exists():
         return mix_audio(segments, Path(bg), output_path,
-                         orig_vocals_path=sep.get("vocals"), stats=stats)
+                         orig_vocals_path=sep.get("vocals"), stats=stats,
+                         restore_ranges=keep or None,
+                         restore_path=sep.get("vocals_full") or sep.get("vocals"))
     return build_speech_track(segments, output_path)
 
 
@@ -962,6 +1036,54 @@ def build_speech_track(
 
     sf.write(str(output_path), speech_track.astype(np.float32), sample_rate)
     return output_path
+
+
+def speech_gated_lufs(path: Path, ranges: list[tuple[float, float]], *, pad: float = 0.2,
+                      min_seconds: float = 10.0) -> float | None:
+    """Integrated loudness (LUFS) of *path* measured only inside *ranges*.
+
+    An 8-minute scene chunk with 18 s of dialogue integrates to −20 LUFS over
+    its silence however the lines are mixed; concatenating the spoken ranges
+    (each padded *pad* s) measures what the ear compares between chunks.
+    ``None`` when less than *min_seconds* of speech exists.
+    """
+    import soundfile as sf
+    spans = sorted((max(0.0, a - pad), b + pad) for a, b in ranges if b > a)
+    merged: list[list[float]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    if sum(b - a for a, b in merged) < min_seconds:
+        return None
+    src = Path(path)
+    decoded = None
+    if src.suffix.lower() not in (".wav", ".flac"):                # a delivered mp4: decode first
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+            decoded = Path(fh.name)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-map", "0:a:0", "-c:a", "pcm_s16le",
+                        str(decoded)], check=True, timeout=1800)
+        src = decoded
+    try:
+        y, sr = sf.read(str(src), dtype="float32", always_2d=True)
+    finally:
+        if decoded:
+            decoded.unlink(missing_ok=True)
+    parts = [y[int(a * sr):int(b * sr)] for a, b in merged]
+    parts = [p for p in parts if len(p)]
+    if not parts:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+        tmp = Path(fh.name)
+    try:
+        sf.write(str(tmp), np.concatenate(parts), sr)
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(tmp), "-map", "0:a:0",
+                            "-af", "ebur128", "-f", "null", "-"], capture_output=True, text=True, timeout=600)
+        m = re.findall(r"I:\s+(-?[0-9.]+) LUFS", r.stderr)
+        return float(m[-1]) if m else None
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def encoded_true_peak(path: Path) -> float | None:

@@ -95,16 +95,34 @@ def cues(film: str) -> tuple[list[dict], dict]:
     return out, read
 
 
+def coverage(cues_iv: list[tuple[float, float]], segs_iv: list[tuple[float, float]],
+             min_overlap: float = 0.1) -> list[bool]:
+    """Per cue: does some segment overlap it by ≥ *min_overlap* s."""
+    order = sorted(segs_iv)
+    starts = [a for a, _ in order]
+    out = []
+    for a, b in cues_iv:
+        j = bisect.bisect_right(starts, b)
+        out.append(any(min(b, order[k][1]) - max(a, order[k][0]) >= min_overlap for k in range(max(0, j - 12), j)))
+    return out
+
+
+def cue_distance(cue_iv: list[tuple[float, float]], t0: float, t1: float) -> float:
+    """Seconds from [t0,t1] to the nearest cue interval (0 = overlap); *cue_iv* sorted."""
+    starts = [a for a, _ in cue_iv]
+    j = bisect.bisect_left(starts, t0)
+    best = float("inf")
+    for k in range(max(0, j - 3), min(len(cue_iv), j + 3)):
+        a, b = cue_iv[k]
+        best = min(best, max(0.0, a - t1, t0 - b))
+    return best
+
+
 def evaluate(film: str) -> dict:
     segs, meta = film_segments(film)
     truth, read = cues(film)
     kept = [s for s in segs if not s.get("keep_original")]
-    starts = sorted(s["t0"] for s in kept)
-    ends = [s["t1"] for s in sorted(kept, key=lambda s: s["t0"])]
-
-    def covered(a, b):
-        j = bisect.bisect_right(starts, b)
-        return any(min(b, ends[k]) - max(a, starts[k]) >= 0.1 for k in range(max(0, j - 12), j))
+    kept_iv = [(s["t0"], s["t1"]) for s in kept]
 
     def ctype(t):
         for i, m in meta.items():
@@ -115,7 +133,7 @@ def evaluate(film: str) -> dict:
     # L1
     for kind in ("interview", "scene"):
         cs = [c for c in truth if ctype(c["start"]) == kind]
-        hit = sum(1 for c in cs if covered(c["start"], c["end"]))
+        hit = sum(coverage([(c["start"], c["end"]) for c in cs], kept_iv))
         rate = hit / len(cs) if cs else 1.0
         lim = L1_INTERVIEW_MIN if kind == "interview" else L1_SCENE_MIN
         checks.append({"id": f"L1[{kind}]", "desc": f"{kind} cues covered by a dubbed line", "ok": rate >= lim,
@@ -123,22 +141,12 @@ def evaluate(film: str) -> dict:
     # L2: post-hoc content rules + orphans inside subtitled stretches
     bad = []
     cue_iv = sorted((c["start"], c["end"]) for c in truth)
-    cue_starts = [a for a, _ in cue_iv]
-
-    def cue_distance(t0, t1):
-        """Seconds from [t0,t1] to the nearest truth cue interval (0 = overlap)."""
-        j = bisect.bisect_left(cue_starts, t0)
-        best = float("inf")
-        for k in range(max(0, j - 3), min(len(cue_iv), j + 3)):
-            a, b = cue_iv[k]
-            best = min(best, max(0.0, a - t1, t0 - b))
-        return best
     for s in kept:
         r = classify({**s, "pass": s.get("pass", "vad")})
         if r["content"] == "drop":
             bad.append((s, r["reasons"][-1])); continue
         vis = len(fold(s.get("text", "")))
-        d = cue_distance(s["t0"], s["t1"])
+        d = cue_distance(cue_iv, s["t0"], s["t1"])
         # official subtitles skip fillers, so only a substantial line that is far from every cue
         # (but inside a subtitled stretch: some cue within a minute) counts as suspicious
         if vis >= 6 and 5.0 <= d < 60.0:

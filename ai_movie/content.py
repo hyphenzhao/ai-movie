@@ -30,14 +30,8 @@ import re
 from ai_movie.segmenter import _HALLUCINATION_PHRASES, _visible_len
 from ai_movie.units import is_nonlexical
 
-# ── thresholds (film-independent; tuned on odd chunks, reported on even) ──
-CONTENT_MAX_CPS = 20.0            # visible chars per second above which text is invented (real fast JA ≈ 15)
-CONTENT_NSP_DROP = 0.85           # sweep only: no_speech_prob above this …
-CONTENT_LOGPROB_DROP = -1.2       # … together with avg_logprob below this → drop
-CONTENT_AGREE_MIN = 0.5           # two decodes this similar = confirmed speech
-CONTENT_CONFLICT_MAX = 0.2        # two decodes this different = neither is trusted
-CONTENT_ENERGY_FLOOR_DBFS = -55.0 # vocals p95 below this = nothing was said
-CONTENT_REPEAT_DROP = 4           # a 1–2-kana unit repeated this often = loop
+from ai_movie.config import (CONTENT_AGREE_MIN, CONTENT_CONFLICT_MAX, CONTENT_ENERGY_FLOOR_DBFS,   # noqa: E402
+                             CONTENT_LOGPROB_DROP, CONTENT_MAX_CPS, CONTENT_NSP_DROP, CONTENT_REPEAT_DROP)
 
 # Whole-line stock outputs (folded); the segmenter's substring list covers the
 # YouTube boilerplate, these are the polite closings Whisper emits over silence.

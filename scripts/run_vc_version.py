@@ -56,6 +56,35 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _refs_from_profiles(state: dict, path: Path) -> tuple[dict, str]:
+    """speaker → {ref_audio, gender, profile} from a film-wide profiles.json.
+
+    A chunk speaker uses the profile the enrol stage assigned it; without an
+    assignment it takes the gender's default profile.  A profile with no
+    reference (nothing qualified) contributes nothing, so its lines keep the
+    built-in voice — the same fallback ``run_vc_conversion`` applies.
+    """
+    import hashlib
+    raw = path.read_bytes()
+    doc = json.loads(raw.decode("utf-8"))
+    profiles = doc.get("profiles") or {}
+    assigned = ((state.get("enrol") or {}).get("speaker_profile")) or {}
+    default = {p.get("gender"): pid for pid, p in profiles.items() if p.get("default_for_gender")}
+    refs = {}
+    for spk, meta in ((state["asr"]["diarization"].get("speakers")) or {}).items():
+        g = meta.get("gender")
+        a = assigned.get(spk)
+        pid = (a.get("profile") if isinstance(a, dict) else a) or default.get(g)
+        prof = profiles.get(pid) if pid else None
+        ref = (prof or {}).get("ref_audio")
+        if not ref:
+            continue
+        rp = Path(ref) if Path(ref).is_absolute() else path.parent / ref
+        if rp.exists():
+            refs[spk] = {"ref_audio": str(rp), "gender": g, "profile": pid}
+    return refs, hashlib.sha1(raw).hexdigest()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("state", help="workspace/<name>/state.json from the v1 run")
@@ -65,6 +94,10 @@ def main() -> int:
     ap.add_argument("--refs-json", default=None,
                     help="refs_auto/refs.json from auto_select_refs.py; overrides --ref-*; "
                          "if no gender qualified, registers the v1 film as state['vc']")
+    ap.add_argument("--profiles", default=None,
+                    help="film-wide profiles.json (scripts/build_profiles.py): one reference clip per "
+                         "speaker profile shared by every chunk; a chunk speaker maps to a profile via "
+                         "state['enrol']['speaker_profile'] or the gender's default profile")
     args = ap.parse_args()
 
     from ai_movie import artifacts, tts as tts_mod
@@ -105,13 +138,28 @@ def main() -> int:
     v1_ends = {i: s.get("fit_end") for i, s in enumerate(v1_segs)}
 
     refs = {}
-    for spk, meta in ((state["asr"]["diarization"].get("speakers")) or {}).items():
-        g = meta.get("gender")
-        p = ROOT / (args.ref_female if g == "female" else args.ref_male)
-        if p.exists():
-            refs[spk] = {"ref_audio": str(p), "gender": g}
+    profiles_sha1 = None
+    if args.profiles:
+        refs, profiles_sha1 = _refs_from_profiles(state, Path(args.profiles))
+        log(f"profiles {Path(args.profiles).name} ({profiles_sha1[:8]}): "
+            f"{ {k: v.get('profile') for k, v in refs.items()} }")
+    else:
+        for spk, meta in ((state["asr"]["diarization"].get("speakers")) or {}).items():
+            g = meta.get("gender")
+            p = ROOT / (args.ref_female if g == "female" else args.ref_male)
+            if p.exists():
+                refs[spk] = {"ref_audio": str(p), "gender": g}
     log(f"references: { {k: Path(v['ref_audio']).name for k, v in refs.items()} }")
     if not refs:
+        if args.profiles and (state.get("fit") or {}).get("segments") and (state.get("compose") or {}).get("video"):
+            state["vc"] = {"segments": state["fit"]["segments"], "refs": {},
+                           "video": state["compose"]["video"], "converted": 0,
+                           "reused_lipsync": True, "max_drift_ms": 0.0,
+                           "profiles_sha1": profiles_sha1,
+                           "note": "no profile has a reference for this chunk's speakers — built-in voices"}
+            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            log("no profile reference applies — registered v1 as the vc version")
+            return 0
         log("no usable reference clips")
         return 1
 
@@ -226,7 +274,7 @@ def main() -> int:
     } for i, s in enumerate(segs)]
     artifacts.export_csv(rows, deliver / "03_tts_report.csv")
 
-    state["vc"] = {"segments": segs, "refs": refs, "video": str(final),
+    state["vc"] = {"segments": segs, "refs": refs, "video": str(final), "profiles_sha1": profiles_sha1,
                    "converted": converted, "reused_lipsync": reuse_lipsync,
                    "max_drift_ms": round(worst[0] * 1000, 1),
                    "mix": mix_stats}

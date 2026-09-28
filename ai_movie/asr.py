@@ -511,6 +511,8 @@ def _transcribe_whisper_gpu(
     max_duration: float | None = None,
     max_chars: int | None = None,
     status_cb: Callable[[str], None] | None = None,
+    sweep: bool = False,
+    alt_audio: str | Path | None = None,
 ) -> list[dict]:
     """Transcribe with openai-whisper GPU + Silero VAD pre-segmentation.
 
@@ -553,6 +555,17 @@ def _transcribe_whisper_gpu(
         # ── load audio & run VAD ─────────────────────────────────
         audio_np = whisper.load_audio(str(p))       # float32, 16 kHz
         audio_pt = torch.from_numpy(audio_np)
+        alt_np = floor_audio = None
+        if sweep:
+            # the other source for cross-decoding; the separated vocals set the energy floor
+            other = alt_audio or vocals_path
+            if other and Path(other).exists():
+                cand = whisper.load_audio(str(other))
+                if abs(len(cand) - len(audio_np)) < WHISPER_SR:
+                    alt_np = cand[:len(audio_np)] if len(cand) >= len(audio_np) else None
+            if vocals_path and Path(vocals_path).exists():
+                floor_audio = alt_np if (alt_np is not None and str(other) == str(vocals_path)) \
+                    else whisper.load_audio(str(vocals_path))
 
         speech_segs = _vad_detect(
             audio_pt,
@@ -597,27 +610,21 @@ def _transcribe_whisper_gpu(
 
             offset = vad_seg["start"]
 
-            for seg in result.get("segments", []):
-                all_segs.append({
-                    "start": round(seg["start"] + offset, 2),
-                    "end": round(seg["end"] + offset, 2),
-                    "text": seg["text"].strip(),
-                })
-                for w in (seg.get("words") or []):
-                    token = w.get("word", w.get("text", ""))
-                    if not token:
-                        continue
-                    all_words.append({
-                        "w": token,
-                        "s": round(float(w["start"]) + offset, 3),
-                        "e": round(float(w["end"]) + offset, 3),
-                        "p": round(float(w.get("probability", 0.0)), 3),
-                    })
+            _collect(result, offset, "vad", all_segs, all_words)
 
             # per-VAD-segment progress (0..99 % within file)
             if file_progress_cb and duration > 0:
                 pct = min(int(vad_seg["end"] / duration * 100), 99)
                 file_progress_cb(i, pct)
+
+        if sweep:
+            sweep_errors: list[str] = []
+            n_sw, n_txt = _sweep_pass(model, audio_np, speech_segs, language, all_segs, all_words,
+                                      sweep_errors, alt_audio=alt_np, floor_audio=floor_audio,
+                                      cancel_check=cancel_check)
+            chunk_errors += sweep_errors
+            if status_cb:
+                status_cb(f"sweep: {n_sw} windows, {n_txt} with text")
 
         all_segs.sort(key=lambda s: s["start"])
         all_words.sort(key=lambda w: w["s"])
@@ -648,6 +655,152 @@ def _transcribe_whisper_gpu(
             progress_cb(i + 1, len(audio_paths))
 
     return all_results
+
+
+_SR16 = 16000          # whisper.audio.SAMPLE_RATE; the model only ever sees 16 kHz mono
+
+
+def _collect(result: dict, offset: float, which: str, all_segs: list[dict],
+             all_words: list[dict], alt_text: str | None = None) -> None:
+    """Append one Whisper result to the raw segment / word streams.
+
+    Whisper's per-segment scores (``no_speech_prob``, ``avg_logprob``,
+    ``compression_ratio``) are kept on the segment *and* copied onto its
+    words, because ``_finalize_segments`` rebuilds sentences from the word
+    stream; ``segmenter._flush`` aggregates them back per sentence.
+    """
+    for seg in result.get("segments", []):
+        extra = {"nsp": round(float(seg.get("no_speech_prob", 0.0)), 3),
+                 "alp": round(float(seg.get("avg_logprob", 0.0)), 3),
+                 "cr": round(float(seg.get("compression_ratio", 0.0)), 3),
+                 "pass": which}
+        if alt_text is not None:
+            extra["alt"] = alt_text
+        all_segs.append({"start": round(seg["start"] + offset, 2),
+                         "end": round(seg["end"] + offset, 2),
+                         "text": seg["text"].strip(),
+                         "no_speech_prob": extra["nsp"], "avg_logprob": extra["alp"],
+                         "compression_ratio": extra["cr"], "pass": which,
+                         **({"alt_text": alt_text} if alt_text is not None else {})})
+        for w in (seg.get("words") or []):
+            token = w.get("word", w.get("text", ""))
+            if not token:
+                continue
+            all_words.append({"w": token,
+                              "s": round(float(w["start"]) + offset, 3),
+                              "e": round(float(w["end"]) + offset, 3),
+                              "p": round(float(w.get("probability", 0.0)), 3),
+                              **extra})
+
+
+def _frame_db(y: "np.ndarray", sr: int = _SR16, frame_ms: int = 20) -> "np.ndarray":
+    """RMS level per *frame_ms* frame in dBFS."""
+    import numpy as np
+    n = sr * frame_ms // 1000
+    m = len(y) // n
+    if m == 0:
+        return np.full(1, -120.0, dtype=np.float32)
+    rms = np.sqrt(np.mean(y[:m * n].reshape(m, n) ** 2, axis=1))
+    return (20 * np.log10(rms + 1e-9)).astype(np.float32)
+
+
+def _sweep_windows(speech_segs: list[dict], n_samples: int, energy_db: "np.ndarray", *,
+                   min_gap: float = 1.0, max_win: float = 20.0, floor_db: float = -50.0,
+                   pad: float = 0.3, sr: int = _SR16, frame_ms: int = 20) -> list[dict]:
+    """Windows for the second pass: what the VAD spans left uncovered.
+
+    Gaps ≥ *min_gap* s between spans (padded *pad* s into the neighbours),
+    cut into ≤ *max_win* s pieces at the quietest 100 ms of the middle 40 %
+    of each piece; a piece whose 95th-percentile level never reaches
+    *floor_db* holds nothing to hear and is skipped.  Pure numpy.
+    """
+    import numpy as np
+    total = n_samples / sr
+    fps = 1000 / frame_ms
+    gaps, prev = [], 0.0
+    for sp in sorted(speech_segs, key=lambda d: d["start"]):
+        a, b = float(sp["start"]), float(sp["end"])
+        if a - prev >= min_gap:
+            gaps.append((max(0.0, prev - pad), min(total, a + pad)))
+        prev = max(prev, b)
+    if total - prev >= min_gap:
+        gaps.append((max(0.0, prev - pad), total))
+    out = []
+    for a, b in gaps:
+        pieces = [(a, b)]
+        while pieces:
+            x, y = pieces.pop(0)
+            if y - x > max_win:
+                lo, hi = int((x + 0.3 * (y - x)) * fps), int((x + 0.7 * (y - x)) * fps)
+                win = max(1, int(0.1 * fps))
+                seg = energy_db[lo:hi]
+                if len(seg) > win:
+                    k = int(np.argmin(np.convolve(seg, np.ones(win) / win, mode="valid")))
+                    cut = (lo + k + win / 2) / fps
+                else:
+                    cut = (x + y) / 2
+                pieces = [(x, cut), (cut, y)] + pieces
+                continue
+            lv = energy_db[int(x * fps):max(int(x * fps) + 1, int(y * fps))]
+            p95 = float(np.percentile(lv, 95)) if lv.size else -120.0
+            if p95 < floor_db:
+                continue
+            out.append({"start": round(x, 3), "end": round(y, 3), "p95_db": round(p95, 1)})
+    return out
+
+
+def _transcribe_sweep(model, chunk, language: str, errors: list[str]) -> dict | None:
+    """Decode a sweep window: low temperatures only, no confidence gating.
+
+    Whisper's own ``no_speech`` / ``logprob`` gates are off because the
+    decision is made by content afterwards (ai_movie.content); temperatures
+    above 0.4 are where the stock phrases come from.
+    """
+    from ai_movie.config import ASR_SWEEP_TEMPERATURES
+    common = dict(language=language, verbose=False, condition_on_previous_text=False,
+                  temperature=tuple(ASR_SWEEP_TEMPERATURES), beam_size=5,
+                  compression_ratio_threshold=2.4, logprob_threshold=None,
+                  no_speech_threshold=None)
+    try:
+        return model.transcribe(chunk, word_timestamps=True, **common)
+    except Exception as exc:                            # noqa: BLE001
+        errors.append(f"sweep word_timestamps failed: {type(exc).__name__}: {exc}")
+    try:
+        return model.transcribe(chunk, **common)
+    except Exception as exc:                            # noqa: BLE001
+        errors.append(f"sweep: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _sweep_pass(model, audio_np, speech_segs, language, all_segs, all_words, errors, *,
+                alt_audio=None, floor_audio=None, cancel_check=None) -> tuple[int, int]:
+    """Second pass over the VAD gaps; returns (windows decoded, windows with text).
+
+    *floor_audio* (the separated vocals, 16 kHz) drives the energy floor —
+    the mix's music would pass every window; *alt_audio* is the other source
+    (mix ↔ vocals), decoded again for windows that produced text so the
+    classifier can compare two independent readings.
+    """
+    from ai_movie.config import (ASR_SWEEP_FLOOR_DBFS, ASR_SWEEP_MAX_WINDOW_S,
+                                 ASR_SWEEP_MIN_GAP_S)
+    energy = _frame_db(floor_audio if floor_audio is not None else audio_np)
+    wins = _sweep_windows(speech_segs, len(audio_np), energy, min_gap=ASR_SWEEP_MIN_GAP_S,
+                          max_win=ASR_SWEEP_MAX_WINDOW_S, floor_db=ASR_SWEEP_FLOOR_DBFS)
+    n_txt = 0
+    for w in wins:
+        if cancel_check and cancel_check():
+            break
+        a, b = int(w["start"] * _SR16), int(w["end"] * _SR16)
+        res = _transcribe_sweep(model, audio_np[a:b], language, errors)
+        if not res or not any(sg.get("text", "").strip() for sg in res.get("segments", [])):
+            continue
+        n_txt += 1
+        alt_text = None
+        if alt_audio is not None:
+            alt = _transcribe_sweep(model, alt_audio[a:b], language, errors)
+            alt_text = "".join(sg.get("text", "") for sg in (alt or {}).get("segments", [])).strip()
+        _collect(res, w["start"], "sweep", all_segs, all_words, alt_text=alt_text)
+    return len(wins), n_txt
 
 
 def _transcribe_chunk(model, chunk, language: str,
@@ -819,6 +972,8 @@ def transcribe_all(
     max_duration: float | None = None,
     max_chars: int | None = None,
     status_cb: Callable[[str], None] | None = None,
+    sweep: bool | None = None,
+    alt_audio: str | Path | None = None,
 ) -> list[dict]:
     """Transcribe audio files. Auto-selects best available backend.
 
@@ -872,6 +1027,10 @@ def transcribe_all(
         diarize=diarize, num_speakers=num_speakers, vocals_path=vocals_path,
         max_duration=max_duration, max_chars=max_chars, status_cb=status_cb,
     )
+    if sweep is None:
+        from ai_movie.config import ASR_SWEEP_ENABLED
+        sweep = ASR_SWEEP_ENABLED
+    gpu_extra = dict(extra, sweep=bool(sweep), alt_audio=alt_audio)   # the CPU path has no sweep
 
     # ── Linux / macOS ──────────────────────────────────────────────
     if sys.platform != "win32":
@@ -891,7 +1050,7 @@ def transcribe_all(
                     return _transcribe_whisper_gpu(
                         audio_paths, language, gpu_model,
                         segment_cb, progress_cb, file_start_cb,
-                        file_progress_cb, cancel_check, **extra,
+                        file_progress_cb, cancel_check, **gpu_extra,
                     )
                 elif backend == "openai-whisper":
                     raise RuntimeError("GPU not available (torch.cuda.is_available() returned False)")

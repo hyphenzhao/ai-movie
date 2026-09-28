@@ -105,7 +105,7 @@ def _flush(buf: list[dict], speaker: str | None) -> dict | None:
     if _is_punct_only(text) or is_hallucination(text):
         return None
     probs = [float(w.get("p", 0.0)) for w in buf if w.get("p") is not None]
-    return {
+    d = {
         "start": round(float(buf[0]["s"]), 2),
         "end": round(float(buf[-1]["e"]), 2),
         "text": text,
@@ -113,6 +113,23 @@ def _flush(buf: list[dict], speaker: str | None) -> dict | None:
         "asr_conf": round(sum(probs) / len(probs), 3) if probs else 0.0,
         "n_words": len(buf),
     }
+    # Whisper's segment scores ride along on the words (asr._transcribe_whisper_gpu) so the
+    # content classifier can see them after this re-split: worst no-speech / compression, mean logprob.
+    nsp = [w["nsp"] for w in buf if w.get("nsp") is not None]
+    alp = [w["alp"] for w in buf if w.get("alp") is not None]
+    cr = [w["cr"] for w in buf if w.get("cr") is not None]
+    if nsp:
+        d["no_speech_prob"] = round(max(nsp), 3)
+    if alp:
+        d["avg_logprob"] = round(sum(alp) / len(alp), 3)
+    if cr:
+        d["compression_ratio"] = round(max(cr), 3)
+    if any(w.get("pass") == "sweep" for w in buf):
+        d["pass"] = "sweep"
+        alts = [w["alt"] for w in buf if w.get("alt")]
+        if alts:
+            d["alt_text"] = alts[0]
+    return d
 
 
 def split_into_sentences(

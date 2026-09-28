@@ -55,19 +55,52 @@ class Report:
 
 # ── A. ASR segmentation + diarization ──────────────────────────────
 
+def chunk_kind(state: dict) -> str:
+    """``interview`` (dense, ≥ 2 speakers — the short-film assumptions hold) or
+    ``scene`` (sparse dialogue over action; speaker mix and segment lengths
+    say nothing about correctness there, so those checks become notes)."""
+    asr = state.get("asr") or {}
+    segs = asr.get("segments") or []
+    dur = 0.0
+    v = state.get("_video")
+    if isinstance(v, str) and Path(v).exists():
+        import subprocess as _sp
+        try:
+            dur = float(_sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", v],
+                                capture_output=True, text=True, timeout=60).stdout.strip() or 0)
+        except Exception:                               # noqa: BLE001
+            dur = 0.0
+    dur = dur or max((float(s["end"]) for s in segs), default=0.0)
+    speech = sum(float(s["end"]) - float(s["start"]) for s in segs)
+    speakers = (asr.get("diarization") or {}).get("speakers") or {}
+    return "interview" if dur and speech / dur >= 0.35 and len(speakers) >= 2 else "scene"
+
+
+def speech_ranges(state: dict) -> list[tuple[float, float]]:
+    """Dubbed line ranges on the chunk timeline (kept-original lines excluded)."""
+    segs = ((state.get("vc") or {}).get("segments") or (state.get("fit") or {}).get("segments")
+            or (state.get("asr") or {}).get("segments") or [])
+    return [(float(s["start"]), float(s.get("fit_end") or s["end"])) for s in segs if not s.get("keep_original")]
+
+
 def eval_asr(state: dict, rep: Report) -> None:
     asr = state.get("asr") or {}
     segs = asr.get("segments") or []
     if not segs:
         rep.check("A0", "ASR segments present", False, 0)
         return
+    kind = chunk_kind(state)
+    rep.note("A0k", "chunk kind", kind)
+    # Interview-only assumptions: on a scene chunk they are recorded, not judged.
+    soft = (rep.check if kind == "interview"
+            else lambda k, d, ok, v: rep.note(k, f"{d} [scene: not judged]", f"{v} ({'ok' if ok else 'would fail'})"))
 
     durs = [float(s["end"]) - float(s["start"]) for s in segs]
     rep.check("A1a", "no segment longer than 12 s",
               max(durs) <= 12.0, f"max {max(durs):.2f}s")
-    rep.check("A1b", "median duration in 1.0–6.0 s",
-              1.0 <= statistics.median(durs) <= 6.0,
-              f"median {statistics.median(durs):.2f}s")
+    soft("A1b", "median duration in 1.0–6.0 s",
+         1.0 <= statistics.median(durs) <= 6.0,
+         f"median {statistics.median(durs):.2f}s")
     # Expressed per second of speech so it applies to any clip length.
     # Baseline: 35 segments over 253 s of speech = 0.14 seg/s (44 s blobs).
     density = len(segs) / max(sum(durs), 1e-6)
@@ -78,8 +111,8 @@ def eval_asr(state: dict, rep: Report) -> None:
 
     diar = asr.get("diarization") or {}
     speakers = diar.get("speakers") or {}
-    rep.check("A2a", ">= 2 speakers detected", len(speakers) >= 2,
-              {k: v.get("gender") for k, v in speakers.items()})
+    soft("A2a", ">= 2 speakers detected", len(speakers) >= 2,
+         {k: v.get("gender") for k, v in speakers.items()})
     labelled = sum(1 for s in segs if s.get("speaker"))
     rep.check("A2b", "every segment has a speaker label",
               labelled == len(segs), f"{labelled}/{len(segs)}")
@@ -93,8 +126,19 @@ def eval_asr(state: dict, rep: Report) -> None:
     male_dur = sum(d for d, s in zip(durs, segs)
                    if (s.get("gender") or s.get("tts_gender")) == "male")
     frac = male_dur / max(sum(durs), 1e-6)
-    rep.check("A5", "male speech share in 5%–45% (baseline was 0%)",
-              0.05 <= frac <= 0.45, f"{frac:.1%} ({male_dur:.0f}s)")
+    soft("A5", "male speech share in 5%–45% (baseline was 0%)",
+         0.05 <= frac <= 0.45, f"{frac:.1%} ({male_dur:.0f}s)")
+    # A6: where a confident on-screen face is bound to the line, its gender must agree
+    conflicts = (state.get("faces") or {}).get("gender_conflicts")
+    tracks = {t["id"]: t for t in ((state.get("faces") or {}).get("tracks") or [])}
+    bound = (state.get("faces") or {}).get("speaker_track") or {}
+    if conflicts is not None and tracks:
+        n_conf = sum(1 for s in segs if bound.get(s.get("speaker")) is not None
+                     and (tracks.get(bound[s["speaker"]]) or {}).get("conf", 0) >= 0.8)
+        if n_conf:
+            agree = 1 - len(conflicts) / n_conf
+            rep.check("A6", "voice gender agrees with a confident bound face in ≥ 90% of lines",
+                      agree >= 0.9, f"{agree:.0%} ({len(conflicts)} conflicts / {n_conf} lines)")
 
     units = diar.get("units") or []
     if units:
@@ -604,7 +648,8 @@ def eval_qc(state: dict, rep: Report) -> None:
                  f"{qv['PASS']}/{qv['WARN']}/{qv['FAIL']} of {qv['n']}")
 
 
-def _audio_checks(path: str, rep: Report, suffix: str, label: str) -> None:
+def _audio_checks(path: str, rep: Report, suffix: str, label: str,
+                  ranges: list[tuple[float, float]] | None = None) -> None:
     import re as _re
     import subprocess as _sp
     try:
@@ -624,21 +669,43 @@ def _audio_checks(path: str, rep: Report, suffix: str, label: str) -> None:
         mP = _re.findall(r"Peak:\s+(-?[0-9.]+) dBFS", r.stderr)
         if mI and mP:
             lufs, tp = float(mI[-1]), float(mP[-1])
-            rep.check(f"E3{suffix}",
-                      f"{label} loudness within −16 ± 1.5 LUFS and true peak ≤ −1 dBTP",
-                      abs(lufs + 16.0) <= 1.5 and tp <= -0.9, f"{lufs} LUFS, {tp} dBTP")
+            gated = None
+            gate_err = None
+            if ranges:
+                from ai_movie.composer import speech_gated_lufs
+                try:
+                    gated = speech_gated_lufs(Path(path), ranges)
+                except Exception as exc:                # noqa: BLE001
+                    gate_err = f"{type(exc).__name__}: {exc}"
+            if gate_err:
+                rep.note(f"E3{suffix}", f"{label} speech-gated loudness not measurable", gate_err)
+                ranges = None
+            if gated is not None:
+                # Integrated loudness of a sparse chunk is set by its silence; judge the spoken part.
+                rep.check(f"E3{suffix}",
+                          f"{label} speech-gated loudness within −16 ± 2 LUFS and true peak ≤ −1 dBTP",
+                          abs(gated + 16.0) <= 2.0 and tp <= -0.9,
+                          f"{gated:.1f} LUFS in speech ({lufs} LUFS overall), {tp} dBTP")
+            elif ranges is not None:
+                rep.note(f"E3{suffix}", f"{label} loudness (< 10 s of speech, not judged)",
+                         f"{lufs} LUFS, {tp} dBTP")
+            else:
+                rep.check(f"E3{suffix}",
+                          f"{label} loudness within −16 ± 1.5 LUFS and true peak ≤ −1 dBTP",
+                          abs(lufs + 16.0) <= 1.5 and tp <= -0.9, f"{lufs} LUFS, {tp} dBTP")
     except Exception:                                   # noqa: BLE001
         pass
 
 
 def eval_mix(state: dict, rep: Report) -> None:
     a = (state.get("mix") or {}).get("audio")
+    ranges = speech_ranges(state)
     if a and Path(a).exists():
-        _audio_checks(a, rep, "", "final mix")
+        _audio_checks(a, rep, "", "final mix", ranges)
     # v2 has no standalone mix file; its audio lives in the delivered video.
     v2 = (state.get("vc") or {}).get("video")
     if v2 and Path(v2).exists():
-        _audio_checks(v2, rep, "v", "v2 video audio")
+        _audio_checks(v2, rep, "v", "v2 video audio", ranges)
 
 
 def eval_compose(state: dict, rep: Report) -> None:

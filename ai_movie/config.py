@@ -178,6 +178,24 @@ UNIT_MAX_CHARS = 60
 #
 # If you do set one, keep it to a bare comma-separated noun list (no
 # sentences) and re-check the transcript for echoes.
+# Second ASR pass over what VAD did not flag.  On the first long film Silero heard 1 of 30 scene
+# lines (breathy dialogue under moans/bed noise) at any threshold, so the gaps are transcribed too
+# and ai_movie.content decides by *content* what is speech, a vocalisation or a hallucination.
+ASR_SWEEP_ENABLED = True
+ASR_SWEEP_MIN_GAP_S = 1.0          # gaps shorter than this are already padded by the VAD spans
+ASR_SWEEP_MAX_WINDOW_S = 20.0      # cut long gaps at their quietest point
+ASR_SWEEP_FLOOR_DBFS = -50.0       # a window whose vocals never exceed this is skipped
+ASR_SWEEP_TEMPERATURES = (0.0, 0.2, 0.4)   # no 0.6+: that is where the stock phrases come from
+
+# Content classifier thresholds (ai_movie/content.py)
+CONTENT_MAX_CPS = 20.0             # visible chars/s above which text is invented (fast real JA ≈ 15)
+CONTENT_NSP_DROP = 0.85            # sweep only: no_speech_prob above this …
+CONTENT_LOGPROB_DROP = -1.2        # … with avg_logprob below this → drop
+CONTENT_AGREE_MIN = 0.5            # two decodes this similar = confirmed speech
+CONTENT_CONFLICT_MAX = 0.2         # two decodes this different = neither trusted
+CONTENT_ENERGY_FLOOR_DBFS = -55.0  # vocals p95 below this = nothing was said
+CONTENT_REPEAT_DROP = 4            # a 1–2-kana word repeated this often = decoder loop
+
 ASR_INITIAL_PROMPT: dict[str, str] = {}
 
 # ── Speaker diarization ───────────────────────────────────────
@@ -419,6 +437,9 @@ MIX_TARGET_LUFS = -16.0
 # -2 dBTP, not -1: the WAV mix lands exactly on target, but AAC encoding of
 # the delivered MP4 overshoots by ~1 dB (v3.0.0 measured -1.0 dBTP in the WAV,
 # -0.2 in the v1 MP4 and 0.0 in the v2 MP4).
+MIX_LOUDNORM_MODE = "auto"    # "auto": sparse chunks get a speech-gated static gain instead of EBU two-pass
+MIX_SPARSE_SPEECH_FRAC = 0.3  # below this speech fraction the chunk counts as sparse
+MIX_RESTORE_PAD_MS = 150      # kept-original lines: original vocals restored this far past the line
 MIX_TRUE_PEAK_DB = -2.0
 
 # ── Lip Sync settings ──────────────────────────────────────────

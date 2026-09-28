@@ -120,7 +120,7 @@ STEP_CONFIG: dict[str, list[str]] = {
             "TTS_RATE_MIN_CORRECTION", "TTS_RATE_MAX_CORRECTION"],
     "mix": ["MIX_DUCK_DB", "MIX_DUCK_ATTACK_MS", "MIX_DUCK_RELEASE_MS",
             "MIX_MATCH_LOUDNESS", "MIX_MATCH_CLAMP_DB", "MIX_TARGET_LUFS",
-            "MIX_TRUE_PEAK_DB"],
+            "MIX_TRUE_PEAK_DB", "MIX_RESTORE_PAD_MS", "MIX_LOUDNORM_MODE", "MIX_SPARSE_SPEECH_FRAC"],
     "faces": ["FACE_SCAN_SPEECH_ONLY", "FACE_SCAN_MARGIN_S", "FACE_SKIP_NONLEXICAL", "FACE_DET_EVERY", "FACE_DET_MAX_WIDTH", "FACE_DET_CONF", "FACE_TRACK_IOU",
               "FACE_TRACK_MIN_FRAMES", "FACE_TRACK_MAX_GAP", "FACE_GENDER_SAMPLES",
               "FACE_GENDER_MIN_CONF", "FACE_BIND_MIN_SCORE", "FACE_YAW_MAX",
@@ -177,7 +177,8 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.composer.estimate_rate_correction",
             "ai_movie.composer.segment_slots"],
     "mix": ["ai_movie.composer.mix_audio", "ai_movie.composer.build_speech_track",
-            "ai_movie.composer.loudnorm_two_pass"],
+            "ai_movie.composer.loudnorm_two_pass", "ai_movie.composer._restore_original_ranges",
+            "ai_movie.composer.mix_for_state", "ai_movie.composer.speech_gated_lufs"],
     "faces": ["ai_movie.faces._scan_ranges", "ai_movie.units.is_nonlexical", "run_pipeline._face_gender_conflicts", "ai_movie.faces.build_face_plan", "ai_movie.faces.detect_face_tracks",
               "ai_movie.faces.gate_frames", "ai_movie.faces.bind_speakers_to_tracks",
               "ai_movie.faces.bind_segments_to_tracks", "ai_movie.faces.interpolate_track",
@@ -561,7 +562,7 @@ def _drop_silent_segments(segments: list[dict], vocals: str, floor_db: float) ->
 def step_asr(ctx: Ctx, args) -> None:
     from ai_movie import asr as asr_mod
     from ai_movie import diarize as diarize_mod
-    from ai_movie.config import ASR_SILENCE_DBFS
+    from ai_movie.config import ASR_SILENCE_DBFS, ASR_SWEEP_ENABLED
 
     audio = Path(ctx.state["demux"]["audio"])
     vocals = ctx.state.get("separate", {}).get("vocals")
@@ -574,6 +575,8 @@ def step_asr(ctx: Ctx, args) -> None:
     res = asr_mod.transcribe_all(
         [asr_audio], language=args.language, backend=args.asr_backend,
         diarize=False,
+        sweep=ASR_SWEEP_ENABLED,
+        alt_audio=(str(vocals) if asr_tag == "mix" else str(audio)) if trusted else None,
         file_progress_cb=lambda i, p: log(f"  ASR {p}%") if p % 25 == 0 else None,
     )
     segments = res[0].get("segments", [])
@@ -649,9 +652,14 @@ def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
     pseudo = [{**segs[u[0]],
                "text": "".join((segs[i].get("text") or "") for i in u),
                "end": segs[u[-1]]["end"]} for u in units]
-    zh_units = translator.translate_segments(
-        pseudo, engine=engine, glossary=gloss, report=polish_rows,
-        progress_cb=lambda d, t: log(f"  {engine}: {d}/{t}") if d % 20 == 0 else None)
+    # kept-original lines (moans, laughs) have nothing to translate; they are always singleton units
+    todo = [k for k, u in enumerate(units) if not segs[u[0]].get("keep_original")]
+    zh_done = translator.translate_segments(
+        [pseudo[k] for k in todo], engine=engine, glossary=gloss, report=polish_rows,
+        progress_cb=lambda d, t: log(f"  {engine}: {d}/{t}") if d % 20 == 0 else None) if todo else []
+    zh_units = [""] * len(units)
+    for k, zh in zip(todo, zh_done):
+        zh_units[k] = zh
     out = [""] * len(segs)
     fallback: list[int] = []
     for k, (u, zh) in enumerate(zip(units, zh_units)):
@@ -761,7 +769,7 @@ def _synthesize(ctx: Ctx, args, segs: list[dict], idxs: list[int],
                  for i in idxs]
     # A line with no visible characters (「……」 for a swallowed 「と」) has
     # nothing to say; synthesising it yields a 0.0 s file that fails QC.
-    seg_texts = [(i, t) for i, t in seg_texts if _visible_chars(t)]
+    seg_texts = [(i, t) for i, t in seg_texts if _visible_chars(t) and not segs[i].get("keep_original")]
     seg_refs, modes = tts_mod.build_seg_refs(
         segs, refs, force_sft=(args.voice_mode == "sft"))
     for i in idxs:
@@ -1090,7 +1098,9 @@ def step_faces(ctx: Ctx, args) -> None:
     from ai_movie.config import FACE_SKIP_NONLEXICAL
     if FACE_SKIP_NONLEXICAL:
         from ai_movie.units import is_nonlexical
-        segs = [dict(s, no_lipsync=True) if is_nonlexical(s.get("text", "")) else s for s in segs]
+        segs = [dict(s, no_lipsync=True) if (s.get("content") == "nonlexical" or s.get("no_lipsync")
+                                             or (not s.get("content") and is_nonlexical(s.get("text", ""))))
+                else s for s in segs]
         n_skip = sum(1 for s in segs if s.get("no_lipsync"))
         if n_skip:
             log(f"  {n_skip}/{len(segs)} interjection-only lines: dubbed, picture left untouched")

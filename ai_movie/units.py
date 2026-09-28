@@ -62,6 +62,8 @@ def joins(prev: dict, seg: dict, *,
     text_prev = (prev.get("text") or "").rstrip()
     if not text_prev or text_prev[-1] in ASR_SENTENCE_END:
         return False
+    if prev.get("keep_original") or seg.get("keep_original"):
+        return False                        # a moan is not part of the sentence around it
     gap = float(seg["start"]) - float(prev["end"])
     same = prev.get("speaker") == seg.get("speaker")
     scrap = min(visible_len(text_prev), visible_len(seg.get("text"))) <= 2
