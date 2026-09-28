@@ -246,6 +246,27 @@ def post_speaker(name: str, body: dict = Body(...)):
     return _edit(E.add_speaker, name, body.get("gender", ""))
 
 
+# ── film-wide speaker profiles (long films) ──
+
+@app.put("/api/projects/{name}/speakers/{spk}/profile")
+def put_speaker_profile(name: str, spk: str, body: dict = Body(...)):
+    """Pin a chunk speaker to a profile id (``{"profile": "P0"}``; null = automatic)."""
+    _project_or_404(name)
+    _no_job(name)
+    return _edit(E.set_speaker_profile, name, spk, body.get("profile"))
+
+
+@app.get("/api/films/{film}/profiles")
+def get_profiles(film: str):
+    return P.profiles_view(film)
+
+
+@app.put("/api/films/{film}/profiles/{pid}")
+def put_profile(film: str, pid: str, body: dict = Body(...)):
+    """Edit a profile: ref_audio / merge_into / name / default_for_gender."""
+    return _edit(E.update_profile, film, pid, body)
+
+
 @app.put("/api/projects/{name}/glossary")
 def put_glossary(name: str, body: dict = Body(...)):
     _project_or_404(name)

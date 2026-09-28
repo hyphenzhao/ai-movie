@@ -900,6 +900,9 @@ def _finalize_segments(
             from ai_movie.osd import overlap_ratio
             d["overlap"] = round(overlap_ratio(overlap_regions, piece["start"],
                                                piece["end"]), 3)
+        for k in ("no_speech_prob", "avg_logprob", "compression_ratio", "pass", "alt_text"):
+            if piece.get(k) is not None:
+                d[k] = piece[k]                          # Whisper scores + sweep evidence for content.classify
         out.append(d)
         if segment_cb:
             segment_cb(d)

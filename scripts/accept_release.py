@@ -121,6 +121,9 @@ def main() -> int:
     ap.add_argument("version")
     ap.add_argument("--baseline", type=Path, default=ROOT / "workspace" / "_archive_v3.0.0")
     ap.add_argument("--films", default=",".join(FILMS))
+    ap.add_argument("--long", default=None,
+                    help="also gate a long film by scripts/eval_long.py (L1–L6): no gate that passed in the "
+                         "baseline's eval_long JSON may fail now, and the absolute floors must hold")
     args = ap.parse_args()
 
     films = [f for f in args.films.split(",") if f]
@@ -229,6 +232,22 @@ def main() -> int:
                    f"- 画面原文：{c['ref_ja']}",
                    f"- 基线：{b['asr_ja']} → {b['ours_zh']}",
                    f"- 本次：{c['asr_ja']} → {c['ours_zh']}", ""]
+    if args.long:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("eval_long", ROOT / "scripts" / "eval_long.py")
+        _el = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_el)
+        res = _el.evaluate(args.long)
+        (outdir / f"{args.long}.eval_long.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+        base_path = Path(args.baseline) / f"{args.long}_eval_long.json"
+        base_ok = {}
+        if base_path.exists():
+            base_ok = {c["id"]: c["ok"] for c in json.loads(base_path.read_text(encoding="utf-8")).get("checks", [])}
+        for c in res["checks"]:
+            regressed = base_ok.get(c["id"]) is True and not c["ok"]
+            gate(f"L[{args.long}] {c['id']}", c["desc"], c["ok"] and not regressed,
+                 c["value"] + ("（基线通过，现在失败）" if regressed else ""))
+        for n in res.get("notes", []):
+            notes.append(f"{args.long}: {n}")
     (outdir / "ACCEPTANCE.md").write_text("\n".join(md), encoding="utf-8")
     (outdir / "ACCEPTANCE.json").write_text(
         json.dumps({"version": args.version, "passed": passed, "gates": gates, "notes": notes},

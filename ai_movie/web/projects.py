@@ -257,6 +257,9 @@ def build_argv(name: str, steps: list[str] | None, force: bool = False,
     if force:
         argv.append("--force")
     argv += option_flags(load_options(name))
+    film = film_of(name)
+    if film:                                   # long-film chunk: enrol against the shared profiles
+        argv += ["--profiles", str(profiles_path(film))]
     argv += extra or []
     return argv
 
@@ -421,8 +424,42 @@ def speakers_view(name: str, state: dict | None = None) -> dict:
     refs = (st.get("tts") or {}).get("refs") or {}
     vc_refs = (st.get("vc") or {}).get("refs") or {}
     quality = (st.get("tts") or {}).get("quality") or {}
+    enrol = st.get("enrol") or {}
+    for k, a in (enrol.get("speaker_profile") or {}).items():
+        if k in spk:
+            spk[k]["profile"] = a.get("profile") if isinstance(a, dict) else a
+            spk[k]["profile_how"] = a.get("how") if isinstance(a, dict) else None
     return {"speakers": spk, "refs": refs, "vc_refs": vc_refs, "quality": quality,
-            "backend": diar.get("backend"), "overlap_total_s": (st.get("osd") or {}).get("total_overlap_s")}
+            "backend": diar.get("backend"), "overlap_total_s": (st.get("osd") or {}).get("total_overlap_s"),
+            "film": film_of(name), "profiles": enrol.get("profiles")}
+
+
+def film_of(name: str) -> str | None:
+    """``FILM_pNN`` → ``FILM`` when ``workspace/FILM/profiles.json`` exists."""
+    import re as _re
+    m = _re.match(r"^(.+)_p\d{2}$", name)
+    return m.group(1) if m and (ROOT / "workspace" / m.group(1) / "profiles.json").exists() else None
+
+
+def profiles_path(film: str) -> Path | None:
+    p = ROOT / "workspace" / film / "profiles.json"
+    return p if p.exists() else None
+
+
+def profiles_view(film: str) -> dict:
+    p = profiles_path(film)
+    if not p:
+        return {"film": film, "profiles": {}, "version": None}
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    out = {}
+    for pid, prof in (doc.get("profiles") or {}).items():
+        ref = prof.get("ref_audio")
+        rp = (p.parent / ref) if ref and not Path(ref).is_absolute() else (Path(ref) if ref else None)
+        thumb = p.parent / "profiles" / f"{pid}.jpg"
+        out[pid] = {**prof, "ref_url": media_url(rp) if rp and rp.exists() else None,
+                    "alt_urls": [media_url(p.parent / a) for a in (prof.get("ref_alternatives") or []) if (p.parent / a).exists()],
+                    "thumb_url": media_url(thumb) if thumb.exists() else None}
+    return {"film": film, "version": doc.get("version"), "built_from": doc.get("built_from"), "profiles": out}
 
 
 def faces_view(name: str, state: dict | None = None) -> dict:

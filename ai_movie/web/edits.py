@@ -146,6 +146,89 @@ def _propagate_labels(state: dict, idx: int, src: dict) -> None:
                     tgt[f] = src[f]
 
 
+# ── film-wide speaker profiles (long films) ──
+
+def _film_of(name: str) -> str | None:
+    """``SONE-846_p07`` → ``SONE-846`` when that film has profiles."""
+    import re as _re
+    m = _re.match(r"^(.+)_p\d{2}$", name)
+    if m and (P.ROOT / "workspace" / m.group(1) / "profiles.json").exists():
+        return m.group(1)
+    return None
+
+
+def set_speaker_profile(name: str, speaker: str, profile: str | None) -> dict:
+    """Pin a chunk speaker to a profile (``None`` = back to the automatic choice).
+
+    Marks the enrol stage edited so tts / faces / vc go stale; translate and
+    compact stay valid (the words did not change).
+    """
+    st = _load(name)
+    spks = ((st.get("asr") or {}).get("diarization") or {}).get("speakers") or {}
+    if speaker not in spks:
+        raise EditError(f"未知说话人 {speaker}", 404)
+    film = _film_of(name)
+    if not film:
+        raise EditError("该项目没有全片档案（profiles.json）", 404)
+    doc = json.loads((P.ROOT / "workspace" / film / "profiles.json").read_text(encoding="utf-8"))
+    if profile is not None and profile not in (doc.get("profiles") or {}):
+        raise EditError(f"未知档案 {profile}", 404)
+    _backup(name, st)
+    enrol = st.setdefault("enrol", {})
+    sp = enrol.setdefault("speaker_profile", {})
+    if profile is None:
+        sp.pop(speaker, None)
+    else:
+        sp[speaker] = {"profile": profile, "how": "manual", "manual": True}
+    if "enrol" in (st.get("_fp") or {}):
+        _commit(name, st, "enrol", keep_valid=["glossary", "translate", "compact"])
+    else:
+        P.state_path(name).write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"speaker": speaker, "profile": profile, "speaker_profile": sp}
+
+
+def update_profile(film: str, pid: str, patch: dict) -> dict:
+    """Edit a film profile: ``ref_audio`` (an existing wav, e.g. one of the
+    alternatives), ``merge_into`` (fold this profile into another) or ``name``.
+    Bumps ``version`` and marks ``manual`` — every chunk's enrol fingerprint
+    (which hashes profiles.json) goes stale at its next run."""
+    path = P.ROOT / "workspace" / film / "profiles.json"
+    if not path.exists():
+        raise EditError("没有全片档案", 404)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    profiles = doc.setdefault("profiles", {})
+    if pid not in profiles:
+        raise EditError(f"未知档案 {pid}", 404)
+    prof = profiles[pid]
+    if "ref_audio" in patch:
+        ref = patch["ref_audio"]
+        rp = Path(ref) if ref and Path(ref).is_absolute() else (path.parent / ref if ref else None)
+        if rp and not rp.exists():
+            raise EditError("参考音文件不存在", 404)
+        prof["ref_audio"] = ref
+    if patch.get("merge_into"):
+        tgt = patch["merge_into"]
+        if tgt not in profiles or tgt == pid:
+            raise EditError(f"无法并入 {tgt}")
+        profiles[tgt].setdefault("sources", []).extend(prof.get("sources") or [])
+        profiles[tgt]["seconds"] = round(float(profiles[tgt].get("seconds") or 0) + float(prof.get("seconds") or 0), 1)
+        if prof.get("default_for_gender") and not profiles[tgt].get("default_for_gender"):
+            profiles[tgt]["default_for_gender"] = True
+        del profiles[pid]
+        prof = profiles[tgt]
+    if "name" in patch:
+        prof["name"] = patch["name"]
+    if "default_for_gender" in patch and patch["default_for_gender"]:
+        for q in profiles.values():
+            if q.get("gender") == prof.get("gender"):
+                q["default_for_gender"] = False
+        prof["default_for_gender"] = True
+    prof["manual"] = True
+    doc["version"] = int(doc.get("version") or 1) + 1
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+    return doc
+
+
 def add_speaker(name: str, gender: str) -> dict:
     if gender not in ("male", "female"):
         raise EditError("gender must be male/female")

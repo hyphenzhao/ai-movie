@@ -627,6 +627,11 @@ def step_asr(ctx: Ctx, args) -> None:
         if len(segments) != n0:
             log(f"Silence gate: {n0 - len(segments)} segment(s) removed")
 
+    # Content, not confidence, decides what goes on: hallucinations out, vocalisations kept as the
+    # original voice, everything else dubbed (ai_movie/content.py).
+    from ai_movie.content import classify_segments
+    segments = classify_segments(segments, vocals=vocals if trusted else None, log=log)
+
     (ctx.work / "asr_words.json").write_text(
         json.dumps(words, ensure_ascii=False), encoding="utf-8")
 

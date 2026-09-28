@@ -50,23 +50,28 @@ def _kind_steps(kind: str, name: str, steps: list[str] | None, force: bool,
     py = P.PY
     S = P.SCRIPTS
     cmds: list[list[str]] = []
+    film = P.film_of(name)
+    prof = str(P.profiles_path(film)) if film else None
+
+    def vc_cmds() -> list[list[str]]:
+        if prof:                                 # long film: the shared profile references
+            return [[py, "-u", str(S / "run_vc_version.py"), str(st), "--profiles", prof]]
+        return [[py, "-u", str(S / "auto_select_refs.py"), str(st)],
+                [py, "-u", str(S / "run_vc_version.py"), str(st),
+                 "--refs-json", str(work / "refs_auto" / "refs.json")]]
     if kind == "steps":
         cmds.append(P.build_argv(name, steps, force))
     elif kind == "one_click":
         cmds.append(P.build_argv(name, steps or list(P.rp.ALL_STEPS), force))
         if with_v2:
-            cmds.append([py, "-u", str(S / "auto_select_refs.py"), str(st)])
-            cmds.append([py, "-u", str(S / "run_vc_version.py"), str(st),
-                         "--refs-json", str(work / "refs_auto" / "refs.json")])
+            cmds += vc_cmds()
         cmds.append(P.build_argv(name, ["qc"], True))
         cmds.append([py, "-u", str(S / "eval_pipeline.py"), str(st)])
         if with_deliver:
             cmds.append([py, "-u", str(S / "deliver.py"), str(st), "--out", str(P.DELIVER),
                          "--version", "vc" if with_v2 else "v1"])
     elif kind == "v2":
-        cmds.append([py, "-u", str(S / "auto_select_refs.py"), str(st)])
-        cmds.append([py, "-u", str(S / "run_vc_version.py"), str(st),
-                     "--refs-json", str(work / "refs_auto" / "refs.json")])
+        cmds += vc_cmds()
         cmds.append(P.build_argv(name, ["qc"], True))
     elif kind == "qc":
         cmds.append(P.build_argv(name, ["qc"], True))
