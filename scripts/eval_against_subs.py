@@ -424,7 +424,9 @@ def render(name: str, groups: list[dict], segments: list[dict],
         out += [f"## ASR 差异最大的 {worst} 句", ""]
         for g in sorted(scored, key=lambda x: x["sim"])[:worst]:
             out += [
-                f"**[{g['start']:.1f}s] #{g['idxs'][0]}–{g['idxs'][-1]}  sim={g['sim']:.2f}**",
+                # a cue no kept segment covers (dropped as hallucination / kept as original voice) has no indices
+                f"**[{g['start']:.1f}s] #{g['idxs'][0] if g['idxs'] else '—'}–{g['idxs'][-1] if g['idxs'] else '—'}"
+                f"  sim={g['sim']:.2f}**",
                 f"- 画面原文：{g['ref_ja']}",
                 f"- 我们 ASR：{g['asr_ja']}",
                 f"- 我们译文：{g['ours_zh']}",

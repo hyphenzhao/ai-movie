@@ -192,7 +192,9 @@ CONTENT_MAX_CPS = 20.0             # visible chars/s above which text is invente
 CONTENT_NSP_DROP = 0.85            # sweep only: no_speech_prob above this …
 CONTENT_LOGPROB_DROP = -1.2        # … with avg_logprob below this → drop
 CONTENT_AGREE_MIN = 0.5            # two decodes this similar = confirmed speech
-CONTENT_CONFLICT_MAX = 0.2         # two decodes this different = neither trusted
+CONTENT_CONFLICT_MAX = 0.2         # two decodes this different = a conflict …
+CONTENT_WEAK_CONF = 0.6            # … which only vetoes a line that is itself weak: word prob below this
+CONTENT_WEAK_LOGPROB = -0.7        #     and segment log-prob below this
 CONTENT_ENERGY_FLOOR_DBFS = -55.0  # vocals p95 below this = nothing was said
 CONTENT_REPEAT_DROP = 4            # a 1–2-kana word repeated this often = decoder loop
 

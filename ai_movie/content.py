@@ -31,7 +31,8 @@ from ai_movie.segmenter import _HALLUCINATION_PHRASES, _visible_len
 from ai_movie.units import is_nonlexical
 
 from ai_movie.config import (CONTENT_AGREE_MIN, CONTENT_CONFLICT_MAX, CONTENT_ENERGY_FLOOR_DBFS,   # noqa: E402
-                             CONTENT_LOGPROB_DROP, CONTENT_MAX_CPS, CONTENT_NSP_DROP, CONTENT_REPEAT_DROP)
+                             CONTENT_LOGPROB_DROP, CONTENT_MAX_CPS, CONTENT_NSP_DROP, CONTENT_REPEAT_DROP,
+                             CONTENT_WEAK_CONF, CONTENT_WEAK_LOGPROB)
 
 # Whole-line stock outputs (folded); the segmenter's substring list covers the
 # YouTube boilerplate, these are the polite closings Whisper emits over silence.
@@ -40,7 +41,6 @@ _STOCK_LINES = {
     "ありがとうございました", "ありがとうございます", "どうもありがとうございました",
     "おやすみなさい", "お疲れ様でした", "お疲れさまでした", "失礼します", "失礼しました",
     "ご視聴ありがとうございました", "またね", "バイバイ", "ごちそうさまでした", "いただきます",
-    "はじめまして", "よろしくお願いします",
 }
 _PUNCT = r"[\s、。，,．.！!？?…‥・「」『』（）()～~♪♬\-—]"
 _CJK = re.compile(r"[぀-ヿ一-鿿]")
@@ -134,8 +134,14 @@ def classify(seg: dict, *, vocals_p95_db: float | None = None) -> dict:
             if sim >= CONTENT_AGREE_MIN:
                 reasons.append(f"confirmed by second decode ({sim:.2f})")
                 return {"content": "speech", "reasons": reasons, "confirmed": True}
-            if sim < CONTENT_CONFLICT_MAX and not is_nonlexical(alt):
-                return out("drop", f"decodes disagree ({sim:.2f})")
+            # A conflicting second decode is a veto only when (a) it is itself believable — the vocals
+            # decode is often the hallucination (「ご視聴ありがとうございました」 against a clean 0.94-confidence
+            # line) — and (b) the line is weak on its own scores.  Measured on the short films: the bare
+            # "decodes disagree" rule removed 12 real lines of test_2 and one of output_test.
+            alt_junk = bool(raw_hallucination(alt, pass_="sweep")) or not _CJK.search(alt) or is_nonlexical(alt)
+            weak = (conf is None or conf < CONTENT_WEAK_CONF) and (alp is None or alp < CONTENT_WEAK_LOGPROB)
+            if sim < CONTENT_CONFLICT_MAX and weak and not alt_junk:
+                return out("drop", f"decodes disagree ({sim:.2f}) and the line is weak")
         elif nsp is not None and nsp >= 0.5:
             return out("drop", "only one decode heard text, nsp ≥ 0.5")
     if sweep and vis <= 2 and (nsp or 0) > 0.5:

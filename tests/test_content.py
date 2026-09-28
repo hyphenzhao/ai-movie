@@ -57,7 +57,12 @@ def test_nonlexical_and_energy():
 def test_sweep_cross_decode():
     s = {"pass": "sweep"}
     assert classify(seg("奥まで入っちゃうよ", asr_conf=0.3, alt_text="奥まで入っちゃうよ。", **s)).get("confirmed")
-    assert kind("奥まで入っちゃうよ", asr_conf=0.3, alt_text="ご飯食べました", **s) == "drop"
+    assert kind("奥まで入っちゃうよ", asr_conf=0.3, avg_logprob=-1.1, alt_text="ご飯食べました", **s) == "drop"
+    # a confident line is not vetoed by a conflicting second decode …
+    assert kind("毎日仕事中電話しすぎはい会議だって遅刻するし", asr_conf=0.94, avg_logprob=-0.18, alt_text="どうする", **s) == "speech"
+    # … and a second decode that is itself a stock phrase vetoes nothing
+    assert kind("下に座っていいのかな", asr_conf=0.46, avg_logprob=-0.86, alt_text="おやすみなさい", **s) == "speech"
+    assert kind("よろしくお願いします", asr_conf=0.7) == "speech"
     assert kind("奥まで入っちゃうよ", alt_text="", no_speech_prob=0.7, **s) == "drop"
     assert kind("奥まで入っちゃうよ", alt_text="", no_speech_prob=0.2, **s) == "speech"
     assert kind("奥まで入っちゃうよ", no_speech_prob=0.9, avg_logprob=-1.5, **s) == "drop"
