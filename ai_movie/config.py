@@ -197,6 +197,22 @@ CONTENT_WEAK_CONF = 0.6            # … which only vetoes a line that is itself
 CONTENT_WEAK_LOGPROB = -0.7        #     and segment log-prob below this
 CONTENT_ENERGY_FLOOR_DBFS = -55.0  # vocals p95 below this = nothing was said
 CONTENT_REPEAT_DROP = 4            # a 1–2-kana word repeated this often = decoder loop
+# compression_ratio is a *window* score: openai-whisper stamps the 30 s decode window's ratio on every
+# segment cut from it, so it says "the window looped", never "this line loops".  A vocalisation is
+# decided by its text first (units.is_nonlexical); only then does the window ratio drop the rest.
+CONTENT_CR_DROP = 2.4              # Whisper window compression ratio above which a non-vocalisation line is a decoder loop
+# Held-vowel run (units.is_nonlexical): one sustained vowel (あああああ / あーーー / 〜〜〜) at least
+# CONTENT_HELD_RUN_MIN marks long that covers CONTENT_HELD_RUN_FRAC of the line is a moan; whatever
+# Whisper appended after it (「ああ×14兄ちゃん」「ぁ×16とりあえず」) came from the same looped window and is
+# not a line.  Replay over SONE-846 (1055 delivered speech rows + 69 compression drops): 5 speech rows
+# (4 distinct — output_test duplicates p01) have a run ≥ 6, and the fraction separates them cleanly:
+# moan + garbage 「ああああ×12 あ10」 0.87 / 「ああああああ大」 0.86 vs real 「あぁ、あぁ、あぁあぁ、痛い、痛い」 0.67 /
+# 「っ ああああああ今までやってきた中」 0.43.  0.7 is the midpoint: it keeps 「痛い、痛い」 dubbed (0.6 flips it)
+# and still catches 「ああ×14兄ちゃん」 (0.78; 0.8 loses 10 drop→nonlexical rows / 27 s).  RUN_MIN 6 is the
+# shortest true positive (「でいっ ああああああ」 6/8) and the largest value that still catches
+# 「ああああああ大」 (6/7); 4–8 are flat (±1 row), 6 also keeps 「あああ大」 (3/4) as speech.
+CONTENT_HELD_RUN_MIN = 6           # a held vowel run at least this many marks long …
+CONTENT_HELD_RUN_FRAC = 0.7        # … covering this share of the line is a sustained sound, not a line
 
 ASR_INITIAL_PROMPT: dict[str, str] = {}
 

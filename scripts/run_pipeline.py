@@ -107,7 +107,8 @@ STEP_CONFIG: dict[str, list[str]] = {
             "ASR_SWEEP_MAX_WINDOW_S", "ASR_SWEEP_FLOOR_DBFS", "ASR_SWEEP_TEMPERATURES",
             "CONTENT_MAX_CPS", "CONTENT_NSP_DROP", "CONTENT_LOGPROB_DROP", "CONTENT_AGREE_MIN",
             "CONTENT_CONFLICT_MAX", "CONTENT_ENERGY_FLOOR_DBFS", "CONTENT_WEAK_CONF",
-            "CONTENT_WEAK_LOGPROB", "CONTENT_REPEAT_DROP"],
+            "CONTENT_WEAK_LOGPROB", "CONTENT_REPEAT_DROP", "CONTENT_CR_DROP",
+            "CONTENT_HELD_RUN_MIN", "CONTENT_HELD_RUN_FRAC"],
     "enrol": ["PROFILE_MIN_SCORE", "PROFILE_MARGIN", "PROFILE_FACE_MIN_COS", "PROFILE_VOICE_LINK_DIST",
               "PROFILE_MIN_SPEECH_S", "DIARIZE_AHC_THRESHOLD", "FACE_DET_CONF", "FACE_SCAN_MARGIN_S",
               "FACE_ID_SAMPLES"],
@@ -211,6 +212,10 @@ STEP_FILES: dict[str, list[str]] = {
     # which a function-source hash cannot see.
     "translate": ["ai_movie/units.py"],
     "asr": ["ai_movie/diar_worker.py", "ai_movie/content.py", "ai_movie/units.py"],
+    # step_faces calls units.is_nonlexical directly for legacy segments without `content`; the byte hash
+    # sees its regexes, and costs nothing extra: asr hashes the same file and faces follows asr through
+    # the up chain (asr → translate → tts → fit → faces), so every units.py edit re-runs faces anyway.
+    "faces": ["ai_movie/units.py"],
     "lipsync": ["patches/musetalk_rotation_align.patch",
                 "patches/musetalk_target_face.patch",
                 "patches/musetalk_quality.patch",

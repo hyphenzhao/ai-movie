@@ -16,6 +16,16 @@ hallucination is dropped.
                       lip-sync (``keep_original`` + ``no_lipsync``)
 * ``"drop"``        — not speech at all: remove the segment
 
+A moan is decided by its text before any window score.  ``compression_ratio``
+is stamped per 30 s decode window (``asr._collect`` copies it onto every word,
+``segmenter._flush`` keeps the max per sentence), so it says the *window*
+looped — a moan window drags every sentence cut from it into the drop unless
+the text rule runs first (52 lines / 167 s silenced on the first long film).
+A window whose ratio stayed above ``CONTENT_CR_DROP`` at every fallback
+temperature (``asr.py`` l.841, up to T=1.0) is a T=1.0 sample, so its
+non-vocalisation text is dropped even when it reads like a line (「胸が痛い」
+SONE-846 p19 433.6 s).
+
 Segments carry ``pass`` = ``"vad"`` (first Whisper pass over VAD spans) or
 ``"sweep"`` (second pass over the gaps).  Sweep segments have no VAD backing,
 so the rules are stricter for them and a second decode of the same window on
@@ -30,9 +40,9 @@ import re
 from ai_movie.segmenter import _HALLUCINATION_PHRASES, _visible_len
 from ai_movie.units import is_nonlexical
 
-from ai_movie.config import (CONTENT_AGREE_MIN, CONTENT_CONFLICT_MAX, CONTENT_ENERGY_FLOOR_DBFS,   # noqa: E402
-                             CONTENT_LOGPROB_DROP, CONTENT_MAX_CPS, CONTENT_NSP_DROP, CONTENT_REPEAT_DROP,
-                             CONTENT_WEAK_CONF, CONTENT_WEAK_LOGPROB)
+from ai_movie.config import (CONTENT_AGREE_MIN, CONTENT_CONFLICT_MAX, CONTENT_CR_DROP,   # noqa: E402
+                             CONTENT_ENERGY_FLOOR_DBFS, CONTENT_LOGPROB_DROP, CONTENT_MAX_CPS,
+                             CONTENT_NSP_DROP, CONTENT_REPEAT_DROP, CONTENT_WEAK_CONF, CONTENT_WEAK_LOGPROB)
 
 # Whole-line stock outputs (folded); the segmenter's substring list covers the
 # YouTube boilerplate, these are the polite closings Whisper emits over silence.
@@ -93,41 +103,42 @@ def classify(seg: dict, *, vocals_p95_db: float | None = None) -> dict:
     def out(kind: str, why: str) -> dict:
         return {"content": kind, "reasons": reasons + [why]}
 
-    # 7. nothing audible where the text supposedly was
+    # Rules in execution order.
+    # 1. nothing audible where the text supposedly was
     if vocals_p95_db is not None and vocals_p95_db < CONTENT_ENERGY_FLOOR_DBFS:
         return out("drop", f"energy {vocals_p95_db:.0f} dBFS")
+    # 2. no visible text
     if not vis:
         return out("nonlexical", "no visible text")
-    # 1. stock phrases — a real high-confidence "thank you" in an interview survives
+    # 3. stock phrases — a real high-confidence "thank you" in an interview survives
     if any(p in text for p in _HALLUCINATION_PHRASES):
         return out("drop", "boilerplate")                 # YouTube closings are never said on set
     if ft.rstrip("。") in _STOCK_LINES:
         if sweep or conf is None or conf < 0.8:
             return out("drop", "stock phrase")
         reasons.append("stock phrase kept (asr_conf ≥ 0.8, vad pass)")
-    # 2. no CJK at all: Latin garbage.  Digits / units alone are fine ("3cm")
+    # 4. no CJK at all: Latin garbage.  Digits / units alone are fine ("3cm")
     if not _CJK.search(text):
         if re.fullmatch(r"[\d０-９.,%％cmCMkgKG\s]+", text.strip() or "x"):
             return out("speech", "numeric")
         return out("drop", "no CJK")
-    # 3. vocalisations before loops: a transcribed moan (「アーッ、アーッ…」「あーーーー」) has a high
-    #    compression ratio too, and dropping it silenced 52 lines / 167 s of the first film instead of
-    #    keeping the original voice
+    # 5. vocalisations before loops: a transcribed moan (「アーッ、アーッ…」「あーーーー」「ああ×14兄ちゃん」)
+    #    carries its window's high compression ratio too, and dropping it silenced 52 lines / 167 s of
+    #    the first film instead of keeping the original voice.  The text alone decides (units.is_nonlexical,
+    #    whitelist included): a repeated unit is only reported, never a reason on its own.
     unit, n = _repeat_unit(ft)
-    if is_nonlexical(text) or (n >= 2 and is_nonlexical(unit)):
+    if is_nonlexical(text):
         return out("nonlexical", f"vocalisation ×{n}" if n >= 2 else "interjection only")
-    if (cr is not None and cr > 2.4) or n >= CONTENT_REPEAT_DROP:
+    # 6. decoder loops: a looped window (see the module docstring) or a word repeated too often
+    if (cr is not None and cr > CONTENT_CR_DROP) or n >= CONTENT_REPEAT_DROP:
         return out("drop", f"repetition ×{n}" if n >= CONTENT_REPEAT_DROP else f"compression {cr:.2f}")
-    # 4. impossible speaking rate
+    # 7. impossible speaking rate
     if vis / dur > CONTENT_MAX_CPS and dur >= 0.3:
         return out("drop", f"{vis / dur:.0f} chars/s")
-    # 5. sweep-only extreme scores
+    # 8. sweep-only extreme scores
     if sweep and nsp is not None and alp is not None and nsp > CONTENT_NSP_DROP and alp < CONTENT_LOGPROB_DROP:
         return out("drop", f"nsp {nsp:.2f} / logprob {alp:.2f}")
-    # 8. moans, sighs, laughs
-    if is_nonlexical(text):
-        return out("nonlexical", "interjection only")
-    # 6. cross-decode evidence (sweep windows decoded on both sources)
+    # 9. cross-decode evidence (sweep windows decoded on both sources)
     alt = seg.get("alt_text")
     if sweep and alt is not None:
         fa = fold(alt)
@@ -140,15 +151,35 @@ def classify(seg: dict, *, vocals_p95_db: float | None = None) -> dict:
             # decode is often the hallucination (「ご視聴ありがとうございました」 against a clean 0.94-confidence
             # line) — and (b) the line is weak on its own scores.  Measured on the short films: the bare
             # "decodes disagree" rule removed 12 real lines of test_2 and one of output_test.
-            alt_junk = bool(raw_hallucination(alt, pass_="sweep")) or not _CJK.search(alt) or is_nonlexical(alt)
+            # A pure vocalisation as the second decode is junk; a held run with a tail (「あ×300寝てきたよ」)
+            # is not — it says the window looped, and the weak line under test stays vetoed (SONE-846
+            # p03 328.1 s sits on a cue with wrong ASR text; p18 163.7 s is far from any cue).
+            alt_junk = bool(raw_hallucination(alt, pass_="sweep")) or not _CJK.search(alt) \
+                or is_nonlexical(alt, held_run=False)
             weak = (conf is None or conf < CONTENT_WEAK_CONF) and (alp is None or alp < CONTENT_WEAK_LOGPROB)
             if sim < CONTENT_CONFLICT_MAX and weak and not alt_junk:
                 return out("drop", f"decodes disagree ({sim:.2f}) and the line is weak")
         elif nsp is not None and nsp >= 0.5:
             return out("drop", "only one decode heard text, nsp ≥ 0.5")
+    # 10. a 1–2-character sweep scrap that Whisper itself doubts
     if sweep and vis <= 2 and (nsp or 0) > 0.5:
         return out("nonlexical", "sweep fragment")
     return out("speech", "content")
+
+
+def looped_indices(segments: list[dict]) -> set[int]:
+    """Indices of segments that are part of a decoder loop: the same folded
+    text in ≥ 3 segments within 30 s, whatever each copy scores.  Text and
+    time only, so it replays offline (scripts/replay_content.py)."""
+    folded = [fold(s.get("text", "")) for s in segments]
+    looped: set[int] = set()
+    for i, ft in enumerate(folded):
+        if len(ft) < 4:
+            continue
+        same = [j for j in range(len(segments)) if folded[j] == ft and abs(float(segments[j]["start"]) - float(segments[i]["start"])) <= 30]
+        if len(same) >= 3:
+            looped.update(same)
+    return looped
 
 
 def classify_segments(segments: list[dict], *, vocals: str | None = None,
@@ -168,15 +199,7 @@ def classify_segments(segments: list[dict], *, vocals: str | None = None,
             i, j = int(a * 50), max(int(a * 50) + 1, int(b * 50))
             seg = lv[i:j]
             return float(np.percentile(seg, 95)) if seg.size else None
-    # the same folded text in ≥ 3 segments within 30 s is a decoder loop, whatever each copy scores
-    folded = [fold(s.get("text", "")) for s in segments]
-    looped = set()
-    for i, ft in enumerate(folded):
-        if len(ft) < 4:
-            continue
-        same = [j for j in range(len(segments)) if folded[j] == ft and abs(float(segments[j]["start"]) - float(segments[i]["start"])) <= 30]
-        if len(same) >= 3:
-            looped.update(same)
+    looped = looped_indices(segments)
     kept = []
     n_drop = n_nl = 0
     for i, s in enumerate(segments):

@@ -116,10 +116,22 @@ def test_units_on_v300_output_test():
 
 def test_nonlexical_lines_are_only_interjections():
     from ai_movie.units import is_nonlexical
-    for t in ("あっ", "んん…", "はぁはぁ", "ふふふ", "アァッ！", "", "…"):
+    for t in ("あっ", "んん…", "はぁはぁ", "ふふふ", "アァッ！", "", "…",
+              "あーーーー", "あ〜〜〜", "アーッ、アーッ…", "はぁはぁ…は", "うわー", "アァン!", "フゥー!"):
         assert is_nonlexical(t), t
-    for t in ("はい", "うん", "いいえ", "ええ", "はーい", "気持ちいい", "あの、すみません", "いく", "だめ"):
+    for t in ("はい", "うん", "いいえ", "ええ", "はーい", "気持ちいい", "あの、すみません", "いく", "だめ",
+              "いいわ", "えーっと", "コーヒー", "いくいく"):
         assert not is_nonlexical(t), t
+
+
+def test_kana_marked_keeps_elongation_marks():
+    # ー is alnum but 〜 / ～ are not; small vowels and katakana fold; っ and punctuation vanish
+    assert U._kana_marked("あーーー") == "あーーー"
+    assert U._kana_marked("あ〜〜、ア～ッ!") == "あ〜〜あ～"
+    assert U._kana_marked("ぁぁッ") == "ああ"
+    assert U._kana_base("あーーー") == "あ"
+    assert U._staccato("いっいっ") and U._staccato("えっ、えっ") and U._staccato("いーいー")
+    assert not U._staccato("はいっ") and not U._staccato("いい") and not U._staccato("はーい")
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

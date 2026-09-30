@@ -22,6 +22,8 @@ import re
 
 from ai_movie.config import (
     ASR_SENTENCE_END,
+    CONTENT_HELD_RUN_FRAC,
+    CONTENT_HELD_RUN_MIN,
     UNIT_CONTINUOUS_GAP,
     UNIT_MAX_CHARS,
     UNIT_MAX_DUR,
@@ -287,31 +289,80 @@ _NONLEX_WORDS = {"はい", "いいえ", "いえ", "いい", "ええ", "うん", 
                  "いや", "やだ", "だめ", "もっと", "ねえ", "やめて", "いく", "すごい", "いたい", "ない"}
 _NONLEX_SOUND = _NONLEX_BASE | set("ぐふぶぷぱぴぽぺ")
 _SMALL = str.maketrans("ぁぃぅぇぉゃゅょゎ", "あいうえおやゆよわ")
+# A scream is a vowel run with a fixed onset: うわー / うわっ / うわぁぁぁ / きゃー / きゃああ.  Anchored
+# and followed by a sound kana (or nothing), so ひやひや / お客 / きゃく are untouched.  Adding わ to
+# _NONLEX_BASE instead would flip 「いいわ」 (SONE-846 p16 31.8 s, a real line).
+_EXCLAIM = re.compile(r"^(?:うわ|きや|ぎや|ひや)(?=[あいうえおんはひふへほ]|$)")
+# One held vowel and its elongation marks (あああ, あーーー, あ〜〜), or bare marks (ーーー: Whisper's
+# rendering of a sustained tone).  "ー".isalnum() is True but 〜 (U+301C) / ～ (U+FF5E) are not, hence the
+# explicit class everywhere the marks matter.
+_HELD = re.compile(r"([あいうえおんはひふへほ])(?:\1|[ー〜～])*|[ー〜～]{2,}")
+
+
+def _fold_kana(ja: str) -> str:
+    """Katakana → hiragana, small vowels → full (ァ → あ), everything else untouched."""
+    return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in (ja or "")).translate(_SMALL)
 
 
 def _kana_base(ja: str) -> str:
-    t = "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in (ja or ""))
-    t = t.translate(_SMALL)
+    t = _fold_kana(ja)
     base = "".join(c for c in t if "ぁ" <= c <= "ゖ" or "一" <= c <= "鿿" or c.isalnum())
     return base.replace("っ", "").replace("ー", "")
 
 
-def is_nonlexical(ja: str) -> bool:
+def _kana_marked(ja: str) -> str:
+    """``_kana_base`` but keeps ー 〜 ～ (still drops っ): あーーー is a held あ, not one character."""
+    t = _fold_kana(ja)
+    return "".join(c for c in t if "ぁ" <= c <= "ゖ" or "一" <= c <= "鿿" or c.isalnum() or c in "〜～").replace("っ", "")
+
+
+def _staccato(ja: str) -> bool:
+    """「いっいっ」「えっ、えっ」「いーいー」: a 1–2-kana unit carrying っ or ー, repeated.
+
+    Their base (いい / ええ) spells a whitelist word, so the whitelist must not
+    see them.  The test is the repetition, not the mere presence of っ:
+    「はいっ」 (SONE-846 p13 248.9 s) and 「あいっ!」 (p11 45.9 s) are delivered
+    as speech today and a bare "has っ" guard would flip both (+9.7 s).
+    """
+    t = "".join(c for c in _fold_kana(ja) if "ぁ" <= c <= "ゖ" or c in "ー〜～")
+    for n in (1, 2):
+        if len(t) >= 2 * n and len(t) % n == 0 and t == t[:n] * (len(t) // n):
+            return any(c in "っー〜～" for c in t[:n])
+    return False
+
+
+def is_nonlexical(ja: str, *, held_run: bool = True) -> bool:
     """True when *ja* is only interjection sounds (no word content).
 
     Covers moans/sighs (あっ、んん、はぁはぁ), katakana onomatopoeia
-    (グーグー → ぐぐ, ハァハァ) and any 1–2-kana unit repeated (ぐふぐふ);
-    the short-word whitelist keeps はい / だめ / もっと as content.
+    (グーグー → ぐぐ, ハァハァ), any 1–2-kana unit repeated (ぐふぐふ),
+    screams (うわー、きゃー) and — with *held_run* — a line dominated by one
+    sustained vowel (「あああああああ兄ちゃん」「ぁ×16とりあえず」「ー×200アイク」):
+    Whisper decodes a moan window as the moan plus a hallucinated tail, and
+    the tail is not a line.  The short-word whitelist keeps はい / だめ /
+    いい as content, except for staccato moans (「いっいっ」「えっ、えっ」) whose
+    base happens to spell a word.
+
+    *held_run=False* is for a second decode used as *evidence* (the
+    cross-decode veto in ``ai_movie.content``): a held run there says the
+    window looped, not that the line under test is a vocalisation.
     """
     base = _kana_base(ja)
     if not base:
         return True
-    if base in _NONLEX_WORDS:
-        return False
-    if all(c in _NONLEX_BASE for c in base):
+    if base in _NONLEX_WORDS and not _staccato(ja):
+        return False                                     # いい / ええ / はーい / はいっ stay content; いっいっ does not
+    base = _EXCLAIM.sub("", base)                        # うわ / きゃ + vowel run = a scream
+    if not base or all(c in _NONLEX_BASE for c in base):
         return True
     # a repeated 1–2-kana *sound* (ぐぐ ← グーグー, ふふ, ぷぷ); repeated words (そうそう) stay content
     for n in (1, 2):
         if len(base) >= 2 * n and len(base) % n == 0 and base == base[:n] * (len(base) // n):
             return all(c in _NONLEX_SOUND for c in base[:n])
-    return False
+    if not held_run:
+        return False
+    # A sustained sound dominates the line: the longest held run is at least CONTENT_HELD_RUN_MIN marks
+    # and covers CONTENT_HELD_RUN_FRAC of the marked text (see config.py for the measured margins).
+    marked = _kana_marked(ja)
+    longest = max((len(m.group(0)) for m in _HELD.finditer(marked)), default=0)
+    return longest >= CONTENT_HELD_RUN_MIN and longest >= CONTENT_HELD_RUN_FRAC * len(marked)

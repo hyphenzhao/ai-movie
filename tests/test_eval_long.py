@@ -29,6 +29,16 @@ def test_cue_distance():
     assert el.cue_distance([], 1.0, 2.0) == float("inf")
 
 
+def test_kept_original_stats():
+    segs = [{"t0": 10.0, "t1": 12.5, "keep_original": True},
+            {"t0": 20.0, "t1": 21.0, "keep_original": True, "audio_fit": "x.wav"},     # touched
+            {"t0": 30.0, "t1": 33.0},                                                  # dubbed line
+            {"start": 40.0, "end": 41.2, "keep_original": True}]                       # plain segment
+    st = el.kept_original_stats(segs)
+    assert st == {"lines": 3, "seconds": 4.7, "touched": 1}, st
+    assert el.kept_original_stats([]) == {"lines": 0, "seconds": 0.0, "touched": 0}
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -921,6 +921,12 @@ def _restore_original_ranges(ranges, path, total: int, sr: int, n_ch: int,
                              *, pad_ms: float | None = None, fade_ms: int = 30) -> dict | None:
     """Original vocals over *ranges*, faded, at the bed's rate/channels.
 
+    Padded ranges that touch or overlap are coalesced first so the vocals are
+    restored once: back-to-back kept-original lines (263 of 450 on SONE-846
+    sit < 0.3 s apart, e.g. the 「アーッ」 run at p05 150–166 s) used to be
+    added twice over the shared pad — +6 dB for up to 2 × pad at the seam,
+    with a fade-out and fade-in crossing inside the same moan.
+
     Returns ``{"audio": (total, n_ch) array, "mask": (total,) 0/1}`` or None.
     """
     import librosa as _librosa
@@ -936,8 +942,15 @@ def _restore_original_ranges(ranges, path, total: int, sr: int, n_ch: int,
     audio = np.zeros((total, n_ch), dtype=np.float32)
     mask = np.zeros(total, dtype=np.float32)
     fade = max(1, int(fade_ms * sr / 1000))
-    for a, b in ranges:
-        i, j = max(0, int((float(a) - pad) * sr)), min(total, len(voc), int((float(b) + pad) * sr))
+    spans = sorted((max(0.0, float(a) - pad), float(b) + pad) for a, b in ranges)
+    merged: list[list[float]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    for a, b in merged:
+        i, j = int(a * sr), min(total, len(voc), int(b * sr))
         if j - i < 2 * fade:
             continue
         piece = voc[i:j].copy()
