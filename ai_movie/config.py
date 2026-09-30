@@ -764,6 +764,47 @@ OLLAMA_SAKURA_POLISH_PROMPT = (
 OLLAMA_SAKURA_CONCURRENCY = 4   # parallel Ollama requests
 OLLAMA_SAKURA_TIMEOUT = 900     # 15 min — 14B+ models need time for cold-start
 
+# ── Sakura draft: speaker tags + prior-turn context (v3.4 T1/T9) ──────
+# Both mechanisms default OFF until scripts/ab_translate_context.py decides
+# (pre-registered rule in that script's docstring).  With the defaults below
+# the requests sent to Sakura are byte-identical to v3.3's — tags off, the
+# last two finished (source, translation) pairs as real chat turns, frozen
+# per block of four units — so the fingerprint change is the only change.
+#
+# SAKURA_SPEAKER_TAGS: prefix every source line (target and prior turns)
+#   with translator._speaker_tag → 「[S0女]…」 and append the tag rule below
+#   to the system prompt.  Assistant turns never carry a tag, so the model's
+#   own history teaches "do not echo it".  Overlapped windows carry NO tag:
+#   there the *label* is unreliable (9/10 female-labelled questions inside
+#   OSD overlaps were male), so translator._speaker_tag stays silent above
+#   OSD_SEED_EXCLUDE rather than emitting a wrong speaker id.
+# SAKURA_CTX_BEFORE: finished (tag, ja, zh) pairs kept as prior turns.
+# SAKURA_CTX_APPEND: run each block sequentially and add every finished
+#   in-block unit as a further real turn, so a unit sees CTX_BEFORE …
+#   CTX_BEFORE + CTX_BLOCK − 1 exact predecessors and never a source-only
+#   look-behind.  Within a block each request is then a pure append to the
+#   previous one (system + snapshot + earlier turns are a cached prefix):
+#   Ollama's journal shows 5–70 uncached tokens per request in that regime
+#   versus ~300 (0.8–1.0 s, ≈3× the draft time) when the window slides by
+#   one every request (SAKURA_CTX_BLOCK = 1).
+# SAKURA_CTX_BLOCK: units per block; the snapshot is frozen at block start.
+#   OLLAMA_SAKURA_CONCURRENCY is only how many of a block run in parallel
+#   when SAKURA_CTX_APPEND is off (n_slots = 1 on this Ollama, so it buys
+#   nothing) and is deliberately not a fingerprinted knob.
+SAKURA_SPEAKER_TAGS = False
+SAKURA_CTX_BEFORE = 2
+SAKURA_CTX_APPEND = False
+SAKURA_CTX_BLOCK = 4
+# Rule 5 of the Sakura system prompt, appended only when tags are on.  It
+# explains the tag and nothing else: the Modelfile's own clause
+# 「不擅自添加原文中没有的代词」 was measured to point the wrong way — the
+# shipped output already *lacks* 11/97 (output_test) and 39/445 (SONE-846)
+# pronouns the reference Chinese has, and invents only 0 / 9.
+OLLAMA_SAKURA_TAG_RULE = (
+    "5. 台词开头的 [S0女]/[S1男] 是说话人编号和性别（同一编号=同一个人），"
+    "只用来判断谁在说、对谁说、说的是谁，不要翻译也不要输出。"
+)
+
 # ── Window defaults ─────────────────────────────────────────
 
 WINDOW_TITLE = "AI Movie - 视频配音"

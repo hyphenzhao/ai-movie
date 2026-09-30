@@ -15,16 +15,25 @@ Blocking gates
   H3  QC FAIL share (v1 and v2) ≤ baseline + 2 percentage points
   H4  output_test ASR vs on-screen subtitles: median ≥ 0.90 and the number of
       lines below 0.70 does not grow
-  H5  output_test sentence units whose Chinese invents a pronoun the Japanese
-      never had: ≤ 80 % of baseline
-  H6  the same pronoun count does not grow on the other films
+  H5  output_test pronoun agreement (你/您、他、她) with the reference Chinese
+      of inputs/subs/output_test.zh.srt: mismatches (extra + missing) ≤
+      baseline and extra ≤ baseline + 1
   H7  lines with leftover kana ≤ max(baseline, 1)
+  L7  with --long: SONE-846 pronoun mismatches vs the screen Chinese ≤ the
+      shipped count (scripts/eval_long.py), alongside L1–L6
 
 H5 was first drafted as "halve the fragmented-sentence count".  A Sakura
 A/B on v3.0.0 output_test showed every grouping rule leaves that count at 8:
 the remaining cases are separate utterances with real pauses that the
 official subtitler happened to put on one line (「カンナちゃん。｜見てますね。」),
 not translation defects — so it is reported, not gated.
+
+Until v3.3 H5/H6 gated ``pronoun_units`` (units.unsupported_pronoun: a
+Chinese 你/他/她 without a Japanese subject) at ≤ 80 % of baseline / not
+growing.  That number can only fall by *deleting* pronouns, and against the
+reference Chinese the shipped output was already short of them (output_test
+0 extra, 11 missing; SONE-846 9 extra, 39 missing) — the polish pass had been
+taught 「没有依据就删掉」.  The count is kept as a health number in the notes.
 """
 
 from __future__ import annotations
@@ -122,8 +131,9 @@ def main() -> int:
     ap.add_argument("--baseline", type=Path, default=ROOT / "workspace" / "_archive_v3.0.0")
     ap.add_argument("--films", default=",".join(FILMS))
     ap.add_argument("--long", default=None,
-                    help="also gate a long film by scripts/eval_long.py (L1–L6): no gate that passed in the "
-                         "baseline's eval_long JSON may fail now, and the absolute floors must hold")
+                    help="also gate a long film by scripts/eval_long.py (L1–L7, L7 = pronoun agreement with "
+                         "the screen Chinese): no gate that passed in the baseline's eval_long JSON may fail "
+                         "now, and the absolute floors must hold")
     args = ap.parse_args()
 
     films = [f for f in args.films.split(",") if f]
@@ -194,10 +204,14 @@ def main() -> int:
                  f"中位数 {cur['asr_median']:.3f}（基线 {bas['asr_median']:.3f}），"
                  f"<0.70 {cur['asr_bad']}（基线 {bas['asr_bad']}），"
                  f"平均 {cur['asr_mean']:.3f}（基线 {bas['asr_mean']:.3f}）")
-            limit = int(bas["pronoun_units"] * 0.8)
-            gate("H5", "output_test 凭空人称代词单元 ≤ 基线 80%",
-                 cur["pronoun_units"] <= limit,
-                 f"{cur['pronoun_units']}（基线 {bas['pronoun_units']}，上限 {limit}）")
+            pa, pb = cur.get("pronoun_agreement"), bas.get("pronoun_agreement")
+            if pa and pb:
+                gate("H5", "output_test 代词（你/您、他、她）与参考译文不一致数 ≤ 基线，且多出 ≤ 基线 + 1",
+                     pa["mismatch"] <= pb["mismatch"] and pa["extra"] <= pb["extra"] + 1,
+                     f"不一致 {pa['mismatch']}（多出 {pa['extra']}，缺少 {pa['missing']}，"
+                     f"{pa['scored']} 句）；基线 {pb['mismatch']}（多出 {pb['extra']}，缺少 {pb['missing']}）")
+            else:
+                notes.append("output_test H5: 无参考译文（inputs/subs/output_test.zh.srt），未评判")
             notes.append(f"output_test 半截话字幕句 {cur['fragmented_cues']}（基线 "
                          f"{bas['fragmented_cues']}，仅报告）；分段 {cur['n_segments']}（基线 "
                          f"{bas['n_segments']}）")
@@ -206,15 +220,13 @@ def main() -> int:
                 b = bmap.get(g["cue"])
                 if b and (b["sim"] < 0.85 or g["sim"] < 0.85):
                     before_after.append((b, g))
-        else:
-            gate(f"H6[{film}]", "凭空人称代词单元不增加",
-                 cur["pronoun_units"] <= bas["pronoun_units"],
-                 f"{cur['pronoun_units']}（基线 {bas['pronoun_units']}）")
         gate(f"H7[{film}]", "译文残留假名的段 ≤ max(基线, 1)",
              cur["kana_segments"] <= max(bas["kana_segments"], 1),
              f"{cur['kana_segments']}（基线 {bas['kana_segments']}）")
         pol = (state.get("translate") or {}).get("polish") or {}
         notes.append(f"{film} 句子单元 {cur['n_units']}（多段 {cur['multi_units']}）；"
+                     f"凭空人称代词单元 {cur['pronoun_units']}（基线 {bas['pronoun_units']}，仅报告）；"
+                     f"半截话单元 {cur['fragmented_units']}（基线 {bas['fragmented_units']}，仅报告）；"
                      f"可疑句校对 {pol.get('accepted', 0)}/{pol.get('flagged', 0)} 采纳；"
                      f"ASR 音源 {(state.get('asr') or {}).get('asr_audio')}，"
                      f"性别音源 {(state.get('asr') or {}).get('gender_source')}")

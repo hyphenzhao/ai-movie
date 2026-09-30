@@ -14,7 +14,10 @@ Gates (L1–L6 in Documentation/v3.3-long-film.md):
   segments (rules of ai_movie.content re-applied post hoc + kept lines far
   from any cue inside subtitled stretches), L2b ASR similarity on read cues,
   L3 voice consistency (one reference file per profile across chunks),
-  L4 kept-original lines untouched, L5 loudness spread, L6 duration.
+  L4 kept-original lines untouched, L5 loudness spread, L6 duration,
+  L7 pronoun agreement (你/他/她) of the translate-stage lines with the
+  screen Chinese of scan.json: mismatches (extra + missing) must not exceed
+  the shipped v3.3 count.
 Exit 0 = pass, 1 = fail, 2 = cannot evaluate.
 """
 
@@ -36,6 +39,10 @@ if str(ROOT) not in sys.path:
 
 from ai_movie.content import classify, fold        # noqa: E402
 
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+from eval_against_subs import pronoun_agreement    # noqa: E402
+
 L1_INTERVIEW_MIN = 0.90
 L1_SCENE_MIN = 0.60
 L2_MAX = 0.05
@@ -44,6 +51,11 @@ L3_MIN_MEDIAN = 0.40
 L3_MAX_SPREAD = 0.15
 L5_TOL_LU = 2.0
 L6_TOL_S = 0.5              # ±1 frame per chunk boundary is the concat floor
+# Shipped v3.3 SONE-846 translate stage vs scan.json: 445 scored cues, 9 extra,
+# 39 missing → 48 mismatches.  The old F1-style count would reward deleting
+# pronouns; this one cannot get better by deletion (missing goes up).
+L7_MAX_MISMATCH = 48
+L7_MIN_OVERLAP_S = 0.25     # same cue↔segment overlap L2b uses
 
 _PAREN = re.compile(r"^\s*[（(].*[)）]\s*$")
 
@@ -53,11 +65,15 @@ def _probe(p: Path, entries: str) -> str:
                           capture_output=True, text=True).stdout.strip().split("\n")[0]
 
 
-def film_segments(film: str, stage: str | None = None) -> tuple[list[dict], dict]:
+def film_segments(film: str, stage: str | None = None,
+                  segments_by_chunk: dict[int, list[dict]] | None = None) -> tuple[list[dict], dict]:
     """Kept segments on the film timeline + chunk meta (type, offsets).
 
     *stage* forces one state key (``asr`` to measure transcription coverage
-    before the rest of the chain has been re-run)."""
+    before the rest of the chain has been re-run).  *segments_by_chunk*
+    replaces the state's segment list for the chunk indices it holds (an
+    in-memory A/B arm, scripts/ab_translate_context.py); other chunks still
+    come from state.json, so a partial arm scores against the shipped lines."""
     split = ROOT / "workspace" / film / "_split"
     plan = json.loads((split / "plan.json").read_text())
     ks = json.loads((split / "keyframes.json").read_text()) if (split / "keyframes.json").exists() else []
@@ -74,9 +90,12 @@ def film_segments(film: str, stage: str | None = None) -> tuple[list[dict], dict
                     lead = c["start"] - ks[j - 1]
         sp = w / "state.json"
         st = json.loads(sp.read_text()) if sp.exists() else {}
-        chunk_segs = ((st.get(stage) or {}).get("segments") or []) if stage else (
-            (st.get("vc") or {}).get("segments") or (st.get("fit") or {}).get("segments")
-            or (st.get("asr") or {}).get("segments") or [])
+        if segments_by_chunk is not None and i in segments_by_chunk:
+            chunk_segs = segments_by_chunk[i]
+        else:
+            chunk_segs = ((st.get(stage) or {}).get("segments") or []) if stage else (
+                (st.get("vc") or {}).get("segments") or (st.get("fit") or {}).get("segments")
+                or (st.get("asr") or {}).get("segments") or [])
         speech = sum(s["end"] - s["start"] for s in chunk_segs)
         spk = len((((st.get("asr") or {}).get("diarization") or {}).get("speakers")) or {})
         meta[i] = {"start": c["start"], "end": c["end"], "lead": lead, "state": bool(st),
@@ -130,6 +149,24 @@ def kept_original_stats(segs: list[dict]) -> dict:
     secs = sum(float(s.get("t1", s.get("end", 0))) - float(s.get("t0", s.get("start", 0))) for s in ko)
     return {"lines": len(ko), "seconds": round(secs, 1),
             "touched": sum(1 for s in ko if s.get("audio") or s.get("audio_fit"))}
+
+
+def pronoun_check(truth: list[dict], segs: list[dict], key: str = "text_translated") -> dict:
+    """L7 numbers: 你/他/她 agreement of our lines with the screen Chinese.
+
+    Every cue with a ``zh`` is paired with the segments overlapping it by more
+    than L7_MIN_OVERLAP_S (their *key* texts joined); cues without any line
+    are not scored, so coverage (L1) cannot move this number.  The scoring
+    itself is eval_against_subs.pronoun_agreement, the same function the
+    output_test release gate uses."""
+    groups = []
+    for c in truth:
+        if not c.get("zh"):
+            continue
+        ov = [s for s in segs if min(c["end"], s["t1"]) - max(c["start"], s["t0"]) > L7_MIN_OVERLAP_S]
+        ours = " ".join((s.get(key) or "").strip() for s in ov).strip()
+        groups.append({"cue": c["id"], "start": c["start"], "ref_zh": c["zh"], "ours_zh": ours})
+    return pronoun_agreement(groups)
 
 
 def evaluate(film: str, stage: str | None = None) -> dict:
@@ -204,6 +241,14 @@ def evaluate(film: str, stage: str | None = None) -> dict:
         checks.append({"id": "L4", "desc": "kept-original lines have no synthesized audio", "ok": kept_original["touched"] == 0,
                        "value": f"{kept_original['touched']}/{kept_original['lines']} touched"})
         notes.append(f"kept-original: {kept_original['lines']} lines, {kept_original['seconds']} s")
+    # L7: pronoun agreement of the translate-stage lines with the screen Chinese
+    tr_segs, _ = film_segments(film, "translate")
+    pa = pronoun_check(truth, tr_segs)
+    if pa["scored"]:
+        checks.append({"id": "L7", "desc": "pronoun (你/他/她) mismatches vs screen Chinese", "ok": pa["mismatch"] <= L7_MAX_MISMATCH,
+                       "value": f"{pa['mismatch']} on {pa['scored']} cues (extra {pa['extra']}, missing {pa['missing']}; ≤ {L7_MAX_MISMATCH})"})
+    else:
+        notes.append("L7: no translate-stage lines overlap a cue with Chinese")
     # L6
     out = ROOT / "deliver" / f"{film}_dubbed_full.mp4"
     plan = json.loads((ROOT / "workspace" / film / "_split" / "plan.json").read_text())

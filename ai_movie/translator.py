@@ -1337,13 +1337,97 @@ def build_context_block(
 
 
 def _speaker_tag(seg: dict) -> str:
-    """``[S0♀]`` style tag so the model keeps pronouns/register consistent."""
+    """``[S0女]`` style tag so the model keeps pronouns/register consistent.
+
+    An overlapped window (OSD ``overlap`` above ``OSD_SEED_EXCLUDE``) gets no
+    tag at all — not a genderless ``[S0]``: in those windows the speaker
+    *label* itself is what diarization gets wrong (9 of 10 "female" questions
+    inside overlaps were the male interviewer), and a prompt that says
+    「同一编号=同一个人」 would then bind the line to the wrong person.  The
+    threshold is the one the channel classifier already uses to refuse
+    overlapped seeds; it encodes the same physical claim.
+    """
+    from ai_movie.config import OSD_SEED_EXCLUDE
+
     spk = seg.get("speaker") or ""
     if not spk:
         return ""
+    try:
+        if float(seg.get("overlap") or 0.0) > OSD_SEED_EXCLUDE:
+            return ""
+    except (TypeError, ValueError):
+        pass
     g = seg.get("gender") or seg.get("tts_gender") or ""
     mark = {"female": "女", "male": "男"}.get(g, "")
     return f"[{spk}{mark}]"
+
+
+_SAKURA_ASK = "将以下日文翻译为口语化中文：\n"
+
+
+def _sakura_messages(
+    seg: dict,
+    prior: list[tuple[str, str, str]],
+    *,
+    glossary: dict | None,
+    tags: bool,
+) -> list[dict]:
+    """Chat messages for one Sakura draft request (pure; no I/O).
+
+    *prior* holds the finished ``(tag, ja, zh)`` units in film order.  Each
+    becomes a real user/assistant turn: Sakura is a completion-style model,
+    and context given inline as a "「原文」→「译文」" block was continued
+    instead of translated (6 of 34 lines came back as literal pairs).  A
+    block of several source lines in one user message fails the same way
+    more quietly — Sakura translates *every* line and the first-line
+    extraction in :func:`_clean_ollama_output` returns the translation of a
+    context line — so the target is always the only Japanese in the last
+    message.  With ``tags`` the user lines carry ``[S0女]``-style speaker
+    tags and the system prompt gains the rule that explains them; assistant
+    lines never carry one.  With ``tags`` off the request is byte-identical
+    to the v3.3 one.
+    """
+    from ai_movie.config import OLLAMA_SAKURA_TAG_RULE, OLLAMA_SAKURA_TRANSLATE_PROMPT
+    from ai_movie.glossary import format_for_prompt
+
+    system = OLLAMA_SAKURA_TRANSLATE_PROMPT
+    if tags:
+        system = system + "\n" + OLLAMA_SAKURA_TAG_RULE
+    msgs = [{"role": "system", "content": system}]
+    for tag, ja, zh in prior:
+        msgs.append({"role": "user", "content": f"{_SAKURA_ASK}{tag if tags else ''}{ja}"})
+        msgs.append({"role": "assistant", "content": zh})
+    txt = (seg.get("text") or "").strip()
+    gl = format_for_prompt(glossary or {}, [txt])
+    head = f"固定译名：{gl}\n" if gl else ""
+    tag = _speaker_tag(seg) if tags else ""
+    msgs.append({"role": "user", "content": f"{head}{_SAKURA_ASK}{tag}{txt}"})
+    return msgs
+
+
+def _strip_tag_echo(zh: str) -> tuple[str, bool]:
+    """Remove a leading speaker tag the model echoed; report a surviving one.
+
+    ``[S0女]我回来了`` → ``我回来了``.  Full-width brackets and a trailing
+    colon are accepted because Sakura re-punctuates freely.  The flag is
+    True when a tag-like token is still present anywhere (a leak that would
+    be read aloud by the TTS), so the caller can retry without tags.
+    """
+    import re as _re
+    text = _re.sub(r"^\s*[\[［【]\s*S\d+\s*[女男♀♂]?\s*[\]］】]\s*[：:]?\s*", "", zh or "", count=1)
+    text = text.strip()
+    return text, bool(_re.search(r"[\[［【]\s*S\d+", text))
+
+
+def _sakura_echo(zh: str, sources: list[str]) -> bool:
+    """A reply that still holds kana and equals one of the Japanese sources."""
+    import re as _re
+    from ai_movie.units import has_kana
+    if not zh or not has_kana(zh):
+        return False
+    fold = lambda s: _re.sub(r"[\s　、。，．！？!?…·・「」『』（）()\-—～~]", "", s or "")  # noqa: E731
+    z = fold(zh)
+    return bool(z) and any(z == fold(s) for s in sources)
 
 
 def _llm_translate_batches(
@@ -1455,77 +1539,121 @@ def _sakura_translate(
     glossary: dict | None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    trace: list[dict] | None = None,
 ) -> list[str]:
     """Per-segment translation with SakuraLLM (it cannot do JSON batches).
 
-    Context is snapshotted per batch rather than mutated live: the previous
+    Context is snapshotted per block rather than mutated live: the previous
     implementation appended to a shared ``ctx_buf`` from inside
     ``as_completed`` while four workers ran, so every worker saw a different,
-    race-dependent context and reruns were not reproducible.
+    race-dependent context and reruns were not reproducible.  Two switches
+    (ai_movie.config, both default off — see the comment there) change what
+    the snapshot carries: ``SAKURA_SPEAKER_TAGS`` tags the source lines with
+    the speaker, ``SAKURA_CTX_APPEND`` runs a block sequentially and feeds
+    each finished unit to the next one as a real turn.
+
+    *trace* (optional) receives one row per unit with the health counters the
+    A/B harness gates on: ``empty``, ``echo`` (kana reply equal to a source
+    line), ``tag_leak`` (a ``[S0女]`` survived cleaning), ``n_lines`` (> 1 =
+    the model answered more than the target line; only the first is kept)
+    and ``retry_bare`` (the request was repeated without tags after one of
+    those failures).
     """
     from concurrent.futures import ThreadPoolExecutor
     from ai_movie.config import (
         OLLAMA_SAKURA_CONCURRENCY, OLLAMA_SAKURA_TIMEOUT,
-        OLLAMA_SAKURA_TRANSLATE_PROMPT,
-    )
-    from ai_movie.glossary import (
-        format_for_prompt, protect_terms, restore_terms,
+        SAKURA_CTX_APPEND, SAKURA_CTX_BEFORE, SAKURA_CTX_BLOCK, SAKURA_SPEAKER_TAGS,
     )
 
     out: list[str] = [""] * len(segments)
     total = len(segments)
-    ctx: list[tuple[str, str]] = []
+    ctx: list[tuple[str, str, str]] = []           # (tag, ja, zh) of finished units
     done = 0
-    chunk = max(1, OLLAMA_SAKURA_CONCURRENCY)
+    block = max(1, SAKURA_CTX_BLOCK)
+    n_before = max(0, SAKURA_CTX_BEFORE)
 
-    for start in range(0, total, chunk):
+    def _ask(i: int, prior: list[tuple[str, str, str]], tags: bool) -> tuple[str, dict]:
+        txt = (segments[i].get("text") or "").strip()
+        msgs = _sakura_messages(segments[i], prior, glossary=glossary, tags=tags)
+        # seed: temperature 0.1 alone made re-runs differ, which is enough to
+        # flip the A/B on a handful of lines; the polish pass already seeds.
+        raw = _call_ollama_chat(
+            model, msgs, base_url, timeout=OLLAMA_SAKURA_TIMEOUT,
+            options={"num_predict": max(64, len(txt) * 4), "temperature": 0.1,
+                     "seed": 7})
+        zh, leak = _strip_tag_echo(_clean_ollama_output(raw))
+        # An echo is counted but not blanked: the kana line still reaches
+        # the polish pass as an F3 job, which is a better recovery than an
+        # empty (silent) line.
+        info = {"n_lines": sum(1 for ln in (raw or "").splitlines() if ln.strip()),
+                "tag_leak": int(leak),
+                "echo": int(_sakura_echo(zh, [txt] + [p[1] for p in prior]))}
+        return zh, info
+
+    def _one(i: int, prior: list[tuple[str, str, str]]) -> tuple[int, str, dict]:
+        txt = (segments[i].get("text") or "").strip()
+        tag = _speaker_tag(segments[i]) if SAKURA_SPEAKER_TAGS else ""
+        row = {"idx": i, "speaker": segments[i].get("speaker") or "", "tag": tag,
+               "n_before": len(prior), "zh": "", "empty": 0, "echo": 0,
+               "tag_leak": 0, "n_lines": 0, "retry_bare": 0}
+        if not txt:
+            return i, "", row
+        try:
+            zh, info = _ask(i, prior, SAKURA_SPEAKER_TAGS)
+            row.update(info)
+            # A tagged request that came back empty, echoed a source line or
+            # leaked the tag is repeated once exactly as the untagged path
+            # would send it; the untagged path itself has no retry (v3.3
+            # behaviour), so the A/B baseline arm is unchanged.
+            if SAKURA_SPEAKER_TAGS and (not zh or info["tag_leak"] or info["echo"]):
+                row["retry_bare"] = 1
+                zh, info = _ask(i, prior, False)
+                row.update(info)
+        except Exception as exc:                    # noqa: BLE001
+            print(f"[translate] sakura segment {i} failed: {exc}",
+                  file=sys.stderr)
+            zh = ""
+        if zh and row["tag_leak"]:
+            zh = ""                                  # never hand a tag to the TTS
+        row["zh"] = zh
+        row["empty"] = int(not zh)
+        return i, zh, row
+
+    for start in range(0, total, block):
         if cancel_check and cancel_check():
             break
-        batch = list(range(start, min(total, start + chunk)))
-        ctx_snapshot = list(ctx[-3:])          # frozen for the whole batch
-
-        def _one(i: int) -> tuple[int, str]:
-            txt = (segments[i].get("text") or "").strip()
-            if not txt:
-                return i, ""
-            pins: dict[str, str] = {}
-            # Sakura is a completion-style translation model.  Context must be
-            # given as real prior chat turns, not as an inline
-            # "「原文」→「译文」" block: given that pattern in the user message
-            # it *continues the pattern* instead of translating, and 6 of 34
-            # segments came back as literal "「A」→「B」" pairs.  Prior turns
-            # are unambiguous — the model can only answer the last one.
-            msgs = [{"role": "system",
-                     "content": OLLAMA_SAKURA_TRANSLATE_PROMPT}]
-            for o, t in ctx_snapshot[-2:]:
-                msgs.append({"role": "user",
-                             "content": f"将以下日文翻译为口语化中文：\n{o}"})
-                msgs.append({"role": "assistant", "content": t})
-
-            gl = format_for_prompt(glossary or {}, [txt])
-            head = f"固定译名：{gl}\n" if gl else ""
-            msgs.append({"role": "user",
-                         "content": f"{head}将以下日文翻译为口语化中文：\n{txt}"})
-            try:
-                raw = _call_ollama_chat(
-                    model, msgs, base_url, timeout=OLLAMA_SAKURA_TIMEOUT,
-                    options={"num_predict": max(64, len(txt) * 4),
-                             "temperature": 0.1})
-                return i, restore_terms(_clean_ollama_output(raw), pins)
-            except Exception as exc:                    # noqa: BLE001
-                print(f"[translate] sakura segment {i} failed: {exc}",
-                      file=sys.stderr)
-                return i, ""
-
-        with ThreadPoolExecutor(max_workers=chunk) as ex:
-            for i, txt in ex.map(_one, batch):
-                out[i] = txt
+        batch = list(range(start, min(total, start + block)))
+        snapshot = list(ctx[-n_before:]) if n_before else []    # frozen for the block
+        rows: list[dict] = []
+        if SAKURA_CTX_APPEND:
+            # Sequential: every finished unit becomes a real turn for the rest
+            # of the block, so the request is a pure append to the previous
+            # one and Ollama re-evaluates only the new tokens.
+            prior = list(snapshot)
+            for i in batch:
+                if cancel_check and cancel_check():
+                    break
+                _, zh, row = _one(i, prior)
+                out[i] = zh
+                rows.append(row)
+                src = (segments[i].get("text") or "").strip()
+                if src and zh:
+                    prior.append((row["tag"], src, zh))
+        else:
+            workers = max(1, min(len(batch), OLLAMA_SAKURA_CONCURRENCY))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for i, zh, row in ex.map(lambda k: _one(k, snapshot), batch):
+                    out[i] = zh
+                    rows.append(row)
+        if trace is not None:
+            trace.extend(rows)
 
         for i in batch:                                 # extend context in order
             src = (segments[i].get("text") or "").strip()
             if src and out[i]:
-                ctx.append((src, out[i]))
-        ctx = ctx[-12:]
+                ctx.append((_speaker_tag(segments[i]) if SAKURA_SPEAKER_TAGS else "",
+                            src, out[i]))
+        ctx = ctx[-max(12, n_before):]
 
         done += len(batch)
         if progress_cb:
@@ -1972,13 +2100,16 @@ def translate_segments(
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     report: list[dict] | None = None,
+    trace: list[dict] | None = None,
 ) -> list[str]:
     """Translate *segments* with one of :data:`TRANSLATE_ENGINES`.
 
     Returns one Chinese string per segment (empty string where the source
     was empty or the engine failed).  Engines are run inside
     :class:`exclusive_engine` so a 57 GB local model and an 88 GB Ollama
-    model can never be resident at the same time on a 122 GB box.
+    model can never be resident at the same time on a 122 GB box.  *trace*
+    receives the Sakura draft rows (see :func:`_sakura_translate`); the
+    draft text in them is what the polish pass starts from.
     """
     from ai_movie.config import (
         OLLAMA_BASE_URL, OLLAMA_GPTOSS_MODEL, OLLAMA_POLISH_MODEL, OLLAMA_SAKURA_MODEL,
@@ -2003,7 +2134,8 @@ def translate_segments(
             if draft_key == "sakura":
                 drafts = _sakura_translate(
                     segments, model=m, base_url=base_url, glossary=glossary,
-                    progress_cb=progress_cb, cancel_check=cancel_check)
+                    progress_cb=progress_cb, cancel_check=cancel_check,
+                    trace=trace)
             else:
                 drafts = _llm_translate_batches(
                     segments, model=m, base_url=base_url, glossary=glossary,
