@@ -41,6 +41,10 @@ STEP_LABELS = {
     "v2": "原声音色(v2)", "deliver": "交付包",
 }
 ENGINES = ["sakura", "sakura+gptoss", "gptoss", "hy-mt2", "hy-mt2+gptoss", "hy-mt2+sakura"]
+# v1 fingerprints the v2 clone was built from (recorded by jobs._record_vc_deps, compared in
+# derive_status).  enrol is included because run_vc_version.py reads enrol.speaker_profile
+# and no cached stage depends on enrol — without it a profile pin never showed as stale.
+VC_DEPS = ("fit", "compose", "enrol")
 
 # Options the UI edits, in the order the panels show them.  Each maps 1:1 to
 # a run_pipeline.py flag (see build_argv).
@@ -351,9 +355,11 @@ def derive_status(name: str, raw: dict, state: dict, running_step: str | None = 
     web = state.get("_web") or {}
     if vc.get("video") and Path(vc["video"] if Path(vc["video"]).is_absolute()
                                 else ROOT / vc["video"]).exists():
-        dep_now = {k: (fps.get(k) or {}).get("hash") for k in ("fit", "compose")}
+        dep_now = {k: (fps.get(k) or {}).get("hash") for k in VC_DEPS}
         rec = web.get("vc_deps")
-        ok = (rec == dep_now) if rec else True
+        # Only the keys the record holds are compared: records written before enrol was
+        # added (fit, compose) must not show every existing v2 as stale.
+        ok = all(dep_now.get(k) == v for k, v in rec.items()) if isinstance(rec, dict) and rec else True
         out["v2"] = {"status": "done" if ok else "stale", "label": STEP_LABELS["v2"],
                      "reasons": [] if ok else ["v1 已变更（需重做 v2）"]}
     else:
@@ -438,11 +444,11 @@ def film_of(name: str) -> str | None:
     """``FILM_pNN`` → ``FILM`` when ``workspace/FILM/profiles.json`` exists."""
     import re as _re
     m = _re.match(r"^(.+)_p\d{2}$", name)
-    return m.group(1) if m and (ROOT / "workspace" / m.group(1) / "profiles.json").exists() else None
+    return m.group(1) if m and (WORKSPACE / m.group(1) / "profiles.json").exists() else None
 
 
 def profiles_path(film: str) -> Path | None:
-    p = ROOT / "workspace" / film / "profiles.json"
+    p = WORKSPACE / film / "profiles.json"
     return p if p.exists() else None
 
 

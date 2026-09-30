@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from ai_movie.runlog import RunLog, append_event, snapshot_host      # noqa: E402
+from ai_movie.runlog import RunLog, append_event, read_jsonl, snapshot_host      # noqa: E402
 
 
 def test_record_of_a_failing_run():
@@ -55,6 +55,29 @@ def test_append_event_and_snapshot():
     e = json.loads(p.read_text().splitlines()[0])
     assert e["kind"] == "chunk_end" and e["chunk"] == "x_p01"
     assert "mem_available_gb" in snapshot_host()
+
+
+def test_append_is_one_line_per_call_and_read_jsonl_skips_junk():
+    """Long records (web edit log) stay one line each under concurrent appends, and the reader
+    ignores corrupt lines and missing files."""
+    import threading
+    p = Path(tempfile.mkdtemp(prefix="runlog_")) / "edits.jsonl"
+    big = "喵" * 3000                                       # ≈ 9 KB per record: past an 8 KiB text buffer
+    ths = [threading.Thread(target=lambda i=i: [append_event(p, "e", i=i, text=big) for _ in range(20)])
+           for i in range(4)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    lines = p.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 80
+    rows = [json.loads(ln) for ln in lines]                 # every line parses: no interleaving
+    assert sorted(r["i"] for r in rows) == sorted([0, 1, 2, 3] * 20) and all(r["text"] == big for r in rows)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write("garbage line\n[1, 2]\n")
+    assert len(read_jsonl(p)) == 80                         # junk and non-object lines skipped
+    assert read_jsonl(p.parent / "missing.jsonl") == []
+    assert read_jsonl(p.parent) == []                       # a directory is unreadable, not fatal
 
 
 if __name__ == "__main__":
