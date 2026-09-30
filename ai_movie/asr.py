@@ -513,6 +513,8 @@ def _transcribe_whisper_gpu(
     status_cb: Callable[[str], None] | None = None,
     sweep: bool = False,
     alt_audio: str | Path | None = None,
+    sweep_alt: str = "whisper",
+    sweep_alt_source: str = "auto",
 ) -> list[dict]:
     """Transcribe with openai-whisper GPU + Silero VAD pre-segmentation.
 
@@ -526,12 +528,18 @@ def _transcribe_whisper_gpu(
     With *diarize*, speaker turns are computed from the same VAD spans and
     fed to the sentence splitter, so no segment ever spans two speakers.
 
+    *sweep_alt* / *sweep_alt_source* pick the sweep's second decoder and the
+    audio it hears (config ASR_SWEEP_ALT_DECODER / _SOURCE); *alt_audio* is
+    the "other" source's file.  anime-whisper is loaded lazily before the
+    first file that sweeps and freed on the way out.
+
     Falls back to whole-file transcription if VAD is unavailable.
     """
     import torch
     import whisper
 
     from ai_movie.config import (
+        ASR_ANIME_BATCH,
         ASR_VAD_MIN_SILENCE_DURATION_MS,
         ASR_VAD_MIN_SPEECH_DURATION_MS,
         ASR_VAD_SPEECH_PAD_MS,
@@ -542,117 +550,143 @@ def _transcribe_whisper_gpu(
     model = whisper.load_model(model_size).to(device)
     WHISPER_SR = whisper.audio.SAMPLE_RATE  # 16 000
 
+    alt_mode = _resolve_alt_source(sweep_alt, sweep_alt_source)
+    alt_decoder = None
+    alt_load_errors: list[str] = []
+    alt_tried = False
+
     all_results: list[dict] = []
-    for i, p in enumerate(audio_paths):
-        if cancel_check and cancel_check():
-            break
-
-        if file_start_cb:
-            file_start_cb(i, p.name)
-
-        duration = _get_audio_duration(p)
-
-        # ── load audio & run VAD ─────────────────────────────────
-        audio_np = whisper.load_audio(str(p))       # float32, 16 kHz
-        audio_pt = torch.from_numpy(audio_np)
-        alt_np = floor_audio = None
-        if sweep:
-            # the other source for cross-decoding; the separated vocals set the energy floor
-            other = alt_audio or vocals_path
-            if other and Path(other).exists():
-                cand = whisper.load_audio(str(other))
-                if abs(len(cand) - len(audio_np)) < WHISPER_SR:
-                    alt_np = cand[:len(audio_np)] if len(cand) >= len(audio_np) else None
-            if vocals_path and Path(vocals_path).exists():
-                floor_audio = alt_np if (alt_np is not None and str(other) == str(vocals_path)) \
-                    else whisper.load_audio(str(vocals_path))
-
-        speech_segs = _vad_detect(
-            audio_pt,
-            threshold=ASR_VAD_THRESHOLD,
-            min_silence_duration_ms=ASR_VAD_MIN_SILENCE_DURATION_MS,
-            min_speech_duration_ms=ASR_VAD_MIN_SPEECH_DURATION_MS,
-            speech_pad_ms=ASR_VAD_SPEECH_PAD_MS,
-        )
-
-        if not speech_segs:
-            # VAD unavailable or found nothing → whole-file fallback
-            speech_segs = [{"start": 0.0, "end": len(audio_np) / WHISPER_SR}]
-
-        # ── speaker diarization (reuses the VAD spans above) ─────
-        diar = None
-        if diarize:
-            diar = _run_diarization(
-                p, speech_segs,
-                num_speakers=num_speakers, vocals_path=vocals_path,
-                status_cb=status_cb,
-            )
-
-        # ── transcribe each VAD segment ──────────────────────────
-        all_segs: list[dict] = []
-        all_words: list[dict] = []
-        chunk_errors: list[str] = []
-
-        for vad_seg in speech_segs:
+    try:
+        for i, p in enumerate(audio_paths):
             if cancel_check and cancel_check():
                 break
 
-            start_samp = int(vad_seg["start"] * WHISPER_SR)
-            end_samp = int(vad_seg["end"] * WHISPER_SR)
-            chunk = audio_np[start_samp:end_samp]
+            if file_start_cb:
+                file_start_cb(i, p.name)
 
-            if len(chunk) < WHISPER_SR * 0.1:   # skip < 100 ms
-                continue
+            duration = _get_audio_duration(p)
 
-            result = _transcribe_chunk(model, chunk, language, chunk_errors)
-            if result is None:
-                continue
+            # ── load audio & run VAD ─────────────────────────────────
+            audio_np = whisper.load_audio(str(p))       # float32, 16 kHz
+            audio_pt = torch.from_numpy(audio_np)
+            alt_np = floor_audio = None
+            if sweep:
+                # the other source for cross-decoding; the separated vocals set the energy floor
+                other = alt_audio or vocals_path
+                need_other = alt_mode == "other" or bool(vocals_path and other and str(other) == str(vocals_path))
+                other_np = whisper.load_audio(str(other)) if (need_other and other and Path(other).exists()) else None
+                alt_np = _pick_alt_audio(audio_np, other_np, alt_mode)
+                if vocals_path and Path(vocals_path).exists():
+                    floor_audio = other_np if (other_np is not None and str(other) == str(vocals_path)) \
+                        else whisper.load_audio(str(vocals_path))
+                if sweep_alt != "whisper" and not alt_tried:
+                    alt_tried = True                    # one load attempt per call, not per file
+                    if status_cb:
+                        status_cb(f"loading sweep alt decoder ({sweep_alt})…")
+                    alt_decoder = _load_alt_decoder(sweep_alt, alt_load_errors)
 
-            offset = vad_seg["start"]
+            speech_segs = _vad_detect(
+                audio_pt,
+                threshold=ASR_VAD_THRESHOLD,
+                min_silence_duration_ms=ASR_VAD_MIN_SILENCE_DURATION_MS,
+                min_speech_duration_ms=ASR_VAD_MIN_SPEECH_DURATION_MS,
+                speech_pad_ms=ASR_VAD_SPEECH_PAD_MS,
+            )
 
-            _collect(result, offset, "vad", all_segs, all_words)
+            if not speech_segs:
+                # VAD unavailable or found nothing → whole-file fallback
+                speech_segs = [{"start": 0.0, "end": len(audio_np) / WHISPER_SR}]
 
-            # per-VAD-segment progress (0..99 % within file)
-            if file_progress_cb and duration > 0:
-                pct = min(int(vad_seg["end"] / duration * 100), 99)
-                file_progress_cb(i, pct)
+            # ── speaker diarization (reuses the VAD spans above) ─────
+            diar = None
+            if diarize:
+                diar = _run_diarization(
+                    p, speech_segs,
+                    num_speakers=num_speakers, vocals_path=vocals_path,
+                    status_cb=status_cb,
+                )
 
-        if sweep:
-            sweep_errors: list[str] = []
-            n_sw, n_txt = _sweep_pass(model, audio_np, speech_segs, language, all_segs, all_words,
-                                      sweep_errors, alt_audio=alt_np, floor_audio=floor_audio,
-                                      cancel_check=cancel_check)
-            chunk_errors += sweep_errors
-            if status_cb:
-                status_cb(f"sweep: {n_sw} windows, {n_txt} with text")
+            # ── transcribe each VAD segment ──────────────────────────
+            all_segs: list[dict] = []
+            all_words: list[dict] = []
+            chunk_errors: list[str] = list(alt_load_errors)
 
-        all_segs.sort(key=lambda s: s["start"])
-        all_words.sort(key=lambda w: w["s"])
+            for vad_seg in speech_segs:
+                if cancel_check and cancel_check():
+                    break
 
-        segs = _finalize_segments(
-            all_segs, all_words, source=str(p),
-            diarization=diar,
-            max_duration=max_duration, max_chars=max_chars,
-            segment_cb=(lambda d, _i=i: segment_cb(_i, d)) if segment_cb else None,
-        )
+                start_samp = int(vad_seg["start"] * WHISPER_SR)
+                end_samp = int(vad_seg["end"] * WHISPER_SR)
+                chunk = audio_np[start_samp:end_samp]
 
-        if file_progress_cb:
-            file_progress_cb(i, 100)
+                if len(chunk) < WHISPER_SR * 0.1:   # skip < 100 ms
+                    continue
 
-        entry = {
-            "source": str(p),
-            "language": language,
-            "segments": segs,
-            "words": all_words,
-        }
-        if chunk_errors:
-            entry["chunk_errors"] = chunk_errors[:20]
-        if diar:
-            entry["diarization"] = diar
-        all_results.append(entry)
+                result = _transcribe_chunk(model, chunk, language, chunk_errors)
+                if result is None:
+                    continue
 
-        if progress_cb:
-            progress_cb(i + 1, len(audio_paths))
+                offset = vad_seg["start"]
+
+                _collect(result, offset, "vad", all_segs, all_words)
+
+                # per-VAD-segment progress (0..99 % within file)
+                if file_progress_cb and duration > 0:
+                    pct = min(int(vad_seg["end"] / duration * 100), 99)
+                    file_progress_cb(i, pct)
+
+            sweep_windows = None
+            if sweep:
+                sweep_errors: list[str] = []
+                n_sw, n_txt, sweep_windows = _sweep_pass(
+                    model, audio_np, speech_segs, language, all_segs, all_words,
+                    sweep_errors, alt_audio=alt_np, floor_audio=floor_audio,
+                    cancel_check=cancel_check, alt_decoder=alt_decoder)
+                chunk_errors += sweep_errors
+                if status_cb:
+                    status_cb(f"sweep: {n_sw} windows, {n_txt} with text")
+
+            all_segs.sort(key=lambda s: s["start"])
+            all_words.sort(key=lambda w: w["s"])
+
+            segs = _finalize_segments(
+                all_segs, all_words, source=str(p),
+                diarization=diar,
+                max_duration=max_duration, max_chars=max_chars,
+                segment_cb=(lambda d, _i=i: segment_cb(_i, d)) if segment_cb else None,
+            )
+
+            if file_progress_cb:
+                file_progress_cb(i, 100)
+
+            entry = {
+                "source": str(p),
+                "language": language,
+                "segments": segs,
+                "words": all_words,
+            }
+            if chunk_errors:
+                entry["chunk_errors"] = chunk_errors[:20]
+            if diar:
+                entry["diarization"] = diar
+            if sweep:
+                entry["sweep_windows"] = sweep_windows
+                # for the record (not fingerprinted): which second decoder the file really got;
+                # "fallback" = it gave up mid-file and large-v3 decoded the rest (see chunk_errors)
+                used = alt_decoder.name if alt_decoder is not None else "whisper"
+                entry["sweep_alt"] = {"name": used, "requested": sweep_alt, "source": alt_mode,
+                                      "revision": getattr(alt_decoder, "revision", None),
+                                      "dir": str(getattr(alt_decoder, "dir", "")) or None,
+                                      "batch": ASR_ANIME_BATCH if used == "anime" else None,
+                                      "fallback": bool(getattr(alt_decoder, "disabled", False)),
+                                      "alt_audio": alt_np is not None}
+            all_results.append(entry)
+
+            if progress_cb:
+                progress_cb(i + 1, len(audio_paths))
+    finally:
+        if alt_decoder is not None:
+            alt_decoder.close()                             # one resident model at a time, next stages need the memory
 
     return all_results
 
@@ -661,13 +695,20 @@ _SR16 = 16000          # whisper.audio.SAMPLE_RATE; the model only ever sees 16 
 
 
 def _collect(result: dict, offset: float, which: str, all_segs: list[dict],
-             all_words: list[dict], alt_text: str | None = None) -> None:
+             all_words: list[dict], alt_text: str | None = None,
+             alt_by: str | None = None) -> None:
     """Append one Whisper result to the raw segment / word streams.
 
     Whisper's per-segment scores (``no_speech_prob``, ``avg_logprob``,
     ``compression_ratio``) are kept on the segment *and* copied onto its
     words, because ``_finalize_segments`` rebuilds sentences from the word
     stream; ``segmenter._flush`` aggregates them back per sentence.
+
+    Sweep evidence rides the same way: ``alt_text`` is the second decode of
+    the window (``""`` = it decoded nothing, which is evidence too) and
+    ``alt_by`` names the decoder ("whisper" | "anime").  ``alt_by`` without
+    ``alt_text`` means that decoder failed on the window.  The content
+    classifier reads ``seg["alt_by"]`` (phase 2 keys its rules on it).
     """
     from ai_movie.content import raw_hallucination
     segs_in = result.get("segments", [])
@@ -685,12 +726,15 @@ def _collect(result: dict, offset: float, which: str, all_segs: list[dict],
                  "pass": which}
         if alt_text is not None:
             extra["alt"] = alt_text
+        if alt_by is not None:
+            extra["alt_by"] = alt_by
         all_segs.append({"start": round(seg["start"] + offset, 2),
                          "end": round(seg["end"] + offset, 2),
                          "text": seg["text"].strip(),
                          "no_speech_prob": extra["nsp"], "avg_logprob": extra["alp"],
                          "compression_ratio": extra["cr"], "pass": which,
-                         **({"alt_text": alt_text} if alt_text is not None else {})})
+                         **({"alt_text": alt_text} if alt_text is not None else {}),
+                         **({"alt_by": alt_by} if alt_by is not None else {})})
         for w in (seg.get("words") or []):
             token = w.get("word", w.get("text", ""))
             if not token:
@@ -781,42 +825,266 @@ def _transcribe_sweep(model, chunk, language: str, errors: list[str]) -> dict | 
         return None
 
 
+# ── the sweep's second decoder ─────────────────────────────────
+#
+# v3.3 decoded every text window twice with large-v3 (mix and vocals) and let
+# ai_movie.content compare the two readings.  litagin/anime-whisper is an
+# alternative *second model*: same large-v3 encoder, a 2-layer decoder trained
+# on visual-novel speech, so it transcribes moans/laughs/breaths as text
+# instead of large-v3's stock closings and hallucinates less over silence
+# (model card).  Its text is the only thing used — the checkpoint carries
+# large-v3's alignment heads, which index decoder layers that do not exist,
+# so word timestamps are impossible (``supports_word_timestamps``) and the
+# timing stays with large-v3's DTW words.
+
+_ALT_DECODERS = ("whisper", "anime")
+
+
+def _resolve_alt_source(decoder: str, mode: str) -> str:
+    """Which audio the second decoder hears: "same" (the primary) or "other" (mix ↔ vocals).
+
+    "auto" keeps v3.3's rule for large-v3 — the other source *was* the second
+    signal — and gives anime-whisper the same audio, since it is the second
+    model.  Pure; fingerprinted through the effective value.
+    """
+    if mode in ("same", "other"):
+        return mode
+    return "same" if decoder == "anime" else "other"
+
+
+def _pick_alt_audio(audio_np, other_np, mode: str):
+    """The 16 kHz array the second decoder hears, or ``None`` (no second decode).
+
+    "other" is accepted only when it lines up with the primary: at most 1 s
+    shorter or longer and at least as long, then truncated to the primary's
+    length (the v3.3 rule — a shorter track within tolerance still yields
+    ``None``, so window slices never run past its end).
+    """
+    if mode == "same":
+        return audio_np
+    if other_np is None:
+        return None
+    if abs(len(other_np) - len(audio_np)) < _SR16 and len(other_np) >= len(audio_np):
+        return other_np[:len(audio_np)]
+    return None
+
+
+class AnimeWhisper:
+    """litagin/anime-whisper as the sweep's second decoder — text only, greedy, no prompt.
+
+    Loads lazily (3 GB fp32 on disk → fp16 on the GPU, ≈ 1.5 GB) and must be
+    ``close()``d by its owner; the pipeline keeps it resident only for the
+    duration of one ``_transcribe_whisper_gpu`` call, next to large-v3.
+    """
+    name = "anime"
+
+    def __init__(self, model_dir: str | Path | None = None, device: str = "cuda",
+                 dtype: str | None = None, attn: str | None = None):
+        import torch
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        from ai_movie.config import ASR_ANIME_ATTN, ASR_ANIME_DTYPE, ASR_ANIME_WHISPER_DIR
+        self.dir = Path(model_dir or ASR_ANIME_WHISPER_DIR)
+        if not (self.dir / "model.safetensors").exists():
+            raise FileNotFoundError(f"anime-whisper weights missing: {self.dir / 'model.safetensors'}")
+        self.device = torch.device(device)
+        self.dtype = getattr(torch, dtype or ASR_ANIME_DTYPE)
+        self.proc = WhisperProcessor.from_pretrained(str(self.dir), local_files_only=True)
+        self.model = WhisperForConditionalGeneration.from_pretrained(
+            str(self.dir), dtype=self.dtype, local_files_only=True,
+            attn_implementation=attn or ASR_ANIME_ATTN).to(self.device).eval()
+        # the checkpoint ships large-v3's forced_decoder_ids; transformers ignores them once
+        # language/task are passed, but dropping them keeps the deprecation path out entirely
+        self.model.generation_config.forced_decoder_ids = None
+        self.gen = self.generate_kwargs()
+        self.revision = self.read_revision(self.dir)
+        self.disabled = False
+
+    @staticmethod
+    def generate_kwargs(language: str = "ja") -> dict:
+        """Greedy, text-only decode.  NEVER ``prompt_ids`` / ``initial_prompt`` (model card:
+        prompts make this checkpoint hallucinate) and never timestamps (no usable heads)."""
+        from ai_movie.config import ASR_ANIME_MAX_NEW_TOKENS, ASR_ANIME_NO_REPEAT_NGRAM
+        return dict(language=language, task="transcribe", num_beams=1, do_sample=False,
+                    no_repeat_ngram_size=ASR_ANIME_NO_REPEAT_NGRAM,
+                    max_new_tokens=ASR_ANIME_MAX_NEW_TOKENS, return_timestamps=False)
+
+    @staticmethod
+    def supports_word_timestamps(gen_cfg: dict, decoder_layers: int) -> bool:
+        """True only when every alignment head lives in a decoder layer that exists.
+
+        anime-whisper's generation_config lists large-v3's heads ([7,0] … [25,6])
+        over a 2-layer decoder: ``return_token_timestamps`` would index
+        cross-attentions that are not there.  Guards anyone from turning it on.
+        """
+        heads = gen_cfg.get("alignment_heads") or []
+        return bool(heads) and all(int(h[0]) < decoder_layers for h in heads)
+
+    @staticmethod
+    def read_revision(model_dir: Path) -> str:
+        """The HF commit the weights came from, for the run record (hf download leaves it in
+        ``.cache/huggingface/download/<file>.metadata``; a ``REVISION`` file also counts)."""
+        for name in ("model.safetensors.metadata", "config.json.metadata"):
+            p = model_dir / ".cache" / "huggingface" / "download" / name
+            if p.exists():
+                first = p.read_text(encoding="utf-8").splitlines()[:1]
+                if first and first[0].strip():
+                    return first[0].strip()
+        p = model_dir / "REVISION"
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip() or "local"
+        return "local"
+
+    def transcribe_batch(self, chunks: list) -> list[str]:
+        """Text for each ≤ 30 s float32 16 kHz chunk (short-form: one generate call, no
+        chunking pipeline — its 30 s stride machinery and timestamp paths are irrelevant)."""
+        import torch
+        feats = self.proc(list(chunks), sampling_rate=_SR16, return_tensors="pt").input_features
+        feats = feats.to(self.device, self.dtype)
+        with torch.inference_mode():
+            ids = self.model.generate(feats, **self.gen)
+        texts = self.proc.batch_decode(ids, skip_special_tokens=True,
+                                       clean_up_tokenization_spaces=False)   # WordPiece-only step, BPE here
+        return [t.strip() for t in texts]
+
+    def close(self) -> None:
+        """Free the weights; MuseTalk/CosyVoice share the same unified memory later on."""
+        model, self.model = getattr(self, "model", None), None
+        del model
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+
+def _load_alt_decoder(name: str, errors: list[str]) -> "AnimeWhisper | None":
+    """The second decoder for *name*, or ``None`` (= large-v3 on the other source).
+
+    A load failure (weights not there yet, out of memory, transformers API
+    drift) is recorded in *errors* and the file falls back to the v3.3 alt,
+    so a chunk is never lost to the experiment.
+    """
+    if name == "anime":
+        try:
+            return AnimeWhisper()
+        except Exception as exc:                            # noqa: BLE001
+            errors.append(f"sweep alt (anime) unavailable, large-v3 alt used: {type(exc).__name__}: {exc}")
+            return None
+    if name not in _ALT_DECODERS:
+        errors.append(f"sweep alt {name!r} unknown, large-v3 alt used")
+    return None
+
+
+def _sweep_alt_texts(model, alt_audio, wins: list[dict], language: str, errors: list[str], *,
+                     alt_decoder=None, batch: int | None = None,
+                     cancel_check=None) -> list[tuple[str | None, str | None]]:
+    """Second decode of each window in *wins*: ``(alt_text, alt_by)`` per window.
+
+    With *alt_decoder* the windows go through it in batches of *batch*
+    (config ASR_ANIME_BATCH); a failing batch yields ``(None, name)`` — the
+    piece then shows *who* failed — and after three failures large-v3 decodes
+    the rest of the file (the decoder is marked ``disabled`` for its owner).
+    Without one, large-v3 decodes the window on *alt_audio* as in v3.3
+    (a failed decode reads as ``""``, as it always did).
+    """
+    n = len(wins)
+    if alt_audio is None or n == 0:
+        return [(None, None)] * n
+    out: list[tuple[str | None, str | None]] = [(None, None)] * n
+
+    def chunk(w):
+        return alt_audio[int(w["start"] * _SR16):int(w["end"] * _SR16)]
+
+    i = 0
+    if alt_decoder is not None and not getattr(alt_decoder, "disabled", False):
+        if batch is None:
+            from ai_movie.config import ASR_ANIME_BATCH
+            batch = ASR_ANIME_BATCH
+        batch = max(1, int(batch))
+        failures = 0
+        while i < n:
+            if cancel_check and cancel_check():
+                return out
+            idx = list(range(i, min(n, i + batch)))
+            try:
+                texts = alt_decoder.transcribe_batch([chunk(wins[j]) for j in idx])
+                for j, t in zip(idx, texts):
+                    out[j] = (t if t is not None else "", alt_decoder.name)
+            except Exception as exc:                        # noqa: BLE001
+                failures += 1
+                errors.append(f"sweep alt ({alt_decoder.name}) windows {wins[idx[0]]['start']}–"
+                              f"{wins[idx[-1]]['end']}: {type(exc).__name__}: {exc}")
+                for j in idx:
+                    out[j] = (None, alt_decoder.name)
+            i = idx[-1] + 1
+            if failures >= 3:
+                errors.append(f"sweep alt ({alt_decoder.name}): {failures} failures, "
+                              f"large-v3 decodes the remaining {n - i} window(s)")
+                alt_decoder.disabled = True
+                break
+    for j in range(i, n):
+        if cancel_check and cancel_check():
+            break
+        alt = _transcribe_sweep(model, chunk(wins[j]), language, errors)
+        out[j] = ("".join(sg.get("text", "") for sg in (alt or {}).get("segments", [])).strip(), "whisper")
+    return out
+
+
 def _sweep_pass(model, audio_np, speech_segs, language, all_segs, all_words, errors, *,
-                alt_audio=None, floor_audio=None, cancel_check=None) -> tuple[int, int]:
-    """Second pass over the VAD gaps; returns (windows decoded, windows with text).
+                alt_audio=None, floor_audio=None, cancel_check=None,
+                alt_decoder=None) -> tuple[int, int, list[dict]]:
+    """Second pass over the VAD gaps; returns (windows decoded, windows with text, window records).
 
     *floor_audio* (the separated vocals, 16 kHz) drives the energy floor —
-    the mix's music would pass every window; *alt_audio* is the other source
-    (mix ↔ vocals), decoded again for windows that produced text so the
-    classifier can compare two independent readings.
+    the mix's music would pass every window; *alt_audio* is what the second
+    decoder hears (``_pick_alt_audio``), decoded again for windows that
+    produced text so the classifier can compare two readings.  The second
+    decode is deferred to after the primary loop so *alt_decoder* can batch
+    it (same result, one GPU call per ASR_ANIME_BATCH windows).
+    Every window is recorded — ``{start, end, p95_db, text, alt_text,
+    alt_by}``, ``text == ""`` when large-v3 heard nothing — and goes to
+    ``state["asr"]["sweep_windows"]`` so scripts/ab_sweep_alt.py can replay
+    the exact audio (and a later "rescue window" measurement has the silent
+    ones too).
     """
     from ai_movie.config import (ASR_SWEEP_FLOOR_DBFS, ASR_SWEEP_MAX_WINDOW_S,
                                  ASR_SWEEP_MIN_GAP_S)
     energy = _frame_db(floor_audio if floor_audio is not None else audio_np)
     wins = _sweep_windows(speech_segs, len(audio_np), energy, min_gap=ASR_SWEEP_MIN_GAP_S,
                           max_win=ASR_SWEEP_MAX_WINDOW_S, floor_db=ASR_SWEEP_FLOOR_DBFS)
-    n_txt = 0
+    decoded: list[tuple[dict, dict | None]] = []          # (window, primary result | None)
     for w in wins:
         if cancel_check and cancel_check():
             break
         a, b = int(w["start"] * _SR16), int(w["end"] * _SR16)
         res = _transcribe_sweep(model, audio_np[a:b], language, errors)
         if not res or not any(sg.get("text", "").strip() for sg in res.get("segments", [])):
-            continue
-        n_txt += 1
-        alt_text = None
-        if alt_audio is not None:
-            alt = _transcribe_sweep(model, alt_audio[a:b], language, errors)
-            alt_text = "".join(sg.get("text", "") for sg in (alt or {}).get("segments", [])).strip()
-        tmp_s, tmp_w = [], []
-        _collect(res, w["start"], "sweep", tmp_s, tmp_w, alt_text=alt_text)
-        spans = [(float(v["start"]), float(v["end"])) for v in speech_segs]
+            res = None
+        decoded.append((w, res))
+    heard_idx = [k for k, (_, res) in enumerate(decoded) if res is not None]
+    alts = dict(zip(heard_idx, _sweep_alt_texts(model, alt_audio, [decoded[k][0] for k in heard_idx],
+                                                language, errors, alt_decoder=alt_decoder,
+                                                cancel_check=cancel_check)))
+    spans = [(float(v["start"]), float(v["end"])) for v in speech_segs]
 
-        def inside(t):
-            return any(a <= t <= b for a, b in spans)
-        all_words += [x for x in tmp_w if not inside((x["s"] + x["e"]) / 2)]      # the VAD pass owns those
-        all_segs += [x for x in tmp_s if not inside((x["start"] + x["end"]) / 2)]
-    return len(wins), n_txt
+    def inside(t):
+        return any(a <= t <= b for a, b in spans)
+    records = []
+    for k, (w, res) in enumerate(decoded):
+        rec = {"start": w["start"], "end": w["end"], "p95_db": w.get("p95_db"),
+               "text": "", "alt_text": None, "alt_by": None}
+        if res is not None:
+            alt_text, alt_by = alts[k]
+            tmp_s, tmp_w = [], []
+            _collect(res, w["start"], "sweep", tmp_s, tmp_w, alt_text=alt_text, alt_by=alt_by)
+            all_words += [x for x in tmp_w if not inside((x["s"] + x["e"]) / 2)]  # the VAD pass owns those
+            all_segs += [x for x in tmp_s if not inside((x["start"] + x["end"]) / 2)]
+            rec.update(text="".join(sg.get("text", "") for sg in res.get("segments", [])).strip(),
+                       alt_text=alt_text, alt_by=alt_by)
+        records.append(rec)
+    return len(wins), len(heard_idx), records
 
 
 def _transcribe_chunk(model, chunk, language: str,
@@ -916,7 +1184,7 @@ def _finalize_segments(
             from ai_movie.osd import overlap_ratio
             d["overlap"] = round(overlap_ratio(overlap_regions, piece["start"],
                                                piece["end"]), 3)
-        for k in ("no_speech_prob", "avg_logprob", "compression_ratio", "pass", "alt_text"):
+        for k in ("no_speech_prob", "avg_logprob", "compression_ratio", "pass", "alt_text", "alt_by"):
             if piece.get(k) is not None:
                 d[k] = piece[k]                          # Whisper scores + sweep evidence for content.classify
         out.append(d)
@@ -993,6 +1261,8 @@ def transcribe_all(
     status_cb: Callable[[str], None] | None = None,
     sweep: bool | None = None,
     alt_audio: str | Path | None = None,
+    sweep_alt: str | None = None,
+    sweep_alt_source: str | None = None,
 ) -> list[dict]:
     """Transcribe audio files. Auto-selects best available backend.
 
@@ -1024,11 +1294,17 @@ def transcribe_all(
         Segment caps for the sentence splitter (defaults from config).
     status_cb:
         ``status_cb(message)`` — coarse stage messages (diarization, etc).
+    sweep, alt_audio, sweep_alt, sweep_alt_source:
+        Second ASR pass over the VAD gaps (GPU path only): the "other"
+        source's file, which decoder re-reads each text window ("whisper" |
+        "anime") and what it hears ("auto" | "same" | "other").  Defaults
+        from config ASR_SWEEP_*.
 
     Returns
     -------
     list[dict] with ``source``, ``language``, ``segments``, ``words`` and
-    (when diarization ran) ``diarization``.
+    (when diarization ran) ``diarization``; with the sweep also
+    ``sweep_windows`` and ``sweep_alt``.
     """
     if diarize is None:
         from ai_movie.config import ASR_DIARIZE
@@ -1049,7 +1325,12 @@ def transcribe_all(
     if sweep is None:
         from ai_movie.config import ASR_SWEEP_ENABLED
         sweep = ASR_SWEEP_ENABLED
-    gpu_extra = dict(extra, sweep=bool(sweep), alt_audio=alt_audio)   # the CPU path has no sweep
+    if sweep_alt is None or sweep_alt_source is None:
+        from ai_movie.config import ASR_SWEEP_ALT_DECODER, ASR_SWEEP_ALT_SOURCE
+        sweep_alt = sweep_alt or ASR_SWEEP_ALT_DECODER
+        sweep_alt_source = sweep_alt_source or ASR_SWEEP_ALT_SOURCE
+    gpu_extra = dict(extra, sweep=bool(sweep), alt_audio=alt_audio,          # the CPU path has no sweep
+                     sweep_alt=sweep_alt, sweep_alt_source=sweep_alt_source)
 
     # ── Linux / macOS ──────────────────────────────────────────────
     if sys.platform != "win32":

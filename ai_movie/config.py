@@ -187,6 +187,25 @@ ASR_SWEEP_MAX_WINDOW_S = 20.0      # cut long gaps at their quietest point
 ASR_SWEEP_FLOOR_DBFS = -50.0       # a window whose vocals never exceed this is skipped
 ASR_SWEEP_TEMPERATURES = (0.0, 0.2, 0.4)   # no 0.6+: that is where the stock phrases come from
 
+# The sweep's second decoder (the ``alt_text`` the content classifier weighs against a window's
+# large-v3 reading).  "whisper": large-v3 again on the OTHER audio source (mix ↔ vocals) — the v3.3
+# behaviour, a second signal from the same model.  "anime": litagin/anime-whisper (large-v3 encoder,
+# 2 decoder layers, trained on visual-novel speech) on the SAME audio — a second model, which hears
+# moans as text (「んぁっ、あっ、はぁっ…」) where large-v3 emits 「ご視聴ありがとうございました」.
+# Its text is all that is used: the checkpoint inherits large-v3's alignment heads (decoder layers
+# 7–25 of a 2-layer decoder → no word timestamps) and it never gets a prompt (model card: an
+# initial_prompt makes it hallucinate).  Segments record which decoder produced the alt in
+# ``alt_by`` ("whisper" | "anime"); phase-2 classifier rules key on that field.
+ASR_SWEEP_ALT_DECODER = "whisper"    # "whisper" | "anime" — `--sweep-alt` overrides per run
+ASR_SWEEP_ALT_SOURCE = "auto"        # "auto" = "other" for whisper (its whole point), "same" for anime
+                                     # | "same" (the primary audio) | "other" (mix ↔ vocals)
+ASR_ANIME_WHISPER_DIR = str(ROOT_DIR / "models" / "anime-whisper")
+ASR_ANIME_DTYPE = "float16"          # ≈ 1.5 GB resident next to large-v3's fp32 6.2 GB
+ASR_ANIME_NO_REPEAT_NGRAM = 5        # model card: suppresses the OpenAI-style repetition loops
+ASR_ANIME_MAX_NEW_TOKENS = 400       # 448 positions − 4 prompt tokens; a 20 s moan window is < 200
+ASR_ANIME_BATCH = 8                  # windows per generate() (each is padded to 30 s of mel anyway)
+ASR_ANIME_ATTN = "sdpa"              # "eager" if SDPA misbehaves on gfx1151
+
 # Content classifier thresholds (ai_movie/content.py)
 CONTENT_MAX_CPS = 20.0             # visible chars/s above which text is invented (fast real JA ≈ 15)
 CONTENT_NSP_DROP = 0.85            # sweep only: no_speech_prob above this …

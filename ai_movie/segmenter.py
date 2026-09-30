@@ -126,9 +126,12 @@ def _flush(buf: list[dict], speaker: str | None) -> dict | None:
         d["compression_ratio"] = round(max(cr), 3)
     if any(w.get("pass") == "sweep" for w in buf):
         d["pass"] = "sweep"
-        alts = [w["alt"] for w in buf if w.get("alt")]
+        # an empty second decode ("") is evidence too (content.classify's empty-alt branch) —
+        # `if w.get("alt")` dropped it, so that branch never fired in the pipeline (0 hits in 22 chunks)
+        alts = [w["alt"] for w in buf if w.get("alt") is not None]
         if alts:
             d["alt_text"] = alts[0]
+        d["alt_by"] = next((w["alt_by"] for w in buf if w.get("alt_by")), None)
     return d
 
 
