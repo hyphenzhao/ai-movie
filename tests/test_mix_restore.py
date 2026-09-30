@@ -35,6 +35,25 @@ def test_restore_ranges_and_mask():
     assert _restore_original_ranges([(1, 2)], d / "missing.wav", total, sr, 2) is None
 
 
+def test_adjacent_ranges_restore_once():
+    """Two kept-original lines closer than 2 × pad used to get the vocals summed over the shared
+    pad (+6 dB, peak 1.0 for a 0.5 sine) with a fade-out/fade-in crossing in the middle of a moan."""
+    sr = 48000
+    d = Path(tempfile.mkdtemp(prefix="restore_"))
+    voc = (0.5 * np.sin(2 * np.pi * 220 * np.arange(10 * sr) / sr)).astype("float32")
+    sf.write(d / "voc.wav", voc, sr)
+    total = 10 * sr
+    for ranges in ([(2.0, 3.0), (3.0, 4.0)], [(3.0, 4.0), (2.0, 3.0)], [(2.0, 3.0), (3.2, 4.0)], [(2.0, 3.5), (2.5, 4.0)]):
+        r = _restore_original_ranges(ranges, d / "voc.wav", total, sr, 1, pad_ms=150)
+        a = np.abs(r["audio"][:, 0])
+        assert a[int(2.8 * sr):int(3.3 * sr)].max() <= 0.5 + 1e-3, (ranges, a[int(2.8 * sr):int(3.3 * sr)].max())
+        assert a[int(2.9 * sr):int(3.2 * sr)].max() >= 0.45, ranges          # no fade dip inside the merged span
+        assert r["mask"][int(1.9 * sr)] == 1 and r["mask"][int(4.1 * sr)] == 1 and r["mask"][int(1.8 * sr)] == 0
+    # ranges further apart than 2 × pad stay separate, with silence between them
+    r = _restore_original_ranges([(2.0, 3.0), (3.5, 4.0)], d / "voc.wav", total, sr, 1, pad_ms=150)
+    assert r["mask"][int(3.25 * sr)] == 0 and np.abs(r["audio"][int(3.2 * sr):int(3.3 * sr)]).max() == 0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

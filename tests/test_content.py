@@ -82,6 +82,74 @@ def test_is_nonlexical_extension():
         assert not is_nonlexical(t), t
 
 
+def test_held_vowel_dominates():
+    # a moan window decodes as the held vowel plus a hallucinated tail; the run decides, not the window score
+    for t in ("ああああああああああああああ兄ちゃん…", "ぁぁぁぁぁぁぁぁぁぁぁぁぁぁぁぁとりあえず", "ー" * 40 + "アイク、アイク、アイク",
+              "アアアアアアアアアアアアアアアアお前もごらん", "ああああああ ああああああたーーーー", "ここまでああああああああああああ",
+              "あ゛ぁぁぁぁぁぁ", "でいっ ああああああ"):
+        assert kind(t, 3.0, compression_ratio=30) == "nonlexical", t
+    # real lines with a run: below RUN_MIN or below the fraction — at their real window ratios (< 2.4)
+    assert kind("あぁ、あぁ、あぁあぁ、痛い、痛い", 3.0, compression_ratio=2.37) == "speech"
+    assert kind("ああああ北までいるよ", 2.0, compression_ratio=1.668) == "speech"
+    assert kind("っ ああああああ今までやってきた中", 3.0, compression_ratio=2.372) == "speech"
+    assert kind("あああ大", 1.0) == "speech"                                    # 3/4: too short a run
+    for t in ("コーヒー", "えーっと", "ーーーーーーーーアイク、アイク"):            # last: 8/14 < 0.7
+        assert not is_nonlexical(t), t
+    # the run rule is opt-out for evidence use (20/25 = 0.8 of the line is the held vowel)
+    assert is_nonlexical("あ" * 20 + "寝てきたよ")
+    assert not is_nonlexical("あ" * 20 + "寝てきたよ", held_run=False)
+
+
+def test_screams():
+    for t in ("うわー", "うわっ", "うわぁぁぁぁ", "きゃー", "きゃああ"):
+        assert kind(t, 1.0) == "nonlexical", t
+    for t in ("いいわ", "ひやひや", "お客", "きゃく"):
+        assert kind(t, 1.0) == "speech", t
+
+
+def test_whitelist_beats_repeat_unit():
+    # the old `is_nonlexical(unit)` half let a repeated whitelist word bypass the whitelist
+    for t in ("いい", "いい?", "ええ", "はーい", "おお"):
+        assert kind(t, 1.0) == "speech", t
+    assert kind("そうそうそうそう", 1.0) == "drop"                    # repetition ×4 of a word
+    assert kind("ぐふぐふぐふぐふ", 1.0) == "nonlexical"
+    # staccato moans spell a whitelist word once っ / ー are stripped; the repetition keeps them nonlexical
+    for t in ("いっいっ", "えっ、えっ", "おっおっ", "いーいー", "えーえー"):
+        assert kind(t, 1.0) == "nonlexical", t
+    # …but a whitelist word merely ending in っ is still the word (SONE-846 p13 248.9 s 「はいっ」)
+    for t in ("はいっ", "あいっ!", "うんっ"):
+        assert kind(t, 1.0) == "speech", t
+
+
+def test_alt_held_run_is_not_junk():
+    s = {"pass": "sweep", "asr_conf": 0.498, "avg_logprob": -1.031}
+    weak = "何してるんだよトお前お前死んじゃった"
+    # a held run *with a tail* as the second decode says the window looped: the veto stands
+    assert kind(weak, 5.0, alt_text="あ" * 300 + "寝てきたよおまわししちゃった", **s) == "drop"
+    # a pure vocalisation as the second decode is junk and vetoes nothing (existing semantics)
+    assert kind(weak, 5.0, alt_text="あああああ", **s) == "speech"
+
+
+def test_rule_order_keeps_cr_for_words():
+    assert kind("気持ちいい", 2.0, compression_ratio=2.9) == "drop"
+    assert kind("気持ちいい" * 5, 2.0, compression_ratio=3.1) == "drop"
+    assert kind("胸が痛い", 1.0, compression_ratio=3.08) == "drop"                 # a T=1.0 window sample
+    assert kind("あーーーー", 2.0, compression_ratio=55) == "nonlexical"
+    assert kind("ん", 0.8, compression_ratio=3.56) == "nonlexical"
+    assert kind("気持ちいい", 2.0, compression_ratio=2.4) == "speech"              # the threshold is exclusive
+
+
+def test_looped_indices_is_text_and_time_only():
+    from ai_movie.content import looped_indices
+    segs = [seg("ご飯食べました", 1.0), seg("ご飯食べました", 1.0), seg("ご飯食べました", 1.0), seg("違う話", 1.0)]
+    for i, s in enumerate(segs):
+        s["start"], s["end"] = 10.0 + 5 * i, 11.0 + 5 * i
+    assert looped_indices(segs) == {0, 1, 2}
+    segs[2]["start"] = 100.0                              # the third copy is > 30 s away from the first
+    assert looped_indices(segs) == set()
+    assert looped_indices([seg("あっ")] * 5) == set()      # < 4 folded chars never counts
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

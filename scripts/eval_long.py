@@ -122,6 +122,16 @@ def cue_distance(cue_iv: list[tuple[float, float]], t0: float, t1: float) -> flo
     return best
 
 
+def kept_original_stats(segs: list[dict]) -> dict:
+    """L4 numbers over the kept-original segments: how many, how many seconds, how many carry
+    synthesized audio (``audio`` / ``audio_fit``) although they must not.  Pure — ``evaluate``
+    feeds it the placed segments (``t0``/``t1``); plain ``start``/``end`` segments work too."""
+    ko = [s for s in segs if s.get("keep_original")]
+    secs = sum(float(s.get("t1", s.get("end", 0))) - float(s.get("t0", s.get("start", 0))) for s in ko)
+    return {"lines": len(ko), "seconds": round(secs, 1),
+            "touched": sum(1 for s in ko if s.get("audio") or s.get("audio_fit"))}
+
+
 def evaluate(film: str, stage: str | None = None) -> dict:
     segs, meta = film_segments(film, stage)
     truth, read = cues(film)
@@ -186,12 +196,14 @@ def evaluate(film: str, stage: str | None = None) -> dict:
                        "value": "ok" if not multi else f"{multi} distinct files"})
     else:
         notes.append("L3: no vc refs recorded")
-    # L4: kept-original lines untouched
-    ko = [s for s in segs if s.get("keep_original")]
-    if ko:
-        touched = sum(1 for s in ko if s.get("audio") or s.get("audio_fit"))
-        checks.append({"id": "L4", "desc": "kept-original lines have no synthesized audio", "ok": touched == 0,
-                       "value": f"{touched}/{len(ko)} touched"})
+    # L4: kept-original lines untouched.  The line / second counts are not a gate: truth cues never
+    # cover moans (0 moan-like cues among 514), so they are the only truth-independent signal of a
+    # content-rule change (Documentation/v3.4: kept-original ≈ 1101 s → ≥ 1290 s on SONE-846).
+    kept_original = kept_original_stats(segs)
+    if kept_original["lines"]:
+        checks.append({"id": "L4", "desc": "kept-original lines have no synthesized audio", "ok": kept_original["touched"] == 0,
+                       "value": f"{kept_original['touched']}/{kept_original['lines']} touched"})
+        notes.append(f"kept-original: {kept_original['lines']} lines, {kept_original['seconds']} s")
     # L6
     out = ROOT / "deliver" / f"{film}_dubbed_full.mp4"
     plan = json.loads((ROOT / "workspace" / film / "_split" / "plan.json").read_text())
@@ -201,6 +213,7 @@ def evaluate(film: str, stage: str | None = None) -> dict:
                        "value": f"Δ {d - plan['duration']:+.2f} s"})
     return {"film": film, "checks": checks, "notes": notes, "passed": all(c["ok"] for c in checks),
             "kept_segments": len(kept), "truth_cues": len(truth), "read_cues": len(read),
+            "kept_original": {"lines": kept_original["lines"], "seconds": kept_original["seconds"]},
             "hallucinated": [{"t": round(s["t0"], 1), "text": s.get("text", "")[:30], "why": why} for s, why in bad[:40]]}
 
 
