@@ -37,11 +37,17 @@ def test_latin_and_numbers():
 
 def test_loops_and_rate():
     assert kind("あああああああああ", 0.5) == "nonlexical"                 # a held vowel is a sound, not a loop
-    assert kind("ぐふぐふぐふぐふ", 2.0) == "drop"
+    assert kind("ぐふぐふぐふぐふ", 2.0) == "nonlexical"                  # a laugh, however long: original voice
     assert kind("はあはあ", 1.5) == "nonlexical"
     assert kind("そうそうそう", 1.0) == "speech"
     assert kind("気持ちいい", 2.0, compression_ratio=2.9) == "drop"
     assert kind("今日はいい天気ですねとても暖かい", 0.4) == "drop"        # 15 chars in 0.4 s
+
+
+def test_transcribed_moans_keep_the_voice_even_with_high_compression():
+    for t in ("アーッ、アーッ、アーッ、アーッ", "あーーーーーーー", "はぁはぁ…はぁ", "んっ、んっ、んっ、んっ、んっ"):
+        assert kind(t, 2.0, compression_ratio=3.1) == "nonlexical", t
+    assert kind("気持ちいい気持ちいい気持ちいい気持ちいい気持ちいい", 2.0, compression_ratio=3.1) == "drop"   # a real word looping
 
 
 def test_nonlexical_and_energy():

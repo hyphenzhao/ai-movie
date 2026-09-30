@@ -110,10 +110,12 @@ def classify(seg: dict, *, vocals_p95_db: float | None = None) -> dict:
         if re.fullmatch(r"[\d０-９.,%％cmCMkgKG\s]+", text.strip() or "x"):
             return out("speech", "numeric")
         return out("drop", "no CJK")
-    # 3. loops
+    # 3. vocalisations before loops: a transcribed moan (「アーッ、アーッ…」「あーーーー」) has a high
+    #    compression ratio too, and dropping it silenced 52 lines / 167 s of the first film instead of
+    #    keeping the original voice
     unit, n = _repeat_unit(ft)
-    if n >= 2 and is_nonlexical(unit):
-        return out("nonlexical", f"vocalisation ×{n}")     # ええええ, はあはあ: a sound, keep the voice
+    if is_nonlexical(text) or (n >= 2 and is_nonlexical(unit)):
+        return out("nonlexical", f"vocalisation ×{n}" if n >= 2 else "interjection only")
     if (cr is not None and cr > 2.4) or n >= CONTENT_REPEAT_DROP:
         return out("drop", f"repetition ×{n}" if n >= CONTENT_REPEAT_DROP else f"compression {cr:.2f}")
     # 4. impossible speaking rate
