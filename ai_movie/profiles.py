@@ -182,3 +182,25 @@ def load_vectors(path: Path, doc: dict) -> dict[str, dict]:
 
 def save(path: Path, doc: dict) -> None:
     Path(path).write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def assignment_signature(path: Path) -> str | None:
+    """SHA-1 of what ``assign_profiles`` reads: per profile the gender, pitch, default flag and the
+    voice/face vectors.  Reference clips and gate rows are excluded on purpose (see run_pipeline)."""
+    import hashlib
+    try:
+        doc = load(path)
+    except (OSError, ValueError):
+        return None
+    h = hashlib.sha1()
+    base = Path(path).parent
+    for pid, p in sorted((doc.get("profiles") or {}).items()):
+        h.update(json.dumps([pid, p.get("gender"), p.get("f0_median"), bool(p.get("default_for_gender")),
+                             p.get("manual"), sorted((s.get("chunk"), s.get("speaker")) for s in (p.get("sources") or []))],
+                            sort_keys=True, default=str).encode())
+        for key in ("voice_centroid", "face_embedding"):
+            f = p.get(key)
+            fp = (base / f) if f and not Path(f).is_absolute() else (Path(f) if f else None)
+            if fp and fp.exists():
+                h.update(fp.read_bytes())
+    return h.hexdigest()

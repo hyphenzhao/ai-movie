@@ -102,12 +102,62 @@ def real_probe(members: list[dict], cands: list[str], gender: str, out_dir: Path
     return measured + [r for r in ranked if r["checked"] == 0]
 
 
+def reselect_refs(film: str, *, no_probe: bool = False) -> int:
+    """Re-choose ref_audio / ref_alternatives of every profile; everything else in profiles.json stays."""
+    pj = ROOT / "workspace" / film / "profiles.json"
+    doc = prof.load(pj)
+    out_dir = pj.parent / "profiles"
+    for pid, p in (doc.get("profiles") or {}).items():
+        gender = p.get("gender")
+        members = p.get("sources") or []
+        cands = []
+        for m in members:
+            d = ROOT / "workspace" / m["chunk"] / "refs_profile"
+            if not d.exists():
+                continue
+            cands += [str(x) for x in sorted(d.glob(f"ref_{m['speaker']}*.wav"))]
+            cands += [str(x) for x in sorted((ROOT / "workspace" / m["chunk"] / "refs_auto").glob(f"cand_{gender}_seg*.wav"))]
+        cands = sorted(set(cands))
+        rows = []
+        for c in cands:
+            med, voiced = asr_refs._f0_median(c)
+            d = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", c],
+                                     capture_output=True, text=True).stdout.strip() or 0)
+            rows.append({"path": c, "dur": round(d, 2), "voiced": voiced, "f0": med, "reject": asr_refs.candidate_ok(d, voiced, med, gender) if gender in TTS_GENDER_HZ else "no_gender"})
+        ok_rows = [r for r in rows if r["reject"] is None]
+        log(f"  {pid} ({gender}): {len(cands)} candidates, {len(ok_rows)} pass the static gate")
+        ranked = real_probe([dict(m) for m in members], [r["path"] for r in ok_rows], gender, out_dir / f"real_{pid}") if ok_rows and not no_probe else []
+        if not ranked:
+            log(f"  {pid}: no measurable candidate — reference unchanged"); continue
+        picked = ranked[0]["path"]; alts = [r["path"] for r in ranked[1:4] if r["checked"] > 0]
+        shutil.copy2(picked, out_dir / f"ref_{pid}.wav")
+        for i, a in enumerate(alts):
+            shutil.copy2(a, out_dir / f"ref_{pid}_alt{i}.wav")
+        p["ref_audio"] = f"profiles/ref_{pid}.wav"
+        p["ref_alternatives"] = [f"profiles/ref_{pid}_alt{i}.wav" for i in range(len(alts))]
+        p["ref_source"] = Path(picked).name
+        p["f0_ref"] = next((r["f0"] for r in rows if r["path"] == picked), None)
+        p["ref_gate"] = [{**{k: v for k, v in r.items() if k != "path"}, "file": Path(r["path"]).name,
+                          **({"real_reject_rate": rr["reject_rate"], "real_lines": rr["checked"]} if (rr := next((x for x in ranked if x["path"] == r["path"]), None)) else {})}
+                         for r in rows]
+        log(f"  {pid}: reference ← {Path(picked).name} (real-line rejection {ranked[0]['reject_rate']:.0%} on {ranked[0]['checked']} lines), {len(alts)} alternates")
+    doc["version"] = int(doc.get("version") or 1) + 1
+    prof.save(pj, doc)
+    log(f"updated {pj}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("film")
     ap.add_argument("--no-probe", action="store_true", help="skip the VC probe gate (tests)")
+    ap.add_argument("--reselect-refs", action="store_true",
+                    help="keep the existing profiles (identities, assignments) and only re-choose each profile's "
+                         "reference clip from the enrolment chunks' candidates (generic gate + real-line probe)")
     args = ap.parse_args()
     film = args.film
+    if args.reselect_refs:
+        return reselect_refs(film, no_probe=args.no_probe)
     split = ROOT / "workspace" / film / "_split"
     plan = json.loads((split / "plan.json").read_text())
     out_dir = ROOT / "workspace" / film / "profiles"

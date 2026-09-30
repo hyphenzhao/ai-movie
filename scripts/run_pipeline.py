@@ -78,11 +78,14 @@ STEP_DEPS: dict[str, list[str]] = {
     "glossary": ["asr"],
     "translate": ["asr", "glossary"],
     "enrol": ["asr"],
-    "tts": ["translate", "enrol"],
+    # tts/faces do not consume the profiles in the default (built-in voice) recipe; the profile
+    # references are consumed by run_vc_version.py, which is not a cached stage.  Making tts depend on
+    # enrol would re-synthesize every chunk whenever a reference clip changes.
+    "tts": ["translate"],
     "compact": ["tts"],
     "fit": ["compact", "tts"],
     "mix": ["fit", "separate"],
-    "faces": ["fit", "enrol"],
+    "faces": ["fit"],
     "lipsync": ["fit", "faces"],
     "enhance": ["lipsync", "faces"],
     "compose": ["enhance", "mix"],
@@ -353,7 +356,7 @@ def _args_extra(step: str, args) -> dict:
         "enrol": ["profiles"],
         "glossary": ["translate_helper"],
         "translate": ["engines", "chosen_engine", "no_units"],
-        "tts": ["voice_mode", "no_ref_probe", "profiles"],
+        "tts": ["voice_mode", "no_ref_probe"],
         "compact": ["no_compact", "voice_mode"],
         "faces": ["faces_bind"],
         "lipsync": ["lipsync_backend", "lipsync_audio_offset_ms", "fusion", "occlusion_mode"],
@@ -394,10 +397,10 @@ def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
         up[dep] = (fps.get(dep) or {}).get("hash", "legacy")
     extra = _args_extra(step, args)
     if extra.get("profiles"):
-        try:
-            extra["profiles_sha1"] = hashlib.sha1(Path(extra["profiles"]).read_bytes()).hexdigest()
-        except OSError:
-            extra["profiles_sha1"] = None
+        # what the assignment depends on (identities, genders), not the reference clips: re-selecting a
+        # clip must not re-run every chunk's enrol/faces
+        from ai_movie.profiles import assignment_signature
+        extra["profiles_sha1"] = assignment_signature(Path(extra["profiles"]))
     n_edit = int((ctx.state.get("_edits") or {}).get(step, 0) or 0)
     if n_edit:
         extra["_edits"] = n_edit
