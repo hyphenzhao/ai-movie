@@ -1902,6 +1902,94 @@ ENGINE_LABELS = {
 }
 
 
+# Generation options shared by the single-sentence rewrite channels (enforce,
+# compact).  _call_ollama_chat defaults to repeat_penalty 1.15 because the
+# batch translators degenerated without it; Ollama's penalty also covers the
+# prompt tokens (repeat_last_n), so a copy-with-one-substitution task was
+# being penalised for reproducing the very sentence it was told to keep (the
+# v3.4 design review attributes the 啊啊啊 / 舔×30 mangling of long compact
+# lines to this, not to the model).  scripts/ab_compact_enforce.py runs a
+# 1.15 arm so the change is measured, not assumed.
+_REWRITE_OPTIONS = {"temperature": 0.0, "repeat_penalty": 1.0}
+
+_ENFORCE_PREFIX_RE = re.compile(r"^(?:改正后|修改后|输出|结果|译文)[：:]\s*")
+_QUOTE_CHARS = "「」『』\"'“”‘’"
+
+
+def _clean_enforce_candidate(raw: str) -> str:
+    """One line, without the quotes and labels an instruct model wraps its answer in."""
+    cand = _clean_ollama_output(raw or "").strip()
+    cand = _ENFORCE_PREFIX_RE.sub("", cand).strip()
+    return cand.strip(_QUOTE_CHARS).strip()
+
+
+def _enforce_edit_ok(zh: str, cand: str, pins: list[str],
+                     max_count: dict[str, int] | None = None) -> str:
+    """Classify an enforce candidate: is *cand* *zh* with the pins applied and nothing else?
+
+    Returns ``"accepted"``, ``"rejected_no_pin"`` (a pin is missing) or
+    ``"rejected_rewrote"`` (the model changed more than the term).
+
+    A stronger instruct model will happily "improve" the sentence while it is
+    at it, and the previous guards could not see that: a length ratio passes
+    any rewrite of similar length, and character-set overlap passes a
+    substitution such as 电视剧 → 电影 (5 of 6 characters shared — the case
+    that made ``units.polish_edit_ok`` switch to difflib opcodes) while it
+    *fails* a correct one-word line 「卡娜」→「坎娜」 (no characters left once
+    the pin is removed).  So, like polish_edit_ok, walk the opcodes between
+    the line and the candidate: every inserted character must belong to a pin
+    occurrence (or be punctuation), every deletion must be the wrong
+    rendering next to a pin — at most one character longer than the pin,
+    which covers every rendering measured (卡恩娜 / 小卡娜 / 小勘娜 for 坎娜,
+    电视剧 for 短剧) — or punctuation, and a pin may not appear more often
+    than the source names it.
+    """
+    import difflib
+
+    from ai_movie.units import _EDIT_PUNCT
+
+    zh, cand = (zh or "").strip(), (cand or "").strip()
+    if not cand or "\n" in cand or _KANA_RE.search(cand):
+        return "rejected_no_pin" if not cand else "rejected_rewrote"
+    if any(p not in cand for p in pins):
+        return "rejected_no_pin"
+    for p in pins:
+        limit = (max_count or {}).get(p, 1)
+        if cand.count(p) > zh.count(p) + max(1, limit):
+            return "rejected_rewrote"
+
+    # which candidate characters are inside a pin occurrence, and which pin
+    owner: list[str | None] = [None] * len(cand)
+    for p in sorted(pins, key=len, reverse=True):
+        start = 0
+        while True:
+            k = cand.find(p, start)
+            if k < 0:
+                break
+            for j in range(k, k + len(p)):
+                owner[j] = owner[j] or p
+            start = k + len(p)
+
+    sm = difflib.SequenceMatcher(None, zh, cand, autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            continue
+        ins, dele = cand[j1:j2], zh[i1:i2]
+        if all(c in _EDIT_PUNCT for c in ins + dele):
+            continue                                # re-punctuation only
+        touched = {owner[j] for j in range(j1, j2) if owner[j]}
+        if j1 == j2:                                # pure deletion: adjacent to a pin?
+            touched = {owner[j] for j in (j1 - 1, j1) if 0 <= j < len(cand) and owner[j]}
+        if not touched:
+            return "rejected_rewrote"               # edit away from any pin
+        if any(owner[j] is None and c not in _EDIT_PUNCT for j, c in zip(range(j1, j2), ins)):
+            return "rejected_rewrote"               # inserted text beyond the pin
+        longest = max(len(p) for p in touched)
+        if len([c for c in dele if c not in _EDIT_PUNCT]) > longest + 1:
+            return "rejected_rewrote"               # replaced more than a rendering
+    return "accepted"
+
+
 def enforce_glossary(
     segments: list[dict],
     translations: list[str],
@@ -1910,6 +1998,8 @@ def enforce_glossary(
     model: str | None = None,
     base_url: str | None = None,
     progress_cb: Callable[[str], None] | None = None,
+    report: list[dict] | None = None,
+    options: dict | None = None,
 ) -> list[str]:
     """Normalise pinned terms in already-translated lines.
 
@@ -1922,9 +2012,18 @@ def enforce_glossary(
     Rewriting one finished sentence is a much easier task than translating
     with constraints, and it only runs on the few lines that actually contain
     a pinned term (9 of 128 on the reference video).  The rewrite is accepted
-    only if it really contains the pin, so this can never make a line worse.
+    only if it is the line with the pin applied and nothing else
+    (:func:`_enforce_edit_ok`), so this can never make a line worse.
+
+    *report*, when given, receives one row per attempted line (``idx`` is the
+    segment index when the caller tagged the segment with ``seg_idx``, else
+    the position in *segments*; ``status`` ∈ accepted / rejected_no_pin /
+    rejected_rewrote / error) — the pipeline writes it as
+    ``02_glossary_enforce.csv``.  *options* overrides the generation options
+    (the A/B harness uses it).
     """
     from ai_movie.config import GLOSSARY_ENFORCE_MODEL, OLLAMA_BASE_URL
+    from ai_movie.glossary import _term_pattern
 
     if not glossary:
         return translations
@@ -1940,7 +2039,7 @@ def enforce_glossary(
         if not src or not zh:
             continue
         need = [(ja, v["zh"]) for ja, v in glossary.items()
-                if v.get("zh") and _glossary_hit(src, ja) and v["zh"] not in zh]
+                if ja and v.get("zh") and _glossary_hit(src, ja) and v["zh"] not in zh]
         if not need:
             continue
         attempted += 1
@@ -1948,25 +2047,42 @@ def enforce_glossary(
         prompt = (
             f"下面这句中文译文里的专有名词译法不对。参考日文原文：{src}\n"
             f"要求：{pins}。\n"
-            f"请只把名字改正，其余措辞保持不变，只输出改正后的整句，不要解释。\n"
+            f"请只把名字改正，其余措辞保持不变，只输出改正后的整句，不要解释，不要加引号。\n"
             f"待改正：{zh}"
         )
+        row = {"idx": seg.get("seg_idx", i), "ja": src,
+               "pins": "；".join(f"{ja}→{t}" for ja, t in need),
+               "before": zh, "candidate": "", "status": "error"}
         try:
+            # think=False unconditionally: the instruct model is thinking-
+            # capable and would otherwise spend the whole num_predict on
+            # reasoning; a non-thinking model ignores think=False (the smoke
+            # test already sends it to the dolphin fallback).
             raw = _call_ollama_chat(
                 model,
                 [{"role": "system",
                   "content": "你是中文字幕校对助手。只输出改正后的一句中文，不要解释。"},
                  {"role": "user", "content": prompt}],
-                base_url, timeout=300,
-                options={"num_predict": max(64, len(zh) * 3), "temperature": 0.0})
-        except Exception:                               # noqa: BLE001
+                base_url, timeout=300, think=False,
+                options={"num_predict": max(64, len(zh) * 3), **_REWRITE_OPTIONS,
+                         **(options or {})})
+        except Exception as exc:                        # noqa: BLE001
+            row["candidate"] = f"{type(exc).__name__}: {exc}"
+            if report is not None:
+                report.append(row)
             continue
-        cand = _clean_ollama_output(raw)
-        # Accept only if it actually applied the pin and stayed a sentence.
-        if cand and all(t in cand for _, t in need) and \
-                0.4 <= len(cand) / max(len(zh), 1) <= 2.5:
+        cand = _clean_enforce_candidate(raw)
+        # how often the source names each pin: a candidate may not add more
+        want = [t for _, t in need]
+        limit = {t: sum(len(_term_pattern(ja).findall(src)) for ja, tt in need if tt == t)
+                 for t in want}
+        status = _enforce_edit_ok(zh, cand, want, limit)
+        row.update(candidate=cand, status=status)
+        if status == "accepted":
             out[i] = cand
             fixed += 1
+        if report is not None:
+            report.append(row)
 
     if progress_cb and attempted:
         progress_cb(f"术语校正：{fixed}/{attempted} 句已统一")
@@ -1997,6 +2113,7 @@ def compact_translation(
     model: str | None = None,
     base_url: str | None = None,
     max_tries: int = 2,
+    options: dict | None = None,
 ) -> str | None:
     """Rewrite one finished Chinese line to at most *max_chars* visible chars.
 
@@ -2010,6 +2127,7 @@ def compact_translation(
     shorter than the original, is within budget, keeps every pinned
     glossary term the source contains, and is not absurdly short (≥ 30 % of
     the original) — so a rewrite can drop words but never the sentence.
+    *options* overrides the generation options (the A/B harness uses it).
     """
     from ai_movie.config import COMPACT_MODEL, OLLAMA_BASE_URL
 
@@ -2051,13 +2169,15 @@ def compact_translation(
             f"只输出压缩后的一句中文，不要解释，不要引号。"
         )
         try:
+            # think=False unconditionally — see enforce_glossary.
             raw = _call_ollama_chat(
                 model,
                 [{"role": "system",
                   "content": "你是中文配音台词精简助手。只输出压缩后的一句中文，不要解释。"},
                  {"role": "user", "content": prompt}],
-                base_url, timeout=300,
-                options={"num_predict": max(48, ask * 3), "temperature": 0.0})
+                base_url, timeout=300, think=False,
+                options={"num_predict": max(48, ask * 3), **_REWRITE_OPTIONS,
+                         **(options or {})})
         except Exception:                               # noqa: BLE001
             break
         cand = _clean_ollama_output(raw).strip().strip("「」『』\"'“”")
@@ -2101,6 +2221,7 @@ def translate_segments(
     cancel_check: Callable[[], bool] | None = None,
     report: list[dict] | None = None,
     trace: list[dict] | None = None,
+    enforce_report: list[dict] | None = None,
 ) -> list[str]:
     """Translate *segments* with one of :data:`TRANSLATE_ENGINES`.
 
@@ -2110,6 +2231,10 @@ def translate_segments(
     model can never be resident at the same time on a 122 GB box.  *trace*
     receives the Sakura draft rows (see :func:`_sakura_translate`); the
     draft text in them is what the polish pass starts from.
+
+    *report* collects the polish rows, *enforce_report* the glossary-enforce
+    rows (different shapes, so different lists — the runner writes one CSV
+    each).
     """
     from ai_movie.config import (
         OLLAMA_BASE_URL, OLLAMA_GPTOSS_MODEL, OLLAMA_POLISH_MODEL, OLLAMA_SAKURA_MODEL,
@@ -2145,7 +2270,7 @@ def translate_segments(
 
     if not polish_key:
         return enforce_glossary(segments, drafts, glossary or {},
-                                base_url=base_url)
+                                base_url=base_url, report=enforce_report)
 
     # ── polish ──────────────────────────────────────────────────────
     m = models[polish_key]
@@ -2159,4 +2284,4 @@ def translate_segments(
                                    glossary=glossary, progress_cb=progress_cb,
                                    cancel_check=cancel_check)
     return enforce_glossary(segments, polished, glossary or {},
-                            base_url=base_url)
+                            base_url=base_url, report=enforce_report)

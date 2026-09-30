@@ -776,23 +776,29 @@ def step_glossary(ctx: Ctx, args) -> None:
 
 def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
                         engine: str, gloss: dict, polish_rows: list[dict],
-                        unit_rows: list[dict]) -> list[str]:
+                        unit_rows: list[dict],
+                        enforce_rows: list[dict] | None = None) -> list[str]:
     """Translate each sentence unit once and split its Chinese back.
 
     See ai_movie/units.py: the segment count never changes, so every stage
     after translate keeps indexing by position.  A unit whose Chinese cannot
     be split without cutting a word falls back to per-segment translation
     of its members — exactly the pre-unit behaviour.
+
+    The pseudo segments carry ``seg_idx`` (first member's segment index) so
+    report rows written inside translate_segments can name the segment
+    rather than their position in the todo-filtered unit list.
     """
     from ai_movie import units as units_mod
 
     pseudo = [{**segs[u[0]],
                "text": "".join((segs[i].get("text") or "") for i in u),
-               "end": segs[u[-1]]["end"]} for u in units]
+               "end": segs[u[-1]]["end"], "seg_idx": u[0]} for u in units]
     # kept-original lines (moans, laughs) have nothing to translate; they are always singleton units
     todo = [k for k, u in enumerate(units) if not segs[u[0]].get("keep_original")]
     zh_done = translator.translate_segments(
         [pseudo[k] for k in todo], engine=engine, glossary=gloss, report=polish_rows,
+        enforce_report=enforce_rows,
         progress_cb=lambda d, t: log(f"  {engine}: {d}/{t}") if d % 20 == 0 else None) if todo else []
     zh_units = [""] * len(units)
     for k, zh in zip(todo, zh_done):
@@ -815,8 +821,8 @@ def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
         log(f"  {len(fallback)} segment(s) in unsplittable units: translating them individually")
         # these lines skipped the unit pass: report them so the polish sees F5_split_fallback
         redo = translator.translate_segments(
-            [dict(segs[i], split_fallback=True) for i in fallback], engine=engine, glossary=gloss,
-            report=polish_rows)
+            [dict(segs[i], split_fallback=True, seg_idx=i) for i in fallback], engine=engine,
+            glossary=gloss, report=polish_rows, enforce_report=enforce_rows)
         for i, zh in zip(fallback, redo):
             out[i] = zh
     for k, u in enumerate(units):
@@ -840,27 +846,36 @@ def step_translate(ctx: Ctx, args) -> None:
         f"({sum(1 for u in units if len(u) > 1)} multi-segment)")
 
     variants: dict[str, list[str]] = {}
-    reports: dict[str, tuple[list[dict], list[dict]]] = {}
+    reports: dict[str, tuple[list[dict], list[dict], list[dict]]] = {}
     for eng in engines:
         log(f"Translating with engine '{eng}' ({len(units)} units)…")
         t0 = time.time()
         polish_rows: list[dict] = []
         unit_rows: list[dict] = []
+        enforce_rows: list[dict] = []
         try:
             out = _translate_by_units(translator, segs, units, eng, gloss,
-                                      polish_rows, unit_rows)
+                                      polish_rows, unit_rows, enforce_rows)
         except Exception as exc:                        # noqa: BLE001
             log(f"  engine {eng} FAILED: {type(exc).__name__}: {exc}")
             continue
         variants[eng] = out
-        reports[eng] = (polish_rows, unit_rows)
+        reports[eng] = (polish_rows, unit_rows, enforce_rows)
         if polish_rows:
             acc = sum(1 for r in polish_rows if r["status"] == "accepted")
             log(f"  polish: {len(polish_rows)} flagged, {acc} rewritten")
+        if enforce_rows:
+            fixed = sum(1 for r in enforce_rows if r["status"] == "accepted")
+            log(f"  glossary enforce: {len(enforce_rows)} attempted, {fixed} fixed")
         log(f"  {eng} done in {time.time() - t0:.0f}s")
         tagged = [{**s, "text_translated": t} for s, t in zip(segs, out)]
         artifacts.export_srt(tagged, ctx.deliver / f"02_zh_{eng}.srt",
                              text_key="text_translated", speaker_prefix=True)
+    # the instruct model is sized to keep Sakura resident (see config.GLOSSARY_ENFORCE_MODEL);
+    # keep_alive expires in minutes, so record the resident set here rather than by hand
+    log("  ollama resident after translate: "
+        + (", ".join(m.get("name") or m.get("model") or "?" for m in translator.ollama_loaded())
+           or "none"))
 
     if not variants:
         raise RuntimeError("all translation engines failed")
@@ -873,8 +888,10 @@ def step_translate(ctx: Ctx, args) -> None:
     log(f"Using '{chosen}' for downstream stages")
     for s, t in zip(segs, variants[chosen]):
         s["text_translated"] = t
-    polish_rows, unit_rows = reports[chosen]
-    for name, rows in (("02_polish_report.csv", polish_rows), ("02_units.csv", unit_rows)):
+    polish_rows, unit_rows, enforce_rows = reports[chosen]
+    # one file per row shape: DictWriter takes its columns from the first row
+    for name, rows in (("02_polish_report.csv", polish_rows), ("02_units.csv", unit_rows),
+                       ("02_glossary_enforce.csv", enforce_rows)):
         if rows:
             with open(ctx.deliver / name, "w", newline="", encoding="utf-8-sig") as fh:
                 w = csv.DictWriter(fh, fieldnames=list(rows[0]))
@@ -884,7 +901,10 @@ def step_translate(ctx: Ctx, args) -> None:
                           "units": units,
                           "polish": {"flagged": len(polish_rows),
                                      "accepted": sum(1 for r in polish_rows
-                                                     if r["status"] == "accepted")}})
+                                                     if r["status"] == "accepted")},
+                          "enforce": {"attempted": len(enforce_rows),
+                                      "fixed": sum(1 for r in enforce_rows
+                                                   if r["status"] == "accepted")}})
 
 
 def _visible_chars(text: str) -> int:
