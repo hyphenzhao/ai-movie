@@ -62,6 +62,39 @@ def chunk_faces(name: str, video: str, st: dict, segs: list[dict]) -> tuple[dict
     return plan, ids, plan["speaker_track"]
 
 
+def real_probe(members: list[dict], cands: list[str], gender: str, out_dir: Path, n_lines: int = 10) -> list[dict]:
+    """Convert real built-in lines of this person onto each candidate; rank by the guard's rejection rate.
+
+    Lines come from any enrolment chunk whose tts/fit stage is done (``audio_fit``); with none, returns [].
+    """
+    from ai_movie import tts as tts_mod
+    from ai_movie.vc_guard import guard_lines
+    lines = []
+    for m in members:
+        sp = ROOT / "workspace" / m["chunk"] / "state.json"
+        if not sp.exists():
+            continue
+        st = json.loads(sp.read_text())
+        for sg in ((st.get("fit") or {}).get("segments") or []):
+            if sg.get("speaker") == m["speaker"] and sg.get("audio_fit") and Path(sg["audio_fit"]).exists() \
+                    and not sg.get("keep_original") and (float(sg["end"]) - float(sg["start"])) >= 1.5:
+                lines.append(dict(sg, speaker="X", gender=gender))
+    if len(lines) < 4:
+        log(f"    real probe skipped ({len(lines)} usable lines)")
+        return []
+    lines = sorted(lines, key=lambda sg: -(float(sg["end"]) - float(sg["start"])))[:n_lines]
+    ranked = []
+    for k, c in enumerate(cands):
+        segs = [dict(sg) for sg in lines]
+        items = tts_mod.run_vc_conversion(segs, {"X": {"ref_audio": c, "gender": gender}}, out_dir / f"c{k}")
+        stats = guard_lines(segs, items, lines)
+        rate = stats["rejected"] / max(1, stats["checked"])
+        ranked.append({"path": c, "reject_rate": round(rate, 3), "checked": stats["checked"], "reasons": stats["reasons"]})
+        log(f"    real probe {Path(c).name}: {stats['rejected']}/{stats['checked']} lines rejected {stats['reasons'] or ''}")
+    ranked.sort(key=lambda r: (r["reject_rate"], -r["checked"]))
+    return ranked
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("film")
@@ -166,6 +199,18 @@ def main() -> int:
             gate_rows = rows
             if good:
                 picked = good[0]["path"]; alts = [x["path"] for x in good[1:4]]
+        # Real-line probe: the generic probe passes clips that wreck real lines (ref_S1 of the first film:
+        # 7 of 10 long lines came out without a measurable pitch).  When an enrolment chunk already has its
+        # built-in lines synthesized, convert up to ten of this person's real lines onto every gated
+        # candidate and keep the one that loses the fewest; the others become the alternates.
+        if good and not args.no_probe:
+            ranked = real_probe(members, [x["path"] for x in good], gender, out_dir / f"real_{pid}")
+            if ranked:
+                picked = ranked[0]["path"]; alts = [r["path"] for r in ranked[1:4]]
+                for x in gate_rows:
+                    rr = next((r for r in ranked if r["path"] == x["path"]), None)
+                    if rr:
+                        x["real_reject_rate"] = rr["reject_rate"]; x["real_lines"] = rr["checked"]
         ref_rel = None
         if picked:
             shutil.copy2(picked, out_dir / f"ref_{pid}.wav"); ref_rel = f"profiles/ref_{pid}.wav"

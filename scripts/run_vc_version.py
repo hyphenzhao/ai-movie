@@ -85,6 +85,36 @@ def _refs_from_profiles(state: dict, path: Path) -> tuple[dict, str]:
     return refs, hashlib.sha1(raw).hexdigest()
 
 
+def _ref_options(refs: dict, args, profiles_doc: dict | None) -> list[dict]:
+    """The reference sets to try, best first: the chosen clips, then the alternates.
+
+    With profiles the alternates are each profile's ``ref_alternatives``; with
+    refs.json they are the other clips that passed the gate (``reject`` None).
+    Every option maps *every* speaker (a speaker without an alternate keeps
+    its primary clip).
+    """
+    alts: dict[str, list[str]] = {}
+    if profiles_doc:
+        base = Path(args.profiles).parent
+        for spk, v in refs.items():
+            prof = (profiles_doc.get("profiles") or {}).get(v.get("profile") or "") or {}
+            alts[spk] = [str(base / a) if not Path(a).is_absolute() else a for a in (prof.get("ref_alternatives") or [])]
+    elif args.refs_json:
+        doc = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
+        for spk, v in refs.items():
+            rows = (doc.get("candidates") or {}).get(v.get("gender"), []) or []
+            alts[spk] = [r["path"] for r in rows if r.get("reject") is None and r["path"] != v["ref_audio"]]
+    n = max([len(a) for a in alts.values()] + [0])
+    options = [refs]
+    for k in range(n):
+        opt = {}
+        for spk, v in refs.items():
+            a = alts.get(spk) or []
+            opt[spk] = dict(v, ref_audio=a[k]) if k < len(a) and Path(a[k]).exists() else v
+        options.append(opt)
+    return options[:3]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("state", help="workspace/<name>/state.json from the v1 run")
@@ -139,8 +169,10 @@ def main() -> int:
 
     refs = {}
     profiles_sha1 = None
+    profiles_doc = None
     if args.profiles:
         refs, profiles_sha1 = _refs_from_profiles(state, Path(args.profiles))
+        profiles_doc = json.loads(Path(args.profiles).read_text(encoding="utf-8"))
         log(f"profiles {Path(args.profiles).name} ({profiles_sha1[:8]}): "
             f"{ {k: v.get('profile') for k, v in refs.items()} }")
     else:
@@ -163,13 +195,28 @@ def main() -> int:
         log("no usable reference clips")
         return 1
 
-    # ── convert ────────────────────────────────────────────────────────
+    # ── convert, guard, retry with the next clip when a reference wrecks the lines ─────────
+    from ai_movie.config import VC_GUARD_MAX_REJECT
+    from ai_movie.vc_guard import guard_lines
     segs = [dict(s) for s in v1_segs]
     out_dir = work / "synthesized_vc"
-    log(f"voice-converting {len(segs)} segments…")
-    items = tts_mod.run_vc_conversion(
-        segs, refs, out_dir,
-        progress_cb=lambda d, t: log(f"  VC {d}/{t}") if d % 10 == 0 else None)
+    options = _ref_options(refs, args, profiles_doc)
+    attempts = []
+    for k, ref_set in enumerate(options):
+        names = {spk: Path(v["ref_audio"]).name for spk, v in ref_set.items()}
+        log(f"voice-converting {len(segs)} segments with {names}…")
+        items = tts_mod.run_vc_conversion(
+            segs, ref_set, out_dir / (f"try{k}" if k else ""),
+            progress_cb=lambda d, t: log(f"  VC {d}/{t}") if d % 10 == 0 else None)
+        stats = guard_lines(segs, items, v1_segs, log=log)
+        attempts.append((stats["rejected"] / max(1, stats["checked"]), k, items, stats, ref_set))
+        if stats["checked"] == 0 or attempts[-1][0] <= VC_GUARD_MAX_REJECT:
+            break
+        log(f"  {attempts[-1][0]:.0%} of lines rejected — trying the next reference clip")
+    attempts.sort(key=lambda a: (a[0], a[1]))
+    reject_rate, k, items, stats, refs = attempts[0]
+    if len(attempts) > 1:
+        log(f"  kept attempt {k} ({reject_rate:.0%} rejected)")
 
     converted = 0
     for i, s in enumerate(segs):
@@ -177,6 +224,8 @@ def main() -> int:
         if it.get("audio"):
             s["audio"] = it["audio"]
             s["vc"] = bool(it.get("vc"))
+            if it.get("guard"):
+                s["vc_guard"] = it["guard"]
             converted += int(bool(it.get("vc")))
         else:
             s["audio"] = None
@@ -275,6 +324,8 @@ def main() -> int:
     artifacts.export_csv(rows, deliver / "03_tts_report.csv")
 
     state["vc"] = {"segments": segs, "refs": refs, "video": str(final), "profiles_sha1": profiles_sha1,
+                   "guard": {"checked": stats["checked"], "rejected": stats["rejected"], "reasons": stats["reasons"],
+                             "attempts": len(attempts), "reject_rate": round(reject_rate, 3)},
                    "converted": converted, "reused_lipsync": reuse_lipsync,
                    "max_drift_ms": round(worst[0] * 1000, 1),
                    "mix": mix_stats}

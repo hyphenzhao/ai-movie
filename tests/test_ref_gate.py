@@ -35,6 +35,10 @@ def test_qualify_never_picks_unmeasurable_and_ranks_by_ratio():
     ]
     ok = asr_mod.qualify(rows, "female")
     assert [r["path"] for r in ok] == ["good", "fast"]
+    # same 0.1 ratio band → the clip with more voiced frames wins
+    tie = [{"path": "short", "f0": 250.0, "voiced": 60, "out_f0": [262.0, 258.0], "ratio": 1.05},
+           {"path": "long", "f0": 250.0, "voiced": 94, "out_f0": [234.0, 240.0], "ratio": 0.94}]
+    assert [r["path"] for r in asr_mod.qualify(tie, "female")] == ["long", "short"]
     assert rows[0]["reject"].startswith("measurable_0")
     assert rows[1]["reject"].startswith("measurable_1")
     assert "outside" in rows[4]["reject"]

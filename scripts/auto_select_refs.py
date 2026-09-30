@@ -94,7 +94,9 @@ def qualify(rows: list[dict], gender: str) -> list[dict]:
         else:
             r_["reject"] = None
             ok.append(r_)
-    ok.sort(key=lambda r_: (abs(r_["ratio"] - 1.0), -r_.get("voiced", 0)))
+    # Ratios within the same 0.1 band are a tie; the clip with more voiced material wins (a 2.5 s
+    # clip at ratio 1.05 used to beat a 4.5 s clip at 0.94 and cloned worse).
+    ok.sort(key=lambda r_: (round(abs(r_["ratio"] - 1.0), 1), -r_.get("voiced", 0)))
     return ok
 
 
@@ -205,8 +207,13 @@ def main() -> int:
     for g, cands in candidates.items():
         lo, hi = GENDER_HZ[g]
         rows = []
+        own = {Path(s_).name for s_ in SOURCES.get(g, [])}
         for c in cands:
-            outs = [f0_of(rec["vc"]) for rec in by_ref.get(c["path"], [])]
+            # Only this gender's probe lines judge the candidate: a male probe converted onto a female
+            # reference lands low by nature, and scoring it against her pitch rejected every reference
+            # of output_test (v3.3 run 1 shipped the built-in voice).
+            outs = [f0_of(rec["vc"]) for rec in by_ref.get(c["path"], [])
+                    if Path(rec.get("src", "")).name in own]
             measurable = [o for o in outs if o is not None]
             in_range = [o for o in measurable if lo <= o <= hi]
             ratio = None
