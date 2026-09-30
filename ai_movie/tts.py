@@ -935,7 +935,7 @@ def run_vc_conversion(
     speaker_refs: dict[str, dict],
     output_dir: str | Path,
     *,
-    source_key: str = "audio_fit",
+    source_key: str | None = None,
     model_choice: str = "cosyvoice3",
     min_seconds: float = 0.7,
     chunk_seconds: float = 1.5,
@@ -947,29 +947,48 @@ def run_vc_conversion(
     Zero-shot cloning conditions the LLM on the reference *transcript*, which
     on this material is Japanese — so Japanese leaked into the Chinese output
     and some references deterministically drove the model into a degenerate
-    mode.  Voice conversion takes the content from ``source_key`` (the
-    built-in-voice audio the pipeline already produced and time-fitted) and
-    only the timbre from the reference, so no text conditioning exists to
-    corrupt.  Measured: 0 kana across 26 probe outputs, and ECAPA similarity
-    to the real speaker rises from ≈0 to 0.44–0.67.  See
-    ``Documentation/vc-gate-result.md``.
+    mode.  Voice conversion takes the content from ``source_key`` (a wav the
+    pipeline already produced in the built-in voice) and only the timbre from
+    the reference, so no text conditioning exists to corrupt.  Measured: 0
+    kana across 26 probe outputs, and ECAPA similarity to the real speaker
+    rises from ≈0 to 0.44–0.67.  See ``Documentation/vc-gate-result.md``.
 
-    Because the content is the source audio, output duration tracks the input
-    to within one 25 Hz token frame (~40 ms) — small enough that re-running
-    :func:`composer.fit_segments_to_timeline` afterwards restores the original
-    timeline exactly, which is what lets the converted track reuse the
-    built-in-voice version's lip-sync render.
+    *source_key* defaults to ``config.VC_SOURCE_KEY``: ``"audio"`` converts
+    the natural-tempo line, ``"audio_fit"`` the slot-fitted one; a segment
+    that lacks the key falls back to ``audio_fit`` then ``audio``.  Converting
+    the natural line means a sped-up line is stretched once — after
+    conversion, when the caller pins it onto the v1 slot — instead of being
+    fed to the converter at 1.25–1.6× and stretched again afterwards.
 
-    Segments shorter than *min_seconds* keep their source audio.  Conversion
-    degrades badly on very short input — every catastrophic failure measured
-    (a line coming back as a different language entirely: 「是的」→ "Shut up",
-    「所以呢」→ "That's all you know") was under 0.6 s, and none above it.  A
-    0.3-second interjection keeping the built-in voice is a far smaller defect
-    than the same interjection becoming a different sentence.
+    Output duration tracks the input per *chunk* (median out/in 1.01) but a
+    piece cut back out of a chunk can be up to ~2× its source (the cut
+    searches ±250 ms for silence and a 0.3 s line absorbs the whole radius),
+    so nothing here assumes the output fits a slot: every result carries
+    ``source`` and ``source_dur`` and the caller (``scripts/run_vc_version.py``)
+    pins each converted wav to the exact sample count of the v1 line, which is
+    what lets the converted track reuse the built-in version's lip-sync
+    render.
 
-    Segments whose speaker has no usable reference also keep their source
-    audio.
+    Fallbacks: a line whose speaker has no usable reference, a line shorter
+    than *min_seconds* that could not be chunked with a neighbour, a source
+    over 29 s (the CosyVoice tokenizer asserts ≤ 30 s) and a failed conversion
+    all come back with ``vc=False`` and ``audio`` = the *source* wav.  That
+    audio is information, not a deliverable: the caller must substitute v1's
+    own fitted line for every ``vc=False`` item (with ``source_key="audio"``
+    the source is the natural take, and re-fitting it would re-render a line
+    v1 already fitted).
+
+    Conversion degrades badly on very short input — every catastrophic
+    failure measured (a line coming back as a different language entirely:
+    「是的」→ "Shut up", 「所以呢」→ "That's all you know") was under 0.6 s,
+    and none above it — so short lines are converted joined to their
+    neighbours (``_vc_chunks``) and only a short line with no neighbour keeps
+    the built-in voice.  Chunk members carry ``chunk`` (first/last index),
+    ``chunk_src`` (the concatenated built-in source) and ``chunk_out`` (the
+    converted chunk) so the guard can judge the chunk as one utterance.
     """
+    from ai_movie.config import VC_SOURCE_KEY
+    source_key = source_key or VC_SOURCE_KEY
     try:
         from ai_movie.translator import free_gpu_for_local_work
         free_gpu_for_local_work()
@@ -984,23 +1003,32 @@ def run_vc_conversion(
 
     import soundfile as _sf
 
+    def _fallback(src: str | None, dur: float | None, **extra) -> dict:
+        return {"audio": src, "mode": "builtin", "vc": False,
+                "source": src, "source_dur": dur, **extra}
+
     # ── which lines can be converted at all ─────────────────────────
     convertible: dict[int, tuple[str, str, float]] = {}      # i → (src, ref, dur)
     for i, seg in enumerate(segments):
-        src = seg.get(source_key) or seg.get("audio")
+        src = seg.get(source_key) or seg.get("audio_fit") or seg.get("audio")
         if not src or not Path(src).exists():
-            results[i] = {"audio": None, "tts_error": "no source audio"}
+            results[i] = {"audio": None, "tts_error": "no source audio", "source": None, "source_dur": None}
             continue
         ref = speaker_refs.get(seg.get("speaker") or "")
         ref_audio = (ref or {}).get("ref_audio")
-        if not ref_audio or not Path(ref_audio).exists():
-            # Nothing to convert onto — the built-in voice is the fallback.
-            results[i] = {"audio": src, "mode": "builtin", "vc": False}
-            continue
         try:
             dur = _sf.info(str(src)).duration
         except Exception:                               # noqa: BLE001
             dur = min_seconds
+        if not ref_audio or not Path(ref_audio).exists():
+            # Nothing to convert onto — the built-in voice is the fallback.
+            results[i] = _fallback(str(src), dur)
+            continue
+        if dur > _VC_MAX_SOURCE_S:
+            # frontend._extract_speech_token asserts ≤ 30 s; the worker would catch the
+            # AssertionError and report tts_error, but that is a wasted model call.
+            results[i] = _fallback(str(src), dur, skipped=f"source > {_VC_MAX_SOURCE_S:.0f} s")
+            continue
         convertible[i] = (str(src), ref_audio, dur)
 
     # ── chunk short lines with their neighbours ─────────────────────
@@ -1023,8 +1051,7 @@ def run_vc_conversion(
             i = first
             src, ref_audio, dur = convertible[i]
             if dur < min_seconds:
-                results[i] = {"audio": src, "mode": "builtin", "vc": False,
-                              "skipped": "too short to convert safely"}
+                results[i] = _fallback(src, dur, skipped="too short to convert safely")
                 continue
             seg_texts.append((i, segments[i].get("text_translated") or ""))
             seg_refs[i] = (ref_audio, None, "vc")
@@ -1037,8 +1064,7 @@ def run_vc_conversion(
             for i in members:
                 src, ref_audio, dur = convertible[i]
                 if dur < min_seconds:
-                    results[i] = {"audio": src, "mode": "builtin", "vc": False,
-                                  "skipped": "too short to convert safely"}
+                    results[i] = _fallback(src, dur, skipped="too short to convert safely")
                 else:
                     seg_texts.append((i, segments[i].get("text_translated") or ""))
                     seg_refs[i] = (ref_audio, None, "vc")
@@ -1065,41 +1091,52 @@ def run_vc_conversion(
             meta = chunk_meta[key]
             pieces = _split_vc_chunk(r.get("audio"), meta, output_dir) if r.get("audio") else None
             for n, i in enumerate(meta["members"]):
+                src, _ref, dur = convertible[i]
                 if pieces and pieces[n]:
                     results[i] = {"audio": pieces[n], "mode": "vc", "vc": True,
                                   "voice": Path(seg_refs[key][0]).name,
-                                  "chunk": [meta["members"][0], meta["members"][-1]]}
+                                  "source": src, "source_dur": dur,
+                                  "chunk": [meta["members"][0], meta["members"][-1]],
+                                  "chunk_src": meta["path"], "chunk_out": r.get("audio")}
                 else:
-                    results[i] = {"audio": convertible[i][0], "mode": "builtin",
-                                  "vc": False,
-                                  "tts_error": r.get("tts_error") or "chunk vc failed"}
+                    results[i] = _fallback(src, dur,
+                                           tts_error=r.get("tts_error") or "chunk vc failed")
             continue
         i = key
+        src, _ref, dur = convertible[i]
         if r.get("audio"):
             results[i] = {"audio": r["audio"], "mode": "vc", "vc": True,
-                          "voice": Path(seg_refs[i][0]).name}
+                          "voice": Path(seg_refs[i][0]).name,
+                          "source": src, "source_dur": dur}
         else:
             # A failed conversion falls back to the source rather than to
             # silence: the built-in voice is still a usable line.
-            results[i] = {"audio": seg_sources[i], "mode": "builtin",
-                          "vc": False,
-                          "tts_error": r.get("tts_error") or "vc failed"}
+            results[i] = _fallback(src, dur, tts_error=r.get("tts_error") or "vc failed")
     return results
 
 
 _VC_CHUNK_BASE = 1_000_000       # synthetic indices for chunked conversions
 _VC_SEPARATOR_S = 0.45           # silence between lines inside a chunk
-_VC_MAX_CHUNK_S = 12.0           # keep conversions local and stable
+_VC_MAX_CHUNK_S = 12.0           # keep conversions local and stable (timeline span)
+# Audio bound on a chunk, separators included: chunk audio = Σ source_dur + 0.45·(n−1).  The span rule
+# alone ignores both the separators and the source length (natural takes run up to 1.6× the fitted
+# ones); the densest window in the regression set is 12 lines / 12 s (SONE-846_p06) → ≤ ~17 s, so
+# 20 s never splits a real chunk here while keeping CosyVoice's 30 s tokenizer assert unreachable.
+_VC_MAX_CHUNK_AUDIO_S = 20.0
+_VC_MAX_SOURCE_S = 29.0          # a single source longer than this cannot be tokenized (≤ 30 s assert)
 
 
 def _vc_chunks(segments: list[dict], convertible: dict[int, tuple[str, str, float]],
-               *, min_seconds: float, target_seconds: float) -> list[list[int]]:
+               *, min_seconds: float, target_seconds: float,
+               max_audio_seconds: float = _VC_MAX_CHUNK_AUDIO_S) -> list[list[int]]:
     """Group consecutive convertible lines of one speaker so that no group
     is shorter than *target_seconds* when it can be helped.
 
     A line already ≥ *target_seconds* stays alone unless the next line is
     too short to convert on its own — then it adopts it.  Greedy and
-    strictly in order, so every member of a chunk is a neighbour."""
+    strictly in order, so every member of a chunk is a neighbour.  A group
+    never spans more than ``_VC_MAX_CHUNK_S`` of timeline nor holds more than
+    *max_audio_seconds* of audio (separators counted)."""
     order = sorted(convertible)
     groups: list[list[int]] = []
     for i in order:
@@ -1112,7 +1149,8 @@ def _vc_chunks(segments: list[dict], convertible: dict[int, tuple[str, str, floa
                     and i == prev + 1)
             g_dur = sum(convertible[j][2] for j in g)
             span = float(segments[i]["end"]) - float(segments[g[0]]["start"])
-            if same and span <= _VC_MAX_CHUNK_S and (g_dur < target_seconds or dur < min_seconds):
+            fits = g_dur + dur + _VC_SEPARATOR_S * len(g) <= max_audio_seconds
+            if same and span <= _VC_MAX_CHUNK_S and fits and (g_dur < target_seconds or dur < min_seconds):
                 g.append(i)
                 continue
         groups.append([i])

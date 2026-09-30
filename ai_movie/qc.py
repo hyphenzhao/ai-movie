@@ -166,6 +166,14 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
             fail.append(f"fit_ratio>{th['fit_fail']}")
         elif fit_ratio > th["fit_warn"]:
             warn.append(f"fit_ratio>{th['fit_warn']}")
+        # v2 keeps v1's fit_ratio (the slot's demand); the stretch actually applied to a converted
+        # wav is vc_pin_ratio (run_vc_version.pin_to_v1) and gets the same thresholds, so a chunk
+        # piece cut too long (output_test #125: 2.14×) stays a FAIL instead of hiding behind v1's 1.0.
+        pin_ratio = float(s.get("vc_pin_ratio") or 1.0)
+        if key == "vc" and s.get("vc") and pin_ratio > th["fit_fail"]:
+            fail.append(f"vc_pin_ratio>{th['fit_fail']}")
+        elif key == "vc" and s.get("vc") and pin_ratio > th["fit_warn"]:
+            warn.append(f"vc_pin_ratio>{th['fit_warn']}")
         if overrun > th["overrun_fail"]:
             fail.append(f"truncated>{th['overrun_fail']}s")
         elif overrun > th["overrun_warn"]:

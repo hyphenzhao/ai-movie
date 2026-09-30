@@ -77,6 +77,99 @@ def test_guard_lines_rewrites_items():
     assert st["checked"] == 2 and st["rejected"] == 1
     assert items[1]["vc"] is False and items[1]["audio"] == v1[1]["audio_fit"] and items[1]["guard"]
     assert items[0]["vc"] is True
+    assert st["drift"] == {"enabled": False, "units": 0, "judged": 0, "rejected": 0}     # transcribe=None: pitch only
+
+
+def test_guard_source_key_judges_natural_line_but_falls_back_to_fitted():
+    """source_key="audio": the baseline is v1['audio'] (what was converted); the fallback is still audio_fit."""
+    d = Path(tempfile.mkdtemp(prefix="vcguard_"))
+    # natural take is voiced at 220 Hz for 1.0 s; the fitted wav is noise — judging against the fitted one
+    # would reject a good conversion, judging against the natural one accepts it
+    v1 = [{"audio": wav(d, "nat0.wav", voiced(1.0, 220)), "audio_fit": wav(d, "fit0.wav", noise(0.8))},
+          {"audio": wav(d, "nat1.wav", voiced(1.0, 220)), "audio_fit": wav(d, "fit1.wav", voiced(0.8, 220))}]
+    segs = [{"gender": "female"}, {"gender": "female"}]
+    items = {0: {"audio": wav(d, "c0.wav", voiced(1.05, 225)), "vc": True},
+             1: {"audio": wav(d, "c1.wav", noise(1.05)), "vc": True}}
+    st = guard_lines(segs, items, v1, source_key="audio")
+    assert st["checked"] == 2 and st["rejected"] == 1
+    assert items[0]["vc"] is True
+    assert items[1]["vc"] is False and items[1]["audio"] == v1[1]["audio_fit"]     # fallback = fitted, not natural
+    # default key keeps today's behaviour: line 0 judged against the noise fit → not judged (no voiced baseline)
+    items2 = {0: {"audio": items[0]["audio"], "vc": True}}
+    st2 = guard_lines(segs, items2, v1)
+    assert st2["checked"] == 0 and items2[0]["vc"] is True
+
+
+def test_guard_lines_drift_chunk_and_single():
+    """Content verdicts fold into the pitch verdicts: a drifted chunk drops whole, a flipped single drops,
+    a line the judge cannot hear stays pitch-judged only, the pitch reason wins when both fail."""
+    d = Path(tempfile.mkdtemp(prefix="vcguard_"))
+    v1 = [{"audio_fit": wav(d, f"v1_{i}.wav", voiced(1.5, 220))} for i in range(6)]
+    segs = [{"gender": "female", "text_translated": t}
+            for t in ("把腿伸直", "好舒服啊", "不妙啊", "哥哥……", "这么多", "疼得要命")]
+    chunk_src = wav(d, "chunk_0000_0001.wav", voiced(3.0, 220))
+    chunk_out = wav(d, "seg_1000001.wav", voiced(3.1, 225))
+    items = {0: {"audio": wav(d, "c0.wav", voiced(1.5, 225)), "vc": True, "chunk": [0, 1],
+                 "chunk_src": chunk_src, "chunk_out": chunk_out},
+             1: {"audio": wav(d, "c1.wav", voiced(1.5, 225)), "vc": True, "chunk": [0, 1],
+                 "chunk_src": chunk_src, "chunk_out": chunk_out},
+             2: {"audio": wav(d, "c2.wav", voiced(1.5, 225)), "vc": True},          # script flip
+             3: {"audio": wav(d, "c3.wav", voiced(1.5, 225)), "vc": True},          # v1 not heard → pitch only
+             4: {"audio": wav(d, "c4.wav", voiced(1.5, 110)), "vc": True},          # pitch fails AND drifts
+             5: {"audio": wav(d, "c5.wav", voiced(1.5, 225)), "vc": True}}          # intact
+    T = {items[0]["audio"]: "把腿伸直", v1[0]["audio_fit"]: "把腿伸直",
+         items[1]["audio"]: "打书法", v1[1]["audio_fit"]: "好舒服啊",                    # member 1 drifted
+         chunk_out: "把腿伸直。打书法", chunk_src: "把腿伸直。好舒服啊",                   # chunk level: 0.53 → passes (dilution)
+         items[2]["audio"]: {"auto": {"text": "Tchau, tchau.", "language": "pt"}, "zh": {"text": "桥桥"}},
+         v1[2]["audio_fit"]: "不妙啊",
+         items[3]["audio"]: "Booga.", v1[3]["audio_fit"]: {"auto": {"text": "Фига!", "language": "ru"}, "zh": None},
+         items[4]["audio"]: "我们都要", v1[4]["audio_fit"]: "这么多",
+         items[5]["audio"]: "疼得要命", v1[5]["audio_fit"]: "疼得要命"}
+    calls = []
+    conv_paths = {i: it["audio"] for i, it in items.items()}          # guard_lines rewrites rejected items
+
+    def transcribe(paths):
+        calls.append(list(paths))
+        return {p: T[p] for p in paths}
+
+    st = guard_lines(segs, items, v1, transcribe=transcribe)
+    assert len(calls) == 1 and len(calls[0]) == len(set(calls[0]))                  # one call, deduped
+    assert set(calls[0]) == set(T)                                                    # every unit path, once
+    v = st["verdicts"]
+    assert v[1]["reason"].startswith("drift_") and not v[1]["ok"]
+    # the chunk-level reading passes (0.53: the intact mate dilutes the drift) — the member level catches it
+    assert v[0]["ok"] and v[0]["drift"]["score"] == 1.0 and 0.5 <= v[0]["drift_chunk"]["score"] < 0.6
+    assert items[0]["vc"] is False and items[0]["guard"] == "chunk_member"           # chunk mate dropped whole
+    assert items[1]["vc"] is False and items[1]["guard"].startswith("drift_")
+    assert v[2]["reason"] == "script_flip" and items[2]["vc"] is False
+    assert v[3]["drift"]["gate"] == "no_v1_cjk" and v[3]["ok"] and items[3]["vc"] is True
+    assert not v[4]["ok"] and v[4]["reason"].startswith(("band_", "pitch_jump")) and v[4]["drift"]["reason"].startswith("drift_")
+    assert v[5]["ok"] and items[5]["vc"] is True
+    assert st["checked"] == 6 and st["rejected"] == 3 and st["dropped"] == 4
+    assert st["reasons"]["drift"] == 1 and st["reasons"]["script"] == 1
+    assert st["drift"]["units"] == 7 and st["drift"]["rejected"] == 3 and st["drift"]["judged"] == 6   # 6 lines judged + chunk unit judged, line 3 not
+    # a crashing transcriber never fails the guard: pitch verdicts stand, error recorded
+    items_b = {4: {"audio": conv_paths[4], "vc": True}, 5: {"audio": conv_paths[5], "vc": True}}
+
+    def boom(paths):
+        raise RuntimeError("no GPU")
+    st_b = guard_lines(segs, items_b, v1, transcribe=boom)
+    assert st_b["drift"]["error"].startswith("RuntimeError") and st_b["checked"] == 2 and st_b["rejected"] == 1
+
+
+def test_guard_drift_chunk_verdict_drops_members():
+    """A chunk whose whole-utterance reading drifted drops every member even when each member's own reading is short."""
+    d = Path(tempfile.mkdtemp(prefix="vcguard_"))
+    v1 = [{"audio_fit": wav(d, f"v1_{i}.wav", voiced(0.4, 220))} for i in range(2)]      # too short for pitch
+    segs = [{"gender": "female", "text_translated": "好大"}, {"gender": "female", "text_translated": "好疼"}]
+    src, out = wav(d, "chunk.wav", voiced(1.3, 220)), wav(d, "conv.wav", voiced(1.3, 225))
+    items = {i: {"audio": wav(d, f"c{i}.wav", voiced(0.4, 225)), "vc": True, "chunk": [0, 1],
+                 "chunk_src": src, "chunk_out": out} for i in range(2)}
+    T = {items[0]["audio"]: "好大", items[1]["audio"]: "好疼", v1[0]["audio_fit"]: "好大", v1[1]["audio_fit"]: "好疼",
+         out: "网络电脑", src: "好大。好疼"}
+    st = guard_lines(segs, items, v1, transcribe=lambda ps: {p: T[p] for p in ps})
+    assert st["verdicts"][0]["reason"].startswith("drift_") and st["verdicts"][0]["reason"].endswith("_chunk")
+    assert items[0]["vc"] is False and items[1]["vc"] is False and st["dropped"] == 2
 
 
 if __name__ == "__main__":
