@@ -40,7 +40,8 @@ STEP_LABELS = {
     "enhance": "人脸增强", "compose": "合成视频", "qc": "质检",
     "v2": "原声音色(v2)", "deliver": "交付包",
 }
-ENGINES = ["sakura", "sakura+gptoss", "gptoss", "hy-mt2", "hy-mt2+gptoss", "hy-mt2+sakura"]
+# run_pipeline's default ("sakura+qwen") first so the select can show it.
+ENGINES = ["sakura+qwen", "sakura", "sakura+gptoss", "gptoss", "hy-mt2", "hy-mt2+gptoss", "hy-mt2+sakura"]
 # v1 fingerprints the v2 clone was built from (recorded by jobs._record_vc_deps, compared in
 # derive_status).  enrol is included because run_vc_version.py reads enrol.speaker_profile
 # and no cached stage depends on enrol — without it a profile pin never showed as stale.

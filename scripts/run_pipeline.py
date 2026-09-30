@@ -141,7 +141,8 @@ STEP_CONFIG: dict[str, list[str]] = {
               "SHOT_DETECT", "SHOT_SCDET_THRESHOLD"],
     "lipsync": ["MUSETALK_BOX_SMOOTH", "MUSETALK_SHARPEN", "MUSETALK_FUSION",
                 "LIPSYNC_AUDIO_OFFSET_MS", "LIPSYNC_SMALL_FACE_UPSCALE",
-                "LIPSYNC_SR_MIN_FRAC", "OCCLUSION_MODE", "OCCLUSION_FULL_LIP_THRESH"],
+                "LIPSYNC_SR_MIN_FRAC", "OCCLUSION_MODE", "OCCLUSION_FULL_LIP_THRESH",
+                "LIPSYNC_SWITCH_FADE_FRAMES"],
     "enhance": ["FACE_ENHANCE_FIDELITY", "FACE_ENHANCE_PROTECT_LIPS"],
     "compose": [],
     "qc": ["QC_ASR_CONF_WARN", "QC_SPEAKER_CONF_WARN", "QC_FIT_WARN", "QC_FIT_FAIL",
@@ -185,7 +186,11 @@ STEP_CODE: dict[str, list[str]] = {
                   "ai_movie.translator._strip_tag_echo", "ai_movie.translator._sakura_echo",
                   "ai_movie.translator._polish_flagged",
                   "ai_movie.units.joins", "ai_movie.units.group_units",
-                  "ai_movie.units.split_translation", "ai_movie.units.flag_line"],
+                  "ai_movie.units.split_translation", "ai_movie.units.flag_line",
+                  # the glossary shapes the prompt and the pinned terms; all three
+                  # depend on _term_pattern (a hash of the callers cannot see it)
+                  "ai_movie.glossary.format_for_prompt", "ai_movie.glossary.protect_terms",
+                  "ai_movie.glossary._term_pattern"],
     "tts": ["ai_movie.tts.run_cloned_synthesis", "ai_movie.tts.build_seg_refs",
             "run_pipeline._synthesize",
             "ai_movie.diarize.extract_speaker_references",
@@ -203,11 +208,17 @@ STEP_CODE: dict[str, list[str]] = {
     "faces": ["ai_movie.faces._scan_ranges", "ai_movie.units.is_nonlexical", "run_pipeline._face_gender_conflicts", "ai_movie.faces.build_face_plan", "ai_movie.faces.detect_face_tracks",
               "ai_movie.faces.gate_frames", "ai_movie.faces.bind_speakers_to_tracks",
               "ai_movie.faces.bind_segments_to_tracks", "ai_movie.faces.interpolate_track",
-              "ai_movie.shots.detect_cuts"],
+              "ai_movie.shots.detect_cuts", "ai_movie.faces.mark_no_lipsync"],
+    # The assembly loop (_segment_lip_sync_musetalk_batch) is deliberately NOT
+    # hashed: a logging edit there must not cost a 30–120 min re-run.  The
+    # pieces that decide which pixels / how many frames a clip has are.
     "lipsync": ["ai_movie.lip_sync.segment_based_lip_sync",
                 "ai_movie.lip_sync.musetalk_sync_batch",
                 "ai_movie.lip_sync._cut_audio_clip",
-                "ai_movie.face_restore.occlusion_gate_video"],
+                "ai_movie.face_restore.occlusion_gate_video",
+                "ai_movie.lip_sync._gate_clip", "ai_movie.lip_sync._write_clip_bbox_json",
+                "ai_movie.lip_sync._fit_clip_to_duration",
+                "ai_movie.switch_fade.switch_fade_weights", "ai_movie.switch_fade.FadeWriter"],
     "enhance": ["ai_movie.face_restore.restore_video"],
     "compose": ["ai_movie.composer.compose_video"],
     "qc": ["ai_movie.qc.build_qc"],
@@ -258,6 +269,15 @@ def _stage_summary(state: dict, step: str) -> dict | None:
             out["with_audio"] = sum(1 for x in segs if x.get("audio") or x.get("audio_fit"))
     if step == "faces":
         out["anchored_frames"] = st.get("anchored_frames")
+        pt = st.get("passthrough") or {}
+        if pt:
+            out["passthrough"] = pt.get("frames")
+            out["speech_frames"] = pt.get("speech_frames")
+    if step == "lipsync":
+        for k in ("clips", "reverted_frames", "use_orig_by_reason", "faded_frames",
+                  "switches", "fade_frames", "passthrough_clips"):
+            if k in st:
+                out[k] = st[k]
     if step == "qc":
         out.update({k: (v.get("summary") or {}).get("FAIL") for k, v in st.items() if isinstance(v, dict) and v.get("summary")})
     for k in ("video", "audio"):
@@ -371,7 +391,8 @@ def _args_extra(step: str, args) -> dict:
         "tts": ["voice_mode", "no_ref_probe"],
         "compact": ["no_compact", "voice_mode"],
         "faces": ["faces_bind"],
-        "lipsync": ["lipsync_backend", "lipsync_audio_offset_ms", "fusion", "occlusion_mode"],
+        "lipsync": ["lipsync_backend", "lipsync_audio_offset_ms", "fusion", "occlusion_mode",
+                    "switch_fade_frames"],
         "enhance": ["enhance_fidelity", "enhance_protect_lips"],
     }
     out = {}
@@ -408,7 +429,7 @@ def _sweep_alt_extra(args) -> dict:
     return out
 
 
-_OPTIONAL_EXTRA = {"faces_bind", "fusion", "profiles"}
+_OPTIONAL_EXTRA = {"faces_bind", "fusion", "profiles", "switch_fade_frames"}
 
 
 def _fp_repr(value) -> str:
@@ -859,12 +880,16 @@ def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
             out[i] = piece
     if fallback:
         log(f"  {len(fallback)} segment(s) in unsplittable units: translating them individually")
-        # these lines skipped the unit pass: report them so the polish sees F5_split_fallback
         redo = translator.translate_segments(
-            [dict(segs[i], split_fallback=True, seg_idx=i) for i in fallback], engine=engine,
+            [dict(segs[i], seg_idx=i) for i in fallback], engine=engine,       # seg_idx: report rows (T5)
             glossary=gloss, report=polish_rows, enforce_report=enforce_rows)
         for i, zh in zip(fallback, redo):
             out[i] = zh
+            # Recorded on the segment itself (not a copy) so the state carries
+            # it: eval B6 / the reviewer can see which lines lost their unit
+            # context.  It is bookkeeping, not a polish flag — the polish
+            # never had a hint for it (v3.4 E12).
+            segs[i]["split_fallback"] = True
     for k, u in enumerate(units):
         for i in u:
             segs[i]["unit_id"] = k
@@ -937,6 +962,10 @@ def step_translate(ctx: Ctx, args) -> None:
                 w = csv.DictWriter(fh, fieldnames=list(rows[0]))
                 w.writeheader()
                 w.writerows(rows)
+    n_fallback = sum(1 for s in segs if s.get("split_fallback"))
+    if n_fallback:
+        log(f"  split fallback: {n_fallback} segment(s) re-translated individually "
+            f"after an unsplittable unit")
     ctx.put("translate", {"segments": segs, "variants": variants, "chosen": chosen,
                           "units": units,
                           "polish": {"flagged": len(polish_rows),
@@ -944,7 +973,8 @@ def step_translate(ctx: Ctx, args) -> None:
                                                      if r["status"] == "accepted")},
                           "enforce": {"attempted": len(enforce_rows),
                                       "fixed": sum(1 for r in enforce_rows
-                                                   if r["status"] == "accepted")}})
+                                                   if r["status"] == "accepted")},
+                          "split_fallback": n_fallback})
 
 
 def _visible_chars(text: str) -> int:
@@ -1296,10 +1326,7 @@ def step_faces(ctx: Ctx, args) -> None:
     segs = _timeline_segments(ctx)
     from ai_movie.config import FACE_SKIP_NONLEXICAL
     if FACE_SKIP_NONLEXICAL:
-        from ai_movie.units import is_nonlexical
-        segs = [dict(s, no_lipsync=True) if (s.get("content") == "nonlexical" or s.get("no_lipsync")
-                                             or (not s.get("content") and is_nonlexical(s.get("text", ""))))
-                else s for s in segs]
+        segs = faces_mod.mark_no_lipsync(segs)
         n_skip = sum(1 for s in segs if s.get("no_lipsync"))
         if n_skip:
             log(f"  {n_skip}/{len(segs)} interjection-only lines: dubbed, picture left untouched")
@@ -1320,10 +1347,23 @@ def step_faces(ctx: Ctx, args) -> None:
              "mean_area": round(t.get("mean_area", 0))}
             for t in plan["tracks"]]
     artifacts.export_csv(rows, ctx.deliver / "04_face_tracks.csv")
+    # L8: why every non-anchored frame inside a speech window passes through
+    # (unbound / profile / cut / off-screen …), from the plan's own tracks.
+    passthrough = None
+    try:
+        passthrough = faces_mod.passthrough_reasons(plan, segs)
+        n_pt = sum(passthrough["frames"].values())
+        log(f"  直通帧 {n_pt}/{passthrough['speech_frames']} "
+            f"({n_pt / max(1, passthrough['speech_frames']):.0%} of speech-window frames): "
+            + ", ".join(f"{k} {v}" for k, v in sorted(passthrough["frames"].items(),
+                                                      key=lambda kv: -kv[1])))
+    except Exception as exc:                            # noqa: BLE001
+        log(f"  passthrough accounting skipped: {type(exc).__name__}: {exc}")
     artifacts.export_json(
         {"speaker_track": plan["speaker_track"], "tracks": rows,
          "anchored_frames": len(plan["frames"]), "n_frames": plan["n_frames"],
-         "gate": plan.get("gate"), "segment_gated": plan.get("segment_gated")},
+         "gate": plan.get("gate"), "segment_gated": plan.get("segment_gated"),
+         "passthrough": passthrough},
         ctx.deliver / "04_face_plan_summary.json")
     conflicts = _face_gender_conflicts(ctx, plan, segs)
     if conflicts:
@@ -1332,7 +1372,9 @@ def step_faces(ctx: Ctx, args) -> None:
             f" → 04_face_gender_conflicts.csv")
     ctx.put("faces", {"plan_path": str(ctx.work / "face_plan.json"),
                       "speaker_track": plan["speaker_track"],
-                      "tracks": rows, "gender_conflicts": conflicts})
+                      "tracks": rows, "gender_conflicts": conflicts,
+                      "anchored_frames": len(plan["frames"]),
+                      "passthrough": passthrough})
 
 
 def _face_gender_conflicts(ctx: Ctx, plan: dict, segs: list[dict],
@@ -1400,6 +1442,7 @@ def step_lipsync(ctx: Ctx, args) -> None:
         audio_offset_ms=args.lipsync_audio_offset_ms,
         fusion=args.fusion,
         occlusion_mode=args.occlusion_mode,
+        switch_fade_frames=getattr(args, "switch_fade_frames", None),
         stats=stats,
         progress_cb=lambda d, t: log(f"  lipsync {d}/{t}"),
     )
@@ -1439,14 +1482,29 @@ def step_lipsync(ctx: Ctx, args) -> None:
     artifacts.export_csv(rows, ctx.deliver / "04_lipsync_report.csv")
     import shutil
     shutil.copy2(str(out), str(ctx.deliver / "04_lipsync.mp4"))
+    # Every generated↔original switch with its film timecode, so the
+    # reviewer can jump straight to each one (scripts/deliver.py copies it).
+    switch_rows = [{"clip": s.get("clip"), "tc": s.get("tc"), "film_frame": s.get("film_frame"),
+                    "local_frame": s.get("frame"), "kind": s.get("kind"), "dir": s.get("dir"),
+                    "fade": s.get("fade"), "step_hard": s.get("step_hard"),
+                    "step_faded": s.get("step_faded"), "step_src": s.get("step_src")}
+                   for s in sorted(stats.get("switch_list") or [], key=lambda s: s.get("tc") or 0)]
+    if switch_rows:
+        artifacts.export_csv(switch_rows, ctx.deliver / "04_switches.csv")
     if stats:
         log(f"  lipsync: {stats.get('clips')} clips, {stats.get('sr_clips')} at 2×, "
             f"occlusion={stats.get('occlusion_mode')} "
             f"(reverted {stats.get('reverted_frames')} frames, "
             f"region-patched {stats.get('region_frames')}), fusion={stats.get('fusion')}, "
             f"audio offset {stats.get('audio_offset_ms')} ms")
+        log(f"  switches: {stats.get('switches')} (fade {stats.get('fade_frames')} frames, "
+            f"{stats.get('faded_frames')} frames blended); original shown by reason: "
+            f"{stats.get('use_orig_by_reason')}, sporadic occlusion {stats.get('occluded_sporadic')}, "
+            f"{stats.get('passthrough_clips')} clips passed through whole "
+            f"({stats.get('passthrough_clip_frames')} frames)")
     ctx.put("lipsync", {"video": str(out), **{k: v for k, v in stats.items()
-                                              if k != "per_clip"},
+                                              if k not in ("per_clip", "switch_list")},
+                        "switch_list": stats.get("switch_list"),
                         "per_clip": stats.get("per_clip")})
 
 
@@ -1604,6 +1662,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="MuseTalk paste mode (default config MUSETALK_FUSION)")
     ap.add_argument("--occlusion-mode", default=None, choices=[None, "frame", "region"],
                     help="occluded-mouth fallback granularity (default config OCCLUSION_MODE)")
+    ap.add_argument("--switch-fade-frames", type=int, default=None,
+                    help="crossfade length (frames) at generated↔original switches in the "
+                         "lip-sync output; 0 = hard cut (default config LIPSYNC_SWITCH_FADE_FRAMES)")
     ap.add_argument("--enhance-fidelity", type=float, default=None,
                     help="CodeFormer fidelity w (default: config FACE_ENHANCE_FIDELITY)")
     ap.add_argument("--enhance-protect-lips", type=int, default=None, choices=[0, 1],

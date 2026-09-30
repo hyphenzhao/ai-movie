@@ -1811,8 +1811,7 @@ def _polish_flagged(
         draft = out[i].strip()
         if not ja or not draft:
             continue
-        flags = [f for f in flag_line(ja, draft, split_fallback=bool(seg.get("split_fallback")))
-                 if f in _FLAG_HINTS]
+        flags = [f for f in flag_line(ja, draft) if f in _FLAG_HINTS]
         if not flags:
             continue
         row = {"idx": i, "flags": ",".join(flags), "ja": ja, "draft": draft,
@@ -1890,16 +1889,9 @@ TRANSLATE_ENGINES = {
     "hy-mt2+sakura":  ("hymt2", "sakura"),
     "sakura+qwen":    ("sakura", "qwen"),
 }
-
-ENGINE_LABELS = {
-    "sakura":        "Sakura-14B 直译（快，日→中口语专精）",
-    "sakura+gptoss": "Sakura 直译 + gpt-oss-120B 上下文润色（推荐）",
-    "gptoss":        "gpt-oss-120B 直译（上下文最强，最慢）",
-    "hy-mt2":        "Hy-MT2-30B 直译（原方案）",
-    "hy-mt2+gptoss": "Hy-MT2 直译 + gpt-oss-120B 润色",
-    "hy-mt2+sakura": "Hy-MT2 直译 + Sakura 润色",
-    "sakura+qwen":   "Sakura 直译 + Qwen3.6 可疑句上下文校对（推荐）",
-}
+# The default is "sakura+qwen" (run_pipeline --engines, v3.1.0).  The gpt-oss
+# recipes are kept for experiments only: gpt-oss-120b cannot be held resident
+# on this box (project memory: ~60 GB Ollama ceiling).
 
 
 # Generation options shared by the single-sentence rewrite channels (enforce,

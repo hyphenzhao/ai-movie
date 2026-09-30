@@ -1516,6 +1516,58 @@ def musetalk_sync(
     return output_path
 
 
+def _gate_clip(
+    orig_clip: Path,
+    lipsync_clip: Path,
+    gated: Path,
+    *,
+    seg_start: float,
+    seg_end: float,
+    target_fps: float,
+    plan_frames: dict | None,
+    cuts: list[int],
+    resize_factor: int,
+    occlusion_mode: str | None,
+    fade_frames: int | None,
+    edge_fade: tuple[bool, bool],
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict:
+    """Occlusion gate + switch crossfade for ONE clip; returns its stats.
+
+    Factored out of the batch loop so the fingerprint can hash exactly the
+    code that decides which pixels the clip shows (this function and
+    ``face_restore.occlusion_gate_video``) without hashing the 260-line
+    assembly loop around it — a logging edit there must not cost a
+    30–120 min lip-sync re-run.
+
+    ``plan_frames`` is the face plan's global frame→box map (original video
+    pixels); the clip's anchored frames are re-sliced here in *orig_clip*
+    coordinates (``/ resize_factor``) — not from the bbox json, which is in
+    MuseTalk's (possibly 2× upscaled) coordinates.  ``None`` = no plan, every
+    frame was painted.
+    """
+    from ai_movie import face_restore as _fr
+    from ai_movie.shots import local_cuts
+
+    base = int(round(seg_start * target_fps))
+    n_local = int(round((seg_end - seg_start) * target_fps)) + 2
+    anchored = None
+    if plan_frames is not None:
+        anchored = {}
+        for i in range(n_local):
+            box = plan_frames.get(str(base + i))
+            if box is not None:
+                anchored[i] = [float(v) / resize_factor for v in box]
+    ostat: dict = {}
+    _fr.occlusion_gate_video(orig_clip, lipsync_clip, gated,
+                             occlusion_mode=occlusion_mode,
+                             cuts=local_cuts(cuts, base, n_local),
+                             anchored=anchored, fade_frames=fade_frames,
+                             edge_fade=edge_fade, stats=ostat,
+                             cancel_check=cancel_check, log_cb=_log)
+    return ostat
+
+
 def _segment_lip_sync_musetalk_batch(
     speech_ranges: list[tuple[float, float]],
     working_video: Path,
@@ -1537,6 +1589,7 @@ def _segment_lip_sync_musetalk_batch(
     fusion: str | None = None,
     occlusion_mode: str | None = None,
     small_face_upscale: bool | None = None,
+    switch_fade_frames: int | None = None,
     stats: dict | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
@@ -1549,10 +1602,14 @@ def _segment_lip_sync_musetalk_batch(
     the small-face 2× route (clips whose anchored frames are mostly
     ``face_plan["frames_sr"]`` are rendered on a lanczos-upscaled copy and
     scaled back), and ``stats`` (per-clip occlusion / SR bookkeeping for QC).
+
+    v3.4: ``switch_fade_frames`` (default ``config.LIPSYNC_SWITCH_FADE_FRAMES``)
+    crossfades every generated↔original switch inside the gate (see
+    ``_gate_clip``); ``stats`` additionally sums the L8 reason counts and
+    lists every switch with its film timecode (``04_switches.csv``).
     """
     from ai_movie.config import (LIPSYNC_SMALL_FACE_UPSCALE, LIPSYNC_SR_MAX_CLIP_SEC,
                                  LIPSYNC_SR_MIN_FRAC)
-    from ai_movie.shots import local_cuts
 
     if small_face_upscale is None:
         small_face_upscale = LIPSYNC_SMALL_FACE_UPSCALE
@@ -1686,17 +1743,40 @@ def _segment_lip_sync_musetalk_batch(
         if occlusion_gate:
             gated = tmp_dir / f"speech_{i:04d}_gated.mp4"
             try:
-                from ai_movie import face_restore as _fr
-                base = int(round(seg_start * target_fps))
-                n_local = int(round((seg_end - seg_start) * target_fps)) + 2
-                ostat: dict = {}
-                _fr.occlusion_gate_video(orig_clip, final_clip, gated,
-                                         occlusion_mode=occlusion_mode,
-                                         cuts=local_cuts(cuts, base, n_local),
-                                         stats=ostat,
-                                         cancel_check=cancel_check, log_cb=_log)
+                # A clip edge is a real switch unless the neighbouring range
+                # abuts it AND was lip-synced too (a 12 s split of one line,
+                # an SR re-chunk): fading there would dip a continuous
+                # generated mouth back to the original for 2·fade frames.
+                k = speech_ranges.index(rng)
+                lipsynced = set(task_range)
+                abut_before = (k > 0 and abs(speech_ranges[k - 1][1] - seg_start) < 1e-6
+                               and speech_ranges[k - 1] in lipsynced)
+                abut_after = (k + 1 < len(speech_ranges)
+                              and abs(speech_ranges[k + 1][0] - seg_end) < 1e-6
+                              and speech_ranges[k + 1] in lipsynced)
+                ostat = _gate_clip(orig_clip, final_clip, gated,
+                                   seg_start=seg_start, seg_end=seg_end,
+                                   target_fps=target_fps,
+                                   plan_frames=plan_frames if face_plan else None,
+                                   cuts=cuts, resize_factor=resize_factor,
+                                   occlusion_mode=occlusion_mode,
+                                   fade_frames=switch_fade_frames,
+                                   edge_fade=(not abut_before, not abut_after),
+                                   cancel_check=cancel_check)
                 if gated.exists():
                     final_clip = gated
+                # Gate-local frame l lands at round(l·n_fit/total) once the
+                # clip is re-timed to its slot (MuseTalk emits fewer frames
+                # than its audio), and the slot starts at the clip's
+                # quantised start frame — that is the film index the user
+                # can jump to (±2 frames).
+                n_fit = _exact_frames(seg_end - seg_start, exact_fps or ms_fps)
+                tot = max(1, int(ostat.get("frames") or n_fit))
+                base = int(round(seg_start * target_fps))
+                for sw in ostat.get("switches") or []:
+                    ff = base + int(round(sw["frame"] * n_fit / tot))
+                    sw["film_frame"] = ff
+                    sw["tc"] = round(ff / target_fps, 3)
                 cstat["occlusion"] = ostat
             except Exception as exc:                    # noqa: BLE001
                 _log(f"clip {i}: occlusion gate failed ({exc}) — un-gated")
@@ -1726,12 +1806,33 @@ def _segment_lip_sync_musetalk_batch(
 
     if stats is not None:
         occ = [c.get("occlusion") or {} for c in clip_stats]
+        by_reason: dict[str, int] = {"plan": 0, "no_face": 0, "lip": 0}
+        for o in occ:
+            for k, v in (o.get("use_orig_by_reason") or {}).items():
+                by_reason[k] = by_reason.get(k, 0) + int(v)
+        switches = [{"clip": c["clip"], **sw}
+                    for c in clip_stats for sw in (c.get("occlusion") or {}).get("switches") or []]
+        # Ranges that never reached MuseTalk (no anchored frame in the plan)
+        # are original footage end to end: counted separately from the
+        # per-frame "plan" reason, which only covers frames inside a clip.
+        passthrough = [r for r in speech_ranges if r not in set(task_range)]
         stats.update({
             "clips": len(task_range), "sr_clips": int(sum(task_sr)),
             "audio_offset_ms": audio_offset_ms, "fusion": fusion or "alpha",
             "occlusion_mode": (occ[0].get("mode") if occ and occ[0] else occlusion_mode),
             "reverted_frames": int(sum(o.get("reverted_frames", 0) for o in occ)),
             "region_frames": int(sum(o.get("region_frames", 0) for o in occ)),
+            "gated_frames": int(sum(o.get("frames", 0) for o in occ)),
+            "anchored_frames": int(sum(o.get("anchored_frames", 0) for o in occ)),
+            "use_orig_by_reason": by_reason,
+            "occluded_sporadic": int(sum(o.get("occluded_sporadic", 0) for o in occ)),
+            "fade_frames": next((int(o["fade_frames"]) for o in occ if "fade_frames" in o), None),
+            "faded_frames": int(sum(o.get("faded_frames", 0) for o in occ)),
+            "switches": len(switches),
+            "switch_list": switches,
+            "passthrough_clips": len(passthrough),
+            "passthrough_clip_frames": int(sum(_exact_frames(e - s, exact_fps or ms_fps)
+                                               for s, e in passthrough)),
             "per_clip": clip_stats,
         })
 
@@ -1797,6 +1898,7 @@ def segment_based_lip_sync(
     audio_offset_ms: float | None = None,
     fusion: str | None = None,
     occlusion_mode: str | None = None,
+    switch_fade_frames: int | None = None,
     stats: dict | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     detail_progress_cb: Callable[[int, int], None] | None = None,
@@ -1807,7 +1909,9 @@ def segment_based_lip_sync(
     v3 keyword-only additions (all default to config): ``audio_offset_ms``
     (``LIPSYNC_AUDIO_OFFSET_MS``), ``fusion`` (``MUSETALK_FUSION``),
     ``occlusion_mode`` (``OCCLUSION_MODE``) and ``stats`` (filled with
-    per-clip bookkeeping — MuseTalk path only).
+    per-clip bookkeeping — MuseTalk path only).  v3.4: ``switch_fade_frames``
+    (``LIPSYNC_SWITCH_FADE_FRAMES``) crossfades generated↔original switches
+    inside the occlusion gate (MuseTalk path; needs ``occlusion_gate``).
 
     Silent portions pass through unchanged (stream copy).  Segments where
     face detection fails fall back to the original clip automatically.
@@ -1976,7 +2080,8 @@ def segment_based_lip_sync(
             audio_offset_ms=(LIPSYNC_AUDIO_OFFSET_MS if audio_offset_ms is None
                              else audio_offset_ms),
             fusion=fusion or MUSETALK_FUSION,
-            occlusion_mode=occlusion_mode, stats=stats,
+            occlusion_mode=occlusion_mode,
+            switch_fade_frames=switch_fade_frames, stats=stats,
             progress_cb=progress_cb, detail_progress_cb=detail_progress_cb,
             cancel_check=cancel_check,
         )

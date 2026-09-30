@@ -22,7 +22,8 @@ This script produces the evidence:
 Measurement lives in ``scripts/vc_measure.py`` (needs the app's own
 transformers, so it cannot share this process).
 
-    python scripts/vc_feasibility.py --out workspace/output_test/vc_probe
+    python scripts/vc_feasibility.py --out workspace/output_test/vc_probe \
+        --ref-female <clip.wav> --ref-male <clip.wav>    # e.g. from auto_select_refs.py
 """
 
 from __future__ import annotations
@@ -94,10 +95,13 @@ def cases_from_state(state_path: Path, n: int) -> list[tuple[str, str, str, str]
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="workspace/output_test/vc_probe")
-    ap.add_argument("--ref-female",
-                    default="workspace/output_test/synthesized/ref_S0_alt1.wav")
-    ap.add_argument("--ref-male",
-                    default="workspace/output_test/synthesized/ref_S1.wav")
+    # No defaults: the clips this probe was first run on no longer exist, and
+    # a reference must be chosen by measurement (scripts/auto_select_refs.py,
+    # Documentation/vc-gate-result.md), never by a path baked into a script.
+    ap.add_argument("--ref-female", required=True,
+                    help="female reference clip (e.g. from auto_select_refs.py)")
+    ap.add_argument("--ref-male", required=True,
+                    help="male reference clip")
     ap.add_argument("--from-state", default=None,
                     help="sample real lines from a run's state.json instead of "
                          "the built-in six")

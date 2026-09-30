@@ -51,13 +51,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Chosen by measuring whether each candidate *reproduces its own pitch*
-# (scripts/vc_ref_probe.py), not by heuristic score or ECAPA similarity.
-# The reference decides the outcome: converting onto the clip the previous
-# release shipped drove a 232 Hz line down to 117 Hz — an octave, which reads
-# as male — while this one holds the ratio at 0.97-1.01. ECAPA barely
-# separated the two (0.44 vs 0.70), because that embedding is largely
-# pitch-invariant; the F0 ratio is what exposes it.
+# There is no default reference clip: the reference decides the outcome (a
+# bad one drove a 232 Hz line down to 117 Hz — an octave — while ECAPA
+# similarity barely noticed, Documentation/vc-gate-result.md), so it must
+# come from a source that measured it — --profiles (build_profiles.py) or
+# --refs-json (auto_select_refs.py) — or be named explicitly with --ref-*.
 # Any segment whose timing moves more than one frame breaks the premise that
 # v1's lip-sync video can be reused.
 FRAME_TOLERANCE = 1.0 / 29.97

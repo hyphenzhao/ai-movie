@@ -232,8 +232,60 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
     return {"key": key, "segments": recs,
             "summary": {**counts, "n": len(recs),
                         "fail_frac": round(counts["FAIL"] / max(1, len(recs)), 3),
-                        "reasons": dict(top)},
+                        "reasons": dict(top),
+                        "picture": picture_counts(state)},
             "thresholds": th}
+
+
+def picture_counts(state: dict) -> dict:
+    """Film-level picture bookkeeping (v3.4 L8 step 1): how many frames the
+    dubbed picture shows original instead of a generated mouth, and why.
+
+    Two layers, both counted by the stages themselves and only read here:
+    the face plan (``state["faces"]["passthrough"]``, frames inside padded
+    speech windows that never reached MuseTalk — unbound speaker, profile,
+    tiny face, shot cut, track gap, off-screen, interjection line) and the
+    lip-sync gate (``state["lipsync"]``: frames inside rendered clips shown
+    original because the plan left them out, S3FD lost the face, or the
+    mouth was occluded; plus the switches between the two and how many
+    frames the crossfade blended).  Counts only — the WARN/FAIL rules for
+    them are L8 step 2.
+    """
+    faces = state.get("faces") or {}
+    ls = state.get("lipsync") or {}
+    out: dict = {}
+    pt = faces.get("passthrough") or {}
+    if pt:
+        n_pt = int(sum((pt.get("frames") or {}).values()))
+        sw = int(pt.get("speech_frames") or 0)
+        out["plan"] = {"speech_window_frames": sw,
+                       "anchored": int(pt.get("anchored_in_windows") or 0),
+                       "passthrough": n_pt,
+                       "passthrough_frac": round(n_pt / sw, 3) if sw else None,
+                       "by_reason": dict(pt.get("frames") or {})}
+    if ls:
+        gate: dict = {}
+        for k in ("clips", "gated_frames", "anchored_frames", "reverted_frames",
+                  "occluded_sporadic", "fade_frames", "faded_frames", "switches",
+                  "passthrough_clips", "passthrough_clip_frames"):
+            if ls.get(k) is not None:
+                gate[k] = ls[k]
+        if ls.get("use_orig_by_reason"):
+            gate["by_reason"] = dict(ls["use_orig_by_reason"])
+        elif ls.get("per_clip"):
+            # a v3.3 state: only the plain revert count exists per clip
+            occ = [(c.get("occlusion") or {}) for c in ls["per_clip"]]
+            gate["by_reason"] = {"occlusion": int(sum(int(o.get("reverted_frames", 0)) for o in occ))}
+            gate.setdefault("gated_frames", int(sum(int(o.get("frames", 0)) for o in occ)))
+        kinds: dict[str, int] = {}
+        for s in ls.get("switch_list") or []:
+            k = f"{s.get('kind')}_{s.get('dir')}"
+            kinds[k] = kinds.get(k, 0) + 1
+        if kinds:
+            gate["switch_kinds"] = kinds
+        if gate:
+            out["gate"] = gate
+    return out
 
 
 def write_outputs(qc: dict, deliver_dir: str | Path, *, suffix: str = "") -> dict[str, Path]:
@@ -259,5 +311,27 @@ def write_outputs(qc: dict, deliver_dir: str | Path, *, suffix: str = "") -> dic
              f"  (fail {sm.get('fail_frac', 0):.1%})", "reasons:"]
     for k, v in sm["reasons"].items():
         lines.append(f"  {v:4d}  {k}")
+    pic = sm.get("picture") or {}
+    if pic:
+        lines.append("picture (frames shown original, by reason):")
+        plan = pic.get("plan")
+        if plan:
+            frac = plan.get("passthrough_frac")
+            lines.append(f"  plan: {plan['passthrough']}/{plan['speech_window_frames']} speech-window frames"
+                         + (f" ({frac:.0%})" if frac is not None else "") + " pass through: "
+                         + ", ".join(f"{k} {v}" for k, v in sorted(plan["by_reason"].items(),
+                                                                   key=lambda kv: -kv[1])))
+        gate = pic.get("gate")
+        if gate:
+            lines.append(f"  gate: {gate.get('reverted_frames')} reverted of "
+                         f"{gate.get('gated_frames')} gated frames: "
+                         + ", ".join(f"{k} {v}" for k, v in (gate.get("by_reason") or {}).items())
+                         + (f"; sporadic occlusion {gate['occluded_sporadic']}"
+                            if gate.get("occluded_sporadic") is not None else ""))
+            if gate.get("switches") is not None:
+                lines.append(f"  switches: {gate['switches']} "
+                             f"(fade {gate.get('fade_frames')} frames, {gate.get('faded_frames')} blended)"
+                             + (": " + ", ".join(f"{k} {v}" for k, v in gate["switch_kinds"].items())
+                                if gate.get("switch_kinds") else ""))
     ps.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"json": pj, "csv": pc, "summary": ps}

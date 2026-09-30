@@ -956,6 +956,18 @@ LIPSYNC_AUDIO_OFFSET_MS = 0
 #           Hands are labelled skin by BiSeNet and are NOT caught by this.
 OCCLUSION_MODE = "frame"
 OCCLUSION_FULL_LIP_THRESH = 0.0005
+# Crossfade at every generated↔original switch in the lip-sync output (v3.4
+# L5, ai_movie/switch_fade.py): the generated mouth fades in over the first
+# N generated frames of a run and out over the last N; original frames are
+# never touched and no frame is added or dropped.  0 = hard cut (v3.3).
+# 4 chosen for the 29.97/30 fps regression set: 4 frames = 133 ms, so a
+# switch costs ≤ 8 partially blended frames (0.27 s of soft lips).  3 leaves
+# only 25/50/75 % levels — a 25 % jump per frame on an open→closed mouth
+# still reads as a pop; 5 makes 10 ghosted frames per switch (test_2 with
+# ~40 switches: 13 s of double lips vs 10.7 s at 4).  The shortest
+# occlusion run is 6 frames and the plan gate is median-smoothed over
+# FACE_GATE_SMOOTH = 15, so 4 never dominates a normal generated run.
+LIPSYNC_SWITCH_FADE_FRAMES = 4
 
 # ── MuseTalk paste fusion (v3, patches/musetalk_fusion.patch) ──
 # "alpha":     single feathered jaw mask (upstream behaviour, 8 % feather).

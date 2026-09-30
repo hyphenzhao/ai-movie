@@ -21,7 +21,7 @@ argv[1] : path to a JSON job file with keys::
       "model_dir":  "<CosyVoice2/3 model dir>",
       "ref_audio":  "<reference wav path or speaker id>",
       "ref_text":   "<prompt/instruct text or null>",
-      "method":     "instruct2" | "zero_shot" | "cross_lingual" | "vc",
+      "method":     "zero_shot" | "cross_lingual" | "vc",
       "output_dir": "<dir for seg_XXXX.wav files>",
       "fp16":       true,
       "segments":   [{"index": 0, "text": "..."}, ...]

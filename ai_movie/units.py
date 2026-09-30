@@ -215,8 +215,13 @@ def length_off(ja: str | None, zh: str | None, lo: float = 0.3, hi: float = 2.5)
     return not (lo <= b / a <= hi)
 
 
-def flag_line(ja: str | None, zh: str | None, *, split_fallback: bool = False) -> list[str]:
-    """Film-independent reasons a translated unit deserves a second look."""
+def flag_line(ja: str | None, zh: str | None) -> list[str]:
+    """Film-independent reasons a translated unit deserves a second look.
+
+    (A line re-translated on its own after an unsplittable unit is recorded
+    as ``seg["split_fallback"]`` in the translate state, not flagged here:
+    the polish has no hint for it, so a flag would never reach the model.)
+    """
     flags = []
     if unsupported_pronoun(ja, zh):
         flags.append("F1_pronoun")
@@ -226,8 +231,6 @@ def flag_line(ja: str | None, zh: str | None, *, split_fallback: bool = False) -
         flags.append("F3_kana")
     if length_off(ja, zh):
         flags.append("F4_length")
-    if split_fallback:
-        flags.append("F5_split_fallback")
     return flags
 
 
