@@ -45,6 +45,8 @@ else
   stage "C: v2 (voice conversion)"
   $PY -u scripts/run_vc_version.py "$STATE" --refs-json "$WORK/refs_auto/refs.json" || die "vc version"
 fi
+# one voice per speaker on the delivered v2 lines (ECAPA on CPU, GPU hidden) → state.vc.consistency, 07_voice_consistency.*
+$PY -u scripts/voice_consistency.py "$STATE" ${PROFILES:+--profiles "$PROFILES"} || echo "(voice consistency failed — kept going)"
 
 stage "D: QC (v1 + v2), verification, acceptance"
 # shellcheck disable=SC2086

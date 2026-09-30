@@ -203,5 +203,7 @@ with open(full / "segments_full.csv", "w", newline="", encoding="utf-8-sig") as 
 print(f"{len(rows)} segments → {full / 'segments_full.csv'}")
 PYEOF
 cp -f "$SPLIT/status.txt" "$ROOT/deliver/${NAME}_full/chunk_status.txt" 2>/dev/null
+# one voice per profile across chunks (leave-one-chunk-out, CPU) → deliver/<film>_full/VOICE_CONSISTENCY.* for eval_long L3b–f
+$PY -u scripts/voice_consistency.py --film "$NAME" ${PROFILES:+--profiles "$PROFILES"} || echo "(voice consistency failed — kept going)"
 ev film_end minutes="$(( ($(date +%s) - T0) / 60 ))"
 say "LONG_DONE in $(( ($(date +%s) - T0) / 60 )) min"

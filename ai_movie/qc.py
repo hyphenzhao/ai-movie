@@ -52,6 +52,7 @@ def _thresholds() -> dict:
                                   getattr(c, "TTS_CLONE_MIN_SIMILARITY", 0.40)),
         "mix_gain_warn": getattr(c, "QC_MIX_GAIN_WARN", 2.9),
         "occlusion_frac_warn": getattr(c, "QC_OCCLUSION_FRAC_WARN", 0.25),
+        "voice_outlier": getattr(c, "VC_CONSIST_OUTLIER", 0.55),
     }
 
 
@@ -100,6 +101,9 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
     mix_off = float(mix_doc.get("global_offset_db") or 0.0)
     lip_per_clip = ((state.get("lipsync") or {}).get("per_clip")) or []
     compact_report = {r["idx"]: r for r in ((state.get("compact") or {}).get("report") or [])}
+    # scripts/voice_consistency.py keys its per-line numbers by str(index): JSON turns int keys
+    # into strings, so an int lookup here would silently find nothing.
+    voice_lines = (((state.get("vc") or {}).get("consistency") or {}).get("lines") or {}) if key == "vc" else {}
 
     def _same_gender_track_present(a: int, b: int, gender: str | None) -> bool:
         if not gender:
@@ -191,6 +195,11 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
         # only a longer line that was not converted is worth a look.
         if key == "vc" and not s.get("vc") and (end - start) >= 0.7 and not kept_original:
             warn.append("vc_kept_builtin")
+        # A converted line far from its own voice's centroid (ECAPA): worth a listen, not a failure —
+        # the cutoff is a listening-list aid until the blind check confirms it (config VC_CONSIST_OUTLIER).
+        voice = voice_lines.get(str(i)) or {}
+        if voice.get("outlier"):
+            warn.append(f"voice_outlier>{th['voice_outlier']}")
 
         status = "FAIL" if fail else ("WARN" if warn else "PASS")
         counts[status] += 1
@@ -204,7 +213,7 @@ def build_qc(state: dict, *, plan: dict | None = None, osd: dict | None = None,
             "text_zh_full": s.get("text_translated_full"),
             "fit_ratio": round(fit_ratio, 3), "rate_factor": s.get("rate_factor"),
             "overrun": round(overrun, 2), "tts_fallback": bool(s.get("tts_fallback")),
-            "vc": bool(s.get("vc")), "clone_similarity": sim,
+            "vc": bool(s.get("vc")), "clone_similarity": sim, "voice_d_self": voice.get("d_self"),
             "mix_gain_db": gain, "bound_track": tid, "anchored_frames": anchored,
             "gated_frames": gated, "sr_frames": sr, "cuts_inside": int(segment_cuts.get(str(i), 0)),
             "occlusion_frames": occ, "overlap_ratio": None if ov is None else round(ov, 3),

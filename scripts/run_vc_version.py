@@ -278,6 +278,8 @@ def main() -> int:
             s["vc"] = bool(it.get("vc"))
             if it.get("guard"):
                 s["vc_guard"] = it["guard"]
+            if it.get("skipped") or it.get("tts_error"):     # why a line kept the built-in voice (voice_consistency)
+                s["vc_skip"] = it.get("skipped") or it.get("tts_error")
             converted += int(bool(it.get("vc")))
         else:
             s["audio"] = None

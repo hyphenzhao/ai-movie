@@ -146,7 +146,7 @@ STEP_CONFIG: dict[str, list[str]] = {
     "compose": [],
     "qc": ["QC_ASR_CONF_WARN", "QC_SPEAKER_CONF_WARN", "QC_FIT_WARN", "QC_FIT_FAIL",
            "QC_OVERRUN_WARN", "QC_OVERRUN_FAIL", "QC_GATED_FRAC_WARN",
-           "QC_OVERLAP_WARN", "QC_OVERLAP_FAIL"],
+           "QC_OVERLAP_WARN", "QC_OVERLAP_FAIL", "VC_CONSIST_OUTLIER"],
 }
 
 # Functions whose source text each stage's output depends on.  Hashing at
