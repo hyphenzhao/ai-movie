@@ -567,21 +567,7 @@ def call_tts(
     elif method == "sft":
         for gen in model.inference_sft(text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
-    elif method == "instruct2":
-        # spk_or_ref = base-timbre reference wav; ref_text = style instruction.
-        instruct = ref_text or _STYLE_INSTRUCT
-        # CosyVoice3's LLM asserts the <|endofprompt|> token (151646) is present
-        # in the prompt — instruct_text is fed in as prompt_text, so it must
-        # carry the marker or every llm_job thread dies on the assertion.
-        if _is_cosyvoice3(model) and "<|endofprompt|>" not in instruct:
-            instruct = instruct + "<|endofprompt|>"
-        if hasattr(model, "inference_instruct2"):
-            for gen in model.inference_instruct2(text, instruct, spk_or_ref, stream=False):
-                chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
-        else:
-            # SFT / CosyVoice-300M has no instruct2 — clone the timbre instead.
-            for gen in model.inference_cross_lingual(text, spk_or_ref, stream=False):
-                chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
+    # ("instruct2" was abandoned — it read the style instruction aloud; see the note near _MALE_REF_WAV)
     elif method == "zero_shot" and ref_text:
         # CosyVoice3 requires <|endofprompt|> in prompt_text
         if _is_cosyvoice3(model) and "<|endofprompt|>" not in ref_text:

@@ -793,8 +793,10 @@ def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
             out[i] = piece
     if fallback:
         log(f"  {len(fallback)} segment(s) in unsplittable units: translating them individually")
+        # these lines skipped the unit pass: report them so the polish sees F5_split_fallback
         redo = translator.translate_segments(
-            [segs[i] for i in fallback], engine=engine, glossary=gloss, report=None)
+            [dict(segs[i], split_fallback=True) for i in fallback], engine=engine, glossary=gloss,
+            report=polish_rows)
         for i, zh in zip(fallback, redo):
             out[i] = zh
     for k, u in enumerate(units):
@@ -1480,8 +1482,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="refine speaker attribution with an LLM over the transcript")
     ap.add_argument("--dialogue-model", default=None)
     ap.add_argument("--translate-helper", default=None)
-    # Default to sakura only: the gpt-oss polish stage cannot complete on
-    # this ROCm build (see Documentation/v2-quality-upgrade.md).  Pass a
+    # Default: Sakura draft + flagged-only Qwen polish (Documentation/v3.1-asr-translation.md).
+    # gpt-oss engines are unusable here (>60 GB Ollama models hang on this box).  Pass a
     # comma-separated list to compare engines in one run.
     ap.add_argument("--engines", default="sakura+qwen")
     ap.add_argument("--no-units", action="store_true",

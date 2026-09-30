@@ -218,7 +218,8 @@ def format_for_prompt(glossary: dict[str, dict], texts: list[str]) -> str:
     if not glossary:
         return ""
     blob = "\n".join(texts)
-    hits = [(k, v) for k, v in glossary.items() if k and k in blob]
+    # boundary-aware: a plain substring test let 「かんな」 fire on 「わかんない」
+    hits = [(k, v) for k, v in glossary.items() if k and _term_pattern(k).search(blob)]
     if not hits:
         return ""
     return "；".join(f"{k}={v['zh']}" for k, v in hits)

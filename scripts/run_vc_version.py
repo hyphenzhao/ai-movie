@@ -43,10 +43,6 @@ if str(ROOT) not in sys.path:
 # as male — while this one holds the ratio at 0.97-1.01. ECAPA barely
 # separated the two (0.44 vs 0.70), because that embedding is largely
 # pitch-invariant; the F0 ratio is what exposes it.
-DEFAULT_REFS = {
-    "female": "workspace/output_test/refs_v2/ref_seg0027_female.wav",
-    "male": "workspace/output_test/synthesized/ref_S1.wav",
-}
 # Any segment whose timing moves more than one frame breaks the premise that
 # v1's lip-sync video can be reused.
 FRAME_TOLERANCE = 1.0 / 29.97
@@ -161,8 +157,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("state", help="workspace/<name>/state.json from the v1 run")
     ap.add_argument("--out-name", default="v2_cloned")
-    ap.add_argument("--ref-female", default=DEFAULT_REFS["female"])
-    ap.add_argument("--ref-male", default=DEFAULT_REFS["male"])
+    ap.add_argument("--ref-female", default=None, help="explicit female reference clip (else --refs-json / --profiles)")
+    ap.add_argument("--ref-male", default=None, help="explicit male reference clip")
     ap.add_argument("--refs-json", default=None,
                     help="refs_auto/refs.json from auto_select_refs.py; overrides --ref-*; "
                          "if no gender qualified, registers the v1 film as state['vc']")
@@ -218,9 +214,16 @@ def main() -> int:
         log(f"profiles {Path(args.profiles).name} ({profiles_sha1[:8]}): "
             f"{ {k: v.get('profile') for k, v in refs.items()} }")
     else:
+        if not (args.ref_female or args.ref_male or args.refs_json):
+            log("no reference given: pass --profiles, --refs-json or --ref-female/--ref-male "
+                "(a baked-in default once cloned every film with output_test's voice)")
+            return 2
         for spk, meta in ((state["asr"]["diarization"].get("speakers")) or {}).items():
             g = meta.get("gender")
-            p = ROOT / (args.ref_female if g == "female" else args.ref_male)
+            chosen = args.ref_female if g == "female" else args.ref_male
+            if not chosen:
+                continue
+            p = ROOT / chosen
             if p.exists():
                 refs[spk] = {"ref_audio": str(p), "gender": g}
     log(f"references: { {k: Path(v['ref_audio']).name for k, v in refs.items()} }")

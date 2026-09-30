@@ -1683,7 +1683,8 @@ def _polish_flagged(
         draft = out[i].strip()
         if not ja or not draft:
             continue
-        flags = [f for f in flag_line(ja, draft) if f in _FLAG_HINTS]
+        flags = [f for f in flag_line(ja, draft, split_fallback=bool(seg.get("split_fallback")))
+                 if f in _FLAG_HINTS]
         if not flags:
             continue
         row = {"idx": i, "flags": ",".join(flags), "ja": ja, "draft": draft,
