@@ -47,8 +47,11 @@ echo "enrolment chunks: $ENROL"
 for IDX in $ENROL; do
   CN="${NAME}_p${IDX}"
   ln -sfn "$SPLIT/chunks/$CN.mp4" "$ROOT/inputs/$CN.mp4"
-  # through tts so build_profiles can try each candidate reference on this person's real lines
-  $PY -u scripts/run_pipeline.py "$ROOT/inputs/$CN.mp4" --name "$CN" --steps demux,separate,osd,asr,glossary,translate,tts < /dev/null \
+  # through tts so build_profiles can try each candidate reference on this person's real lines;
+  # PIPE_ARGS as in run_v3.sh, or an option such as --sweep-alt gives these chunks a different asr
+  # fingerprint from their later pass and they transcribe twice
+  # shellcheck disable=SC2086
+  $PY -u scripts/run_pipeline.py "$ROOT/inputs/$CN.mp4" --name "$CN" --steps demux,separate,osd,asr,glossary,translate,tts ${PIPE_ARGS:-} < /dev/null \
     || { echo "enrol: $CN asr failed"; echo "$IDX enrol asr_failed" >> "$SPLIT/status.txt"; }
 done
 if [ ! -s "$ROOT/workspace/$NAME/profiles.json" ] || [ "${REBUILD_PROFILES:-0}" = 1 ]; then

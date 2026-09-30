@@ -166,7 +166,9 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.content.classify_segments", "ai_movie.content.raw_hallucination", "ai_movie.asr._collect", "ai_movie.asr._sweep_pass", "ai_movie.units.is_nonlexical",
             "ai_movie.segmenter.is_hallucination", "ai_movie.segmenter._flush",
             "ai_movie.asr._transcribe_whisper_gpu", "ai_movie.asr._sweep_windows",
-            "ai_movie.asr._transcribe_sweep"],
+            "ai_movie.asr._transcribe_sweep", "ai_movie.asr._pick_alt_audio",
+            "ai_movie.asr._resolve_alt_source", "ai_movie.asr._sweep_alt_texts",
+            "ai_movie.asr.AnimeWhisper"],
     "enrol": ["run_pipeline.step_enrol", "ai_movie.profiles.assign_profiles",
               "ai_movie.profiles.speaker_centroids", "ai_movie.faces.embed_track_identity",
               "ai_movie.faces._embed_face", "ai_movie.faces.bind_speakers_to_tracks",
@@ -370,6 +372,29 @@ def _args_extra(step: str, args) -> dict:
         if k in _OPTIONAL_EXTRA and v is None:
             continue
         out[k] = v
+    if step == "asr":
+        out.update(_sweep_alt_extra(args))
+    return out
+
+
+def _sweep_alt_extra(args) -> dict:
+    """The sweep's second decoder as the asr stage *effectively* ran it.
+
+    The flag's value or the config default — never ``None`` and never the
+    default's repr on its own — so a ``--sweep-alt anime`` validation run and
+    the post-adoption default run (config flipped, no flag) share one
+    fingerprint and nothing is re-run twice.  The anime decode parameters are
+    recorded only when anime is the decoder: in whisper mode they cannot
+    change the output, and tuning them must not re-stamp every chunk.
+    """
+    from ai_movie import asr as _asr, config as _cfg
+    decoder = getattr(args, "sweep_alt", None) or _cfg.ASR_SWEEP_ALT_DECODER
+    mode = getattr(args, "sweep_alt_source", None) or _cfg.ASR_SWEEP_ALT_SOURCE
+    out = {"sweep_alt": decoder, "sweep_alt_source": _asr._resolve_alt_source(decoder, mode)}
+    if decoder == "anime":
+        out["sweep_alt_params"] = {k: repr(getattr(_cfg, k)) for k in
+                                   ("ASR_ANIME_DTYPE", "ASR_ANIME_NO_REPEAT_NGRAM",
+                                    "ASR_ANIME_MAX_NEW_TOKENS", "ASR_ANIME_ATTN")}
     return out
 
 
@@ -614,16 +639,26 @@ def step_asr(ctx: Ctx, args) -> None:
 
     # Pass 1: transcribe and split on punctuation / pauses only.
     log(f"ASR: transcribing ({asr_tag})…")
+    # alt_audio is the "other" source for the sweep's second decode, offered only when the
+    # separation is trusted; a "same"-mode decoder (anime) hears the primary and needs no file
     res = asr_mod.transcribe_all(
         [asr_audio], language=args.language, backend=args.asr_backend,
         diarize=False,
         sweep=ASR_SWEEP_ENABLED,
         alt_audio=(str(vocals) if asr_tag == "mix" else str(audio)) if trusted else None,
+        sweep_alt=args.sweep_alt, sweep_alt_source=args.sweep_alt_source,
         file_progress_cb=lambda i, p: log(f"  ASR {p}%") if p % 25 == 0 else None,
     )
     segments = res[0].get("segments", [])
     words = res[0].get("words", [])
     log(f"ASR: {len(segments)} segments, {len(words)} words")
+    sweep_alt = res[0].get("sweep_alt")
+    if sweep_alt:
+        sweep_alt["source"] = {"same": asr_tag, "other": "vocals" if asr_tag == "mix" else "mix"}[sweep_alt["source"]]
+        log(f"ASR: sweep alt decoder {sweep_alt['name']} on {sweep_alt['source']}"
+            + (f" (requested {sweep_alt['requested']})" if sweep_alt["requested"] != sweep_alt["name"] else ""))
+    for e in res[0].get("chunk_errors") or []:
+        log(f"  ASR warning: {e}")
 
     diar = None
     if not args.no_diarize:
@@ -673,7 +708,7 @@ def step_asr(ctx: Ctx, args) -> None:
                      "pass": s.get("pass", "vad"), "asr_conf": s.get("asr_conf"),
                      "no_speech_prob": s.get("no_speech_prob"), "avg_logprob": s.get("avg_logprob"),
                      "compression_ratio": s.get("compression_ratio"), "speaker": s.get("speaker"),
-                     "text": s.get("text"), "alt_text": s.get("alt_text")})
+                     "text": s.get("text"), "alt_text": s.get("alt_text"), "alt_by": s.get("alt_by")})
     artifacts.export_csv(rows, ctx.deliver / "01_content.csv")
 
     (ctx.work / "asr_words.json").write_text(
@@ -689,7 +724,12 @@ def step_asr(ctx: Ctx, args) -> None:
 
     ctx.put("asr", {"segments": segments, "diarization": diar,
                     "language": args.language, "asr_audio": asr_tag,
-                    "gender_source": (diar or {}).get("gender_source")})
+                    "gender_source": (diar or {}).get("gender_source"),
+                    # sweep record: which second decoder really ran, every window with both readings
+                    # (scripts/ab_sweep_alt.py replays them), and the decoder warnings (adoption gate:
+                    # no anime fallback)
+                    "sweep_alt": sweep_alt, "sweep_windows": res[0].get("sweep_windows"),
+                    "chunk_errors": res[0].get("chunk_errors") or []})
 
 
 def step_enrol(ctx: Ctx, args) -> None:
@@ -1473,6 +1513,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--diarize-backend", default=DIARIZE_BACKEND,
                     choices=["pyannote", "ecapa"],
                     help="who-is-speaking: pyannote clusters (worker) or pitch+ECAPA")
+    ap.add_argument("--sweep-alt", default=None, choices=[None, "whisper", "anime"],
+                    help="second decoder of the sweep windows: large-v3 on the other source or "
+                         "anime-whisper on the same audio (default config ASR_SWEEP_ALT_DECODER)")
+    ap.add_argument("--sweep-alt-source", default=None, choices=[None, "auto", "same", "other"],
+                    help="audio the second decoder hears (default config ASR_SWEEP_ALT_SOURCE)")
     ap.add_argument("--num-speakers", type=int, default=None)
     ap.add_argument("--no-diarize", action="store_true")
     # OFF by default: the only local model strong enough for this task
