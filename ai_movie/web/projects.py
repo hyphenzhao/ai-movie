@@ -40,7 +40,8 @@ STEP_LABELS = {
     "enhance": "人脸增强", "compose": "合成视频", "qc": "质检",
     "v2": "原声音色(v2)", "deliver": "交付包",
 }
-ENGINES = ["sakura", "sakura+gptoss", "gptoss", "hy-mt2", "hy-mt2+gptoss", "hy-mt2+sakura"]
+# run_pipeline's default ("sakura+qwen") first so the select can show it.
+ENGINES = ["sakura+qwen", "sakura", "sakura+gptoss", "gptoss", "hy-mt2", "hy-mt2+gptoss", "hy-mt2+sakura"]
 
 # Options the UI edits, in the order the panels show them.  Each maps 1:1 to
 # a run_pipeline.py flag (see build_argv).

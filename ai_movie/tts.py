@@ -574,9 +574,13 @@ def call_tts(
             ref_text = ref_text + "<|endofprompt|>"
         for gen in model.inference_zero_shot(text, ref_text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
-    else:
+    elif method in ("cross_lingual", "zero_shot"):
+        # zero_shot without a prompt text is cross-lingual by construction
         for gen in model.inference_cross_lingual(text, spk_or_ref, stream=False):
             chunks.append(gen["tts_speech"].squeeze(0).cpu().numpy())
+    else:
+        raise ValueError(f"unknown TTS method {method!r} "
+                         f"(expected sft / zero_shot / cross_lingual / vc)")
     return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
 
@@ -1387,14 +1391,16 @@ def synthesize(
     mode:
         ``'gender'`` — clear bundled voice matched to detected gender (default).
         ``'clone'``  — voice cloning from the best segment of *reference_audio*.
-        ``'style'``  — Taiwanese / soft female voice via CosyVoice3 instruct2.
+        ``'style'``  — Taiwanese / soft female voice: zero-shot cloning of the
+                       bundled soft reference clip on CosyVoice3 (instruct2
+                       was abandoned — it read the style instruction aloud).
 
     SFT synthesis runs in-process on the calling (main) thread.  Qwen-based
     synthesis (CosyVoice2/3 — any non-SFT method) is delegated to an
     isolated subprocess and may therefore be called from any thread.
     """
-    # 'style' needs an instruct2-capable model (CosyVoice3 > CosyVoice2);
-    # the SFT model has no instruct2 and would silently fall back.
+    # 'style' needs a zero-shot-capable model (CosyVoice3 > CosyVoice2);
+    # the SFT model has built-in speakers only and would silently fall back.
     prefer = "cosyvoice3" if mode == "style" else None
     choice = resolve_model_choice(prefer)
 

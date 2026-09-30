@@ -286,13 +286,22 @@ def restore_terms(text: str, mapping: dict[str, str]) -> str:
     return out
 
 
+_HONORIFICS = ("さん", "ちゃん", "くん", "君", "様")
+
+
 def _term_pattern(ja: str) -> "re.Pattern":
     esc = re.escape(ja)
+    # A key that already ends in an honorific is a confirmed name: match it
+    # as is.  (The hiragana look-ahead below would otherwise refuse
+    # 「かねちゃんにまた」 because に follows — measured on SONE-846_p14:
+    # substring 1 hit, guarded pattern 0.)
+    if any(ja.endswith(h) for h in _HONORIFICS):
+        return re.compile(esc)
     # An honorific confirms a name, so match regardless of what follows.
     # Without one, only guard the *hiragana* terms: a katakana or kanji term
     # followed by a particle (ドラマを) is a normal reading, whereas a hiragana
     # term followed by more hiragana (わかんない) is the middle of another word.
-    alts = [esc + "(?:さん|ちゃん|くん|君|様)"]
+    alts = [esc + "(?:" + "|".join(_HONORIFICS) + ")"]
     if ja and ja[-1] in _HIRAGANA_SET:
         alts.append(esc + "(?![" + _HIRAGANA + "])")
     else:
@@ -331,11 +340,16 @@ def check_consistency(glossary: dict[str, dict], segments: list[dict],
     for k, v in (glossary or {}).items():
         zh = v.get("zh") or ""
         occ = hit = 0
+        pat = _term_pattern(k) if k else None
         for seg, tr in zip(segments, translations):
-            if k in (seg.get("text") or ""):
-                occ += 1
-                if zh and zh in (tr or ""):
-                    hit += 1
+            src = seg.get("text") or ""
+            # substring first: a cheap superset filter before the word-boundary
+            # pattern (かんな inside わかんない is NOT an occurrence)
+            if pat is None or k not in src or not pat.search(src):
+                continue
+            occ += 1
+            if zh and zh in (tr or ""):
+                hit += 1
         if occ:
             rows.append({"ja": k, "zh": zh, "occurrences": occ, "applied": hit,
                          "rate": round(hit / occ, 3)})

@@ -178,7 +178,11 @@ STEP_CODE: dict[str, list[str]] = {
                   "ai_movie.translator._sakura_translate",
                   "ai_movie.translator._polish_flagged",
                   "ai_movie.units.joins", "ai_movie.units.group_units",
-                  "ai_movie.units.split_translation", "ai_movie.units.flag_line"],
+                  "ai_movie.units.split_translation", "ai_movie.units.flag_line",
+                  # the glossary shapes the prompt and the pinned terms; all three
+                  # depend on _term_pattern (a hash of the callers cannot see it)
+                  "ai_movie.glossary.format_for_prompt", "ai_movie.glossary.protect_terms",
+                  "ai_movie.glossary._term_pattern"],
     "tts": ["ai_movie.tts.run_cloned_synthesis", "ai_movie.tts.build_seg_refs",
             "run_pipeline._synthesize",
             "ai_movie.diarize.extract_speaker_references",
@@ -810,12 +814,15 @@ def _translate_by_units(translator, segs: list[dict], units: list[list[int]],
             out[i] = piece
     if fallback:
         log(f"  {len(fallback)} segment(s) in unsplittable units: translating them individually")
-        # these lines skipped the unit pass: report them so the polish sees F5_split_fallback
         redo = translator.translate_segments(
-            [dict(segs[i], split_fallback=True) for i in fallback], engine=engine, glossary=gloss,
-            report=polish_rows)
+            [segs[i] for i in fallback], engine=engine, glossary=gloss, report=polish_rows)
         for i, zh in zip(fallback, redo):
             out[i] = zh
+            # Recorded on the segment itself (not a copy) so the state carries
+            # it: eval B6 / the reviewer can see which lines lost their unit
+            # context.  It is bookkeeping, not a polish flag — the polish
+            # never had a hint for it (v3.4 E12).
+            segs[i]["split_fallback"] = True
     for k, u in enumerate(units):
         for i in u:
             segs[i]["unit_id"] = k
@@ -877,11 +884,16 @@ def step_translate(ctx: Ctx, args) -> None:
                 w = csv.DictWriter(fh, fieldnames=list(rows[0]))
                 w.writeheader()
                 w.writerows(rows)
+    n_fallback = sum(1 for s in segs if s.get("split_fallback"))
+    if n_fallback:
+        log(f"  split fallback: {n_fallback} segment(s) re-translated individually "
+            f"after an unsplittable unit")
     ctx.put("translate", {"segments": segs, "variants": variants, "chosen": chosen,
                           "units": units,
                           "polish": {"flagged": len(polish_rows),
                                      "accepted": sum(1 for r in polish_rows
-                                                     if r["status"] == "accepted")}})
+                                                     if r["status"] == "accepted")},
+                          "split_fallback": n_fallback})
 
 
 def _visible_chars(text: str) -> int:
