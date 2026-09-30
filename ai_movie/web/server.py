@@ -225,35 +225,46 @@ def _edit(fn, *a, **kw):
         raise HTTPException(exc.code, str(exc))
 
 
+# Every edit route passes ``who=_user(request)`` (Remote-User set by Authelia on the
+# tunnel path, "lan" otherwise) so the edit log can say who made the change.
+
 @app.put("/api/projects/{name}/segments/{idx}/translation")
-def put_translation(name: str, idx: int, body: dict = Body(...)):
+def put_translation(name: str, idx: int, request: Request, body: dict = Body(...)):
     _project_or_404(name)
     _no_job(name)
-    return _edit(E.set_translation, name, idx, body.get("text", ""))
+    return _edit(E.set_translation, name, idx, body.get("text", ""), who=_user(request))
 
 
 @app.put("/api/projects/{name}/segments/{idx}/speaker")
-def put_speaker(name: str, idx: int, body: dict = Body(...)):
+def put_speaker(name: str, idx: int, request: Request, body: dict = Body(...)):
     _project_or_404(name)
     _no_job(name)
-    return _edit(E.set_speaker, name, idx, body.get("speaker"), body.get("gender"))
+    return _edit(E.set_speaker, name, idx, body.get("speaker"), body.get("gender"), who=_user(request))
 
 
 @app.post("/api/projects/{name}/speakers")
-def post_speaker(name: str, body: dict = Body(...)):
+def post_speaker(name: str, request: Request, body: dict = Body(...)):
     _project_or_404(name)
     _no_job(name)
-    return _edit(E.add_speaker, name, body.get("gender", ""))
+    return _edit(E.add_speaker, name, body.get("gender", ""), who=_user(request))
+
+
+@app.get("/api/projects/{name}/edits")
+def get_edits(name: str, n: int = 50, stage: str | None = None, idx: int | None = None,
+              who: str | None = None):
+    """Tail of the project's edit log (workspace/<name>/edits.jsonl), oldest first."""
+    _project_or_404(name)
+    return E.read_edits(name, n=max(1, min(int(n), 1000)), stage=stage or None, idx=idx, who=who or None)
 
 
 # ── film-wide speaker profiles (long films) ──
 
 @app.put("/api/projects/{name}/speakers/{spk}/profile")
-def put_speaker_profile(name: str, spk: str, body: dict = Body(...)):
+def put_speaker_profile(name: str, spk: str, request: Request, body: dict = Body(...)):
     """Pin a chunk speaker to a profile id (``{"profile": "P0"}``; null = automatic)."""
     _project_or_404(name)
     _no_job(name)
-    return _edit(E.set_speaker_profile, name, spk, body.get("profile"))
+    return _edit(E.set_speaker_profile, name, spk, body.get("profile"), who=_user(request))
 
 
 @app.get("/api/films/{film}/profiles")
@@ -262,23 +273,32 @@ def get_profiles(film: str):
 
 
 @app.put("/api/films/{film}/profiles/{pid}")
-def put_profile(film: str, pid: str, body: dict = Body(...)):
+def put_profile(film: str, pid: str, request: Request, body: dict = Body(...)):
     """Edit a profile: ref_audio / merge_into / name / default_for_gender."""
-    return _edit(E.update_profile, film, pid, body)
+    return _edit(E.update_profile, film, pid, body, who=_user(request))
+
+
+@app.get("/api/films/{film}/edits")
+def get_film_edits(film: str, n: int = 50):
+    """Tail of the film's profile-edit log (workspace/<film>/edits.jsonl)."""
+    if not P.valid_name(film):
+        raise HTTPException(400, "invalid film name")
+    return E.read_edits(film, n=max(1, min(int(n), 1000)), film=True)
 
 
 @app.put("/api/projects/{name}/glossary")
-def put_glossary(name: str, body: dict = Body(...)):
+def put_glossary(name: str, request: Request, body: dict = Body(...)):
     _project_or_404(name)
     _no_job(name)
-    return _edit(E.set_glossary, name, body.get("terms") or {}, bool(body.get("apply_to_translation")))
+    return _edit(E.set_glossary, name, body.get("terms") or {}, bool(body.get("apply_to_translation")),
+                 who=_user(request))
 
 
 @app.put("/api/projects/{name}/faces/binding")
-def put_binding(name: str, body: dict = Body(...)):
+def put_binding(name: str, request: Request, body: dict = Body(...)):
     _project_or_404(name)
     _no_job(name)
-    return _edit(E.set_face_binding, name, body.get("binding") or {})
+    return _edit(E.set_face_binding, name, body.get("binding") or {}, who=_user(request))
 
 
 # ── jobs ──

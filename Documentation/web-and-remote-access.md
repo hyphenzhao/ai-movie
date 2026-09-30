@@ -37,7 +37,14 @@ Web 服务 `KillMode=process`：重启 Web 不会杀正在跑的流水线，任�
   （`run_pipeline.restamp_after_edit`）；被保留的步骤（改说话人时的 glossary/translate）刷新 `up` 保持有效，其余下游自然 STALE。
   改译文 → tts 起过期；改说话人/性别（`diarize.assign_speaker_for_gender`，无同性别说话人则新建 `S<k>`）→ tts 起过期、翻译保留；
   术语表 → translate 过期，或“仅应用到现有译文”做字符串替换；人脸绑定 → 选项 `--faces-bind S0=3,S1=none`（faces 过期）。
-  每次编辑前备份 `web/state_backups/`（保留 20 份）。任务运行/排队中的工程拒绝编辑（409）。
+  每次编辑前备份 `web/state_backups/<时间戳>-NNN.json`（同一秒多次编辑不覆盖；保留 20 份；校验不过的编辑不备份）。任务运行/排队中的工程拒绝编辑（409）。
+- **编辑日志**：每次成功编辑（保存之后）追加一行到 `workspace/<name>/edits.jsonl`（全片档案编辑到 `workspace/<film>/edits.jsonl`，
+  并备份到 `profiles_backups/`），字段 `kind/stage/idx/before/after/speaker/who/at/edits_n/backup/restamped/consumers`。
+  `who` 来自 `Remote-User`（Authelia 隧道）或 `lan`；`restamped` 是“是否调用了 restamp_after_edit”，`consumers` 是“真正要重做的东西”
+  （改译文 → tts；改说话人 → tts；术语表 → translate，或“应用到译文”且有替换 → tts；人脸绑定 → faces；
+  档案钉定 → v2（没有缓存步骤依赖 enrol，v2 通过 `_web.vc_deps` 显示过期）；改全片档案 → 指纹签名变了才是各分块的 enrol@chunk，否则只是 v2）。
+  术语表记录的是差异不是快照，回滚要用 state 备份。查看：`python scripts/runs.py <name> --edits [--stage --idx --who -n]`、
+  `GET /api/projects/<name>/edits?n=&stage=`；`runs.py <name>` 概览行里给出“最近一次运行开始之后的编辑数”，但过期与否以 `--status-json` 为准。
 - **媒体**：`/api/media?p=<绝对路径>` 只允许 `workspace/ inputs/ deliver/` 下白名单扩展名，`FileResponse` 原生 Range；下载带 UTF-8 文件名。
 - **上传**：8 MB 分块（`/api/uploads/init|{id}/{n}|finalize`）以穿过隧道与 Cloudflare 的 100 MB 单请求上限；也可 scp 到 `inputs/` 后“导入”。
 
@@ -50,7 +57,7 @@ Web 服务 `KillMode=process`：重启 Web 不会杀正在跑的流水线，任�
 
 ```
 bash scripts/web_smoke.sh [http://host:8000] [project]   # health/状态/Range/穿越/SSE/下载/首页
-.venv/bin/python tests/web/test_edits.py                  # 编辑语义与指纹过期（合成工作区）
+.venv/bin/python tests/web/test_edits.py                  # 编辑语义与指纹过期、编辑日志、备份后缀、runs.py 视图、who 透传（临时目录里的合成工作区）
 node scripts/web_check.js                                  # app.js 语法、id 引用、无外链、API 路径与路由一致
 ```
 实测：三项全部通过；远程链路用密码 + TOTP 登录后 `/api/health`、`/`、`/static/app.js`、`/api/projects` 均 200，Range 请求 206。

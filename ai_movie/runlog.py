@@ -197,14 +197,42 @@ class RunLog:
 
 
 def append_event(path: Path, kind: str, **fields) -> None:
-    """One JSON line into any events file (used by the shell orchestrators)."""
+    """One JSON line into any events file (shell orchestrators, the web edit log).
+
+    The line goes out as a single ``os.write`` on an O_APPEND descriptor, not
+    through a buffered text writer: concurrent appenders (two web threadpool
+    workers, a chunk runner and the orchestrator) then never interleave
+    inside a line, whatever its length — Python's 8 KiB TextIOWrapper buffer
+    would split a longer record into several writes.
+    """
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"t": round(time.time(), 3), "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                 "kind": kind, **fields}, ensure_ascii=False, default=str) + "\n")
+        line = json.dumps({"t": round(time.time(), 3), "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           "kind": kind, **fields}, ensure_ascii=False, default=str) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
     except Exception:                                   # noqa: BLE001
         pass
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    """Every parseable line of a JSONL file; absent or unreadable file → ``[]``."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for ln in text.splitlines():
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
 
 
 if __name__ == "__main__":                              # python -m ai_movie.runlog <events.jsonl> <kind> k=v …

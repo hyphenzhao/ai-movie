@@ -485,11 +485,12 @@ def _kill_group(pid: int | None) -> None:
 
 
 def _record_vc_deps(name: str) -> None:
-    """Remember which v1 fingerprints the v2 film was built from."""
+    """Remember which v1 fingerprints the v2 film was built from (``P.VC_DEPS``: fit, compose and
+    enrol — the clone reads ``enrol.speaker_profile``, so a profile pin must show v2 as stale)."""
     try:
         st = P.load_state(name)
         fps = st.get("_fp") or {}
-        st.setdefault("_web", {})["vc_deps"] = {k: (fps.get(k) or {}).get("hash") for k in ("fit", "compose")}
+        st.setdefault("_web", {})["vc_deps"] = {k: (fps.get(k) or {}).get("hash") for k in P.VC_DEPS}
         P.rp.save_state(P.state_path(name), st)
     except Exception:                                   # noqa: BLE001
         pass
