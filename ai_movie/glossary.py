@@ -326,13 +326,24 @@ def check_consistency(glossary: dict[str, dict], segments: list[dict],
 
     Reported in the acceptance run: a term present in the source but missing
     from the translation means the pin did not take.
+
+    Occurrences are counted with the same boundary-aware :func:`_term_pattern`
+    the pipeline pins with: a plain substring test counted 「かんな」 inside
+    「わかんない」 ("don't know") and reported three "misses" on the release
+    films that no enforce model could ever reach — :func:`translator.enforce_glossary`
+    never attempts them, correctly, because they are not the name.
     """
     rows = []
     for k, v in (glossary or {}).items():
         zh = v.get("zh") or ""
+        if not k:
+            continue
+        pat = _term_pattern(k)
         occ = hit = 0
         for seg, tr in zip(segments, translations):
-            if k in (seg.get("text") or ""):
+            text = seg.get("text") or ""
+            # substring first: a cheap superset of the pattern
+            if k in text and pat.search(text):
                 occ += 1
                 if zh and zh in (tr or ""):
                     hit += 1

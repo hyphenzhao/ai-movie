@@ -401,7 +401,9 @@ COMPACT_TRIGGER_RATIO = 1.30      # natural duration / slot above which we rewri
 COMPACT_TARGET_RATIO = 1.15       # budget the rewrite for this ratio (fit absorbs it)
 COMPACT_MAX_ROUNDS = 2            # rewrite → re-synth → re-measure, at most twice
 COMPACT_MIN_CHARS = 4             # never ask for fewer visible characters than this
-COMPACT_MODEL = "dolphin-mixtral:8x7b"   # same instruct model enforce_glossary uses
+# COMPACT_MODEL (the instruct model that rewrites the line) is defined next to
+# GLOSSARY_ENFORCE_MODEL in the glossary block below: both alias
+# OLLAMA_POLISH_MODEL, which is only known after the Ollama block.
 TTS_COMPACT_SEC_PER_CHAR_DEFAULT = 0.24  # only when a speaker has no measurable lines
 
 # ── Vocal Separation settings ──────────────────────────────────
@@ -622,15 +624,32 @@ OLLAMA_EXCLUSIVE_ABOVE_GB = 40.0
 # (user entries always win).
 GLOSSARY_PATH = str(ROOT_DIR / "asset" / "glossary.json")
 
-# Model used to normalise pinned terms in finished translations.
+# Model used to normalise pinned terms in finished translations
+# (translator.enforce_glossary) and to shorten over-slot lines in the compact
+# stage (translator.compact_translation).
 #
 # Deliberately NOT the translation model: Sakura is a completion-style
 # translator and cannot follow a correction instruction — asked to fix a name
 # it returned 小卡娜 / 小勘 / 小勘娜.  A general instruct model handles the
-# one-sentence rewrite reliably (4/4 on the reference cases).  Bulk structured
-# output from the same model is unreliable, which is why enforcement is
-# per-sentence.
-GLOSSARY_ENFORCE_MODEL = "dolphin-mixtral:8x7b"
+# one-sentence rewrite reliably (dolphin-mixtral:8x7b scored 4/4 on the
+# reference cases).  Bulk structured output from the same model is
+# unreliable, which is why enforcement is per-sentence.
+#
+# v3.4: both alias the flagged-line polish model, so the three single-sentence
+# rewrite uses (polish, enforce, compact) share one model, one smoke test
+# (scripts/smoke_polish_model.py) and one env override (AI_MOVIE_POLISH_MODEL);
+# dolphin-mixtral:8x7b stays installed and in OLLAMA_MODEL_SIZE_GB as the
+# smoke-test fallback.  Two properties of that model matter here:
+#   * it is registered with the "thinking" capability (``ollama show``), so
+#     every request must send think=False — otherwise its reasoning consumes
+#     the small num_predict and the reply comes back empty: enforce would
+#     silently fix nothing and compact would return None for every line;
+#   * it is below OLLAMA_EXCLUSIVE_ABOVE_GB (24 GB) by design, so Sakura stays
+#     resident across draft → polish → enforce: one model load fewer than with
+#     dolphin, and translate ends with ≈ 37 GB resident instead of ≈ 64 GB.
+# Text-level A/B against dolphin: scripts/ab_compact_enforce.py.
+GLOSSARY_ENFORCE_MODEL = OLLAMA_POLISH_MODEL
+COMPACT_MODEL = OLLAMA_POLISH_MODEL
 
 # Auto-extract proper nouns / slang with the LLM before translating.
 GLOSSARY_AUTO_EXTRACT = True
