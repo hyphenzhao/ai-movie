@@ -22,6 +22,9 @@ exec > >(tee -a "$LOG") 2>&1
 export HF_HUB_OFFLINE=1
 STALL_MIN="${STALL_MIN:-40}"                        # minutes without log output = hung
 MIN_SPEECH_MIN="${MIN_SPEECH_MIN:-0.03}"          # < ~2 s of detected speech → nothing to dub
+RERUN="${RERUN:-}"                                # tag (e.g. v3.4): push every dub chunk through run_v3.sh again after a code
+                                                  # change; the stage cache decides what really re-runs, and a chunk already
+                                                  # re-run under this tag (status.txt "rerun=<tag>") is skipped on a restart
 
 say() { echo; echo "##### [$(date '+%m-%d %H:%M:%S')] $NAME · $* #####"; }
 # Film-level event log (JSON lines, with a host snapshot): what started, what ended, with which result.
@@ -70,7 +73,9 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
   ln -sfn "$FILE" "$ROOT/inputs/$CN.mp4"
   FINAL="$ROOT/workspace/$CN/output/v2_cloned_dubbed.mp4"
   if [ "$MODE" = "pass" ]; then echo "p$IDX: no speech ($SPEECH min) → passthrough"; echo "$IDX pass nospeech" >> "$SPLIT/status.txt"; continue; fi
-  if { [ -s "$FINAL" ] || grep -q "^$IDX dub v1_only" "$SPLIT/status.txt" 2>/dev/null; } && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then echo "p$IDX: already done"; continue; fi
+  if [ -n "$RERUN" ]; then
+    if grep -q "^$IDX dub .*rerun=$RERUN$" "$SPLIT/status.txt" 2>/dev/null; then echo "p$IDX: already re-run ($RERUN)"; continue; fi
+  elif { [ -s "$FINAL" ] || grep -q "^$IDX dub v1_only" "$SPLIT/status.txt" 2>/dev/null; } && grep -q "DONE in" "$ROOT/workspace/$CN/run_v3.log" 2>/dev/null; then echo "p$IDX: already done"; continue; fi
   say "chunk p$IDX (speech $SPEECH min)"
   C0=$(date +%s)
   ev chunk_start chunk="$CN" speech_min="$SPEECH"
@@ -100,9 +105,9 @@ while IFS=$'\t' read -r IDX FILE MODE SPEECH; do
     [ "$TRY" -lt 3 ] && echo "p$IDX: try $TRY ended rc=$RC, retrying"
   done
   ev chunk_end chunk="$CN" rc="$RC" minutes="$(( ($(date +%s)-C0)/60 ))" final="$([ -s "$FINAL" ] && echo yes || echo no)" run="$(readlink "$ROOT/workspace/$CN/runs/latest" 2>/dev/null)"
-  if [ $RC -eq 0 ] && [ -s "$FINAL" ]; then echo "$IDX dub ok $(( ($(date +%s)-C0)/60 ))min" >> "$SPLIT/status.txt"
+  if [ $RC -eq 0 ] && [ -s "$FINAL" ]; then echo "$IDX dub ok $(( ($(date +%s)-C0)/60 ))min${RERUN:+ rerun=$RERUN}" >> "$SPLIT/status.txt"
   elif [ $RC -eq 0 ] && [ -s "$ROOT/workspace/$CN/output/${CN}_dubbed.mp4" ]; then
-    echo "p$IDX: no cloned version → the built-in-voice dub is used for this chunk"; echo "$IDX dub v1_only" >> "$SPLIT/status.txt"
+    echo "p$IDX: no cloned version → the built-in-voice dub is used for this chunk"; echo "$IDX dub v1_only${RERUN:+ rerun=$RERUN}" >> "$SPLIT/status.txt"
   else echo "p$IDX: pipeline rc=$RC → passthrough for this chunk"; echo "$IDX pass failed_rc$RC" >> "$SPLIT/status.txt"; fi
 done < "$SPLIT/chunks.tsv"
 

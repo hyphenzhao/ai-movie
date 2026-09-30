@@ -376,6 +376,14 @@ def _args_extra(step: str, args) -> dict:
 _OPTIONAL_EXTRA = {"faces_bind", "fusion", "profiles"}
 
 
+def _fp_repr(value) -> str:
+    """``repr`` with the repo root spelled ``<ROOT>``: path constants such as ``ASR_MODEL_SIZE`` embed
+    ``ROOT_DIR``, so the same code fingerprinted differently from a git worktree
+    (``…/ai-movie-v34``) and every worktree run re-stamped asr and everything below it."""
+    from ai_movie import config as _cfg
+    return repr(value).replace(str(_cfg.ROOT_DIR), "<ROOT>")
+
+
 def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
     """Everything ``step``'s output depends on, plus a combined hash."""
     from ai_movie import config as _cfg
@@ -383,7 +391,7 @@ def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
     cfg = {}
     for name in STEP_CONFIG.get(step, []):
         if hasattr(_cfg, name):
-            cfg[name] = repr(getattr(_cfg, name))
+            cfg[name] = _fp_repr(getattr(_cfg, name))
     code = {d: _source_hash(d) for d in STEP_CODE.get(step, [])}
     files = {}
     for rel in STEP_FILES.get(step, []):
@@ -395,12 +403,14 @@ def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
         if dep not in ctx.state:
             continue                    # optional upstream absent
         up[dep] = (fps.get(dep) or {}).get("hash", "legacy")
-    extra = _args_extra(step, args)
-    if extra.get("profiles"):
+    raw_extra = _args_extra(step, args)
+    extra = {k: (v.replace(str(_cfg.ROOT_DIR), "<ROOT>") if isinstance(v, str) else v)
+             for k, v in raw_extra.items()}
+    if raw_extra.get("profiles"):
         # what the assignment depends on (identities, genders), not the reference clips: re-selecting a
         # clip must not re-run every chunk's enrol/faces
         from ai_movie.profiles import assignment_signature
-        extra["profiles_sha1"] = assignment_signature(Path(extra["profiles"]))
+        extra["profiles_sha1"] = assignment_signature(Path(raw_extra["profiles"]))
     n_edit = int((ctx.state.get("_edits") or {}).get(step, 0) or 0)
     if n_edit:
         extra["_edits"] = n_edit
