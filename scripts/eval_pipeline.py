@@ -169,8 +169,9 @@ def eval_translation(state: dict, rep: Report) -> None:
     rep.note("B1", "engines completed", list(variants))
 
     for eng, texts in variants.items():
+        # kept-original lines (moans, laughs — ai_movie.content) are untranslated by design
         empty = sum(1 for s, t in zip(segs, texts)
-                    if (s.get("text") or "").strip() and not (t or "").strip())
+                    if (s.get("text") or "").strip() and not (t or "").strip() and not s.get("keep_original"))
         rep.check(f"B2a[{eng}]", "no empty translations", empty == 0, empty)
 
         kana = sum(1 for t in texts if any(c in KANA for c in (t or "")))
