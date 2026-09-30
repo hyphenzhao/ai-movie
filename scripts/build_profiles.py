@@ -88,8 +88,11 @@ def real_probe(members: list[dict], cands: list[str], gender: str, out_dir: Path
     ranked = []
     for k, c in enumerate(cands):
         segs = [dict(sg) for sg in lines]
-        items = tts_mod.run_vc_conversion(segs, {"X": {"ref_audio": c, "gender": gender}}, out_dir / f"c{k}")
-        stats = guard_lines(segs, items, lines)
+        # The probe lines carry both the natural take and the fitted wav; convert and judge the
+        # fitted one explicitly so reference selection does not change with config.VC_SOURCE_KEY.
+        items = tts_mod.run_vc_conversion(segs, {"X": {"ref_audio": c, "gender": gender}}, out_dir / f"c{k}",
+                                          source_key="audio_fit")
+        stats = guard_lines(segs, items, lines, source_key="audio_fit")
         rate = stats["rejected"] / max(1, stats["checked"])
         ranked.append({"path": c, "reject_rate": round(rate, 3), "checked": stats["checked"], "reasons": stats["reasons"]})
         log(f"    real probe {Path(c).name}: {stats['rejected']}/{stats['checked']} lines rejected {stats['reasons'] or ''}")

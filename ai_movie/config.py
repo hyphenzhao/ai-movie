@@ -354,6 +354,28 @@ VC_GUARD_MIN_BASE_FRAMES = 20  # a built-in line with fewer confidently-voiced f
 VC_GUARD_MIN_VOICED_KEEP = 0.4
 VC_GUARD_RATIO = (0.7, 1.4)
 VC_GUARD_MAX_REJECT = 0.3      # above this share of rejected lines, try the next reference clip
+# Which v1 wav voice conversion takes its content from (tts.run_vc_conversion).  "audio" is the
+# natural-tempo line: it is converted once and then pinned to the v1 slot in ONE stretch, whereas
+# "audio_fit" (v3.3) fed the converter speech already sped up 1.25–1.60× and stretched it a third
+# time afterwards.  Only lines with v1 fit_ratio > 1 differ (22 of 268 short-film lines, 38 of 1239 on
+# SONE-846); "audio_fit" stays selectable for the A/B (run_vc_version.py --vc-source audio_fit).
+VC_SOURCE_KEY = "audio"
+# Content-drift judge on converted lines (ai_movie/vc_guard.py judge_content): the pitch guard cannot
+# see a line whose words changed («把腿伸直» → «把腿先举», «不妙啊» → "Tchau, tchau").  Both the
+# built-in line and its conversion are re-read by Whisper and the folded (t2s / NFKC / kana→hiragana)
+# similarity of the conversion to max(v1 reading, intended text) decides.  Calibrated on 417 paired
+# verify_v1/verify_v2 rows (299 converted) of the v3.3 release, folded as in fold_zh:
+VC_DRIFT_JUDGE = True
+VC_DRIFT_WHISPER_MODEL = ASR_OPENAI_WHISPER_MODEL   # same openai-whisper checkpoint as the ASR stage
+VC_DRIFT_BEAM = 5
+# Mel batch per decode.  1 = the (1, 128, 3000) encoder conv the ASR stage already JIT-compiled on
+# gfx1151; any other batch is a new MIOpen problem (find/JIT, the old "terminal freeze" class), so
+# batching is opt-in and unmeasured.
+VC_DRIFT_BATCH = 1
+VC_DRIFT_MIN_CHARS = 3        # on 1–2 char lines the ratio is quantised to {0, .5, .67, 1}; hard rules still apply
+VC_DRIFT_BASELINE_MIN = 0.6   # v1 reading vs intended text: below this Whisper cannot hear the built-in line either
+VC_DRIFT_MIN_SIM = 0.5        # rejects 15/240 judgeable sample lines (~11 wrong content, ~4 homophones); 0.6 adds 6 homophones
+VC_DRIFT_KANA_LEAK = 2        # one kana can be a Whisper artefact on «嗯»
 
 # Voice-consistency metric on the delivered v2 lines (ai_movie/voice_consistency.py, run by
 # scripts/voice_consistency.py after run_vc_version, ECAPA on CPU).  Distances are cosine distances

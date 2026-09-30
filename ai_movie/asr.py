@@ -1396,3 +1396,190 @@ def transcribe_all(
         segment_cb, progress_cb, file_start_cb,
         file_progress_cb, cancel_check,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WhisperClips — short-clip re-reader for the voice-conversion content judge
+# (ai_movie/vc_guard.py).  Standalone; nothing above (the transcription
+# stage, hashed by run_pipeline STEP_CODE["asr"]) is touched or reused.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class WhisperClips:
+    """Re-read short synthesized wavs with openai-whisper on the GPU, one model load per process.
+
+    Used by ``scripts/run_vc_version.py`` to judge converted lines (v1 wav vs
+    its conversion, ``vc_guard.judge_content``).  It runs in the main process
+    of run_vc_version — the CosyVoice worker is a separate pinned subprocess
+    that is gone by the time the guard runs — with the same checkpoint the
+    ASR stage loads (``whisper.load_model``: fp32 weights ≈ 6.2 GB resident
+    for large-v3 with per-op fp16 casts; fine on the 122 GB unified box, and
+    the Ollama models were evicted before conversion).
+
+    Decode regime mirrors ``scripts/verify_dub.py`` so the thresholds
+    calibrated on its rows transfer: every clip is decoded with automatic
+    language ID first; clips whose detected language is not ``zh`` are
+    decoded again forced to Chinese, and both readings are returned as
+    ``{"auto": {"text", "language", "avg_logprob", "no_speech_prob",
+    "compression_ratio"}, "zh": {...} | None}``.  A greedy loop
+    (compression ratio > 2.4) is re-decoded at temperatures 0.2 / 0.4 with
+    ``best_of`` instead of ``beam_size`` (whisper rejects beams with T > 0),
+    exactly like ``transcribe``'s fallback ladder.
+
+    Mel batch is ``VC_DRIFT_BATCH`` (default 1): a (1, n_mels, 3000) encoder
+    conv is the MIOpen problem the ASR stage already JIT-compiled on gfx1151;
+    any other batch is a new find/JIT (the "terminal freeze" class), so
+    batching is opt-in.
+
+    Readings are cached in a JSON file keyed by the wav's *content* digest
+    plus the decode regime — not by path: retries write the chunk sources to
+    ``try{k}/chunks/`` and v1 lines are shared across A/B variants, and a
+    path key would decode all of them again.  Unreadable files yield an
+    empty reading (never an exception): the judge must not fail the build.
+    """
+
+    _CACHE_TAG = "v1"
+
+    def __init__(self, model_size: str | None = None, cache: str | Path | None = None, *,
+                 beam: int | None = None, batch: int | None = None, device: str = "cuda"):
+        from ai_movie.config import VC_DRIFT_BATCH, VC_DRIFT_BEAM, VC_DRIFT_WHISPER_MODEL
+        self.model_size = model_size or VC_DRIFT_WHISPER_MODEL
+        self.beam = int(beam or VC_DRIFT_BEAM)
+        self.batch = max(1, int(batch or VC_DRIFT_BATCH))
+        self.device = device
+        self.cache_path = Path(cache) if cache else None
+        self._cache: dict[str, dict] = {}
+        self._cache_dirty = False
+        self._model = None
+        self.decoded = 0                     # clips actually sent to the model (cache misses)
+        self.seconds = 0.0                   # wall time inside the model
+        if self.cache_path and self.cache_path.exists():
+            try:
+                doc = json.loads(self.cache_path.read_text(encoding="utf-8"))
+                self._cache = doc.get("entries") or {}
+            except Exception:                           # noqa: BLE001  (a torn cache is just a miss)
+                self._cache = {}
+
+    # ── cache ───────────────────────────────────────────────────────────
+    def _key(self, path: str) -> str | None:
+        import hashlib
+        try:
+            h = hashlib.blake2b(digest_size=16)
+            with open(path, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(block)
+        except OSError:
+            return None
+        return f"{h.hexdigest()}|{self.model_size}|b{self.beam}|{self._CACHE_TAG}"
+
+    def _save_cache(self) -> None:
+        if not (self.cache_path and self._cache_dirty):
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"entries": self._cache}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.cache_path)
+        self._cache_dirty = False
+
+    # ── model ───────────────────────────────────────────────────────────
+    def _load(self):
+        if self._model is None:
+            import whisper
+            self._model = whisper.load_model(self.model_size, device=self.device)
+        return self._model
+
+    def close(self) -> None:
+        self._save_cache()
+        if self._model is not None:
+            self._model = None
+            try:
+                import gc
+                import torch
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:                           # noqa: BLE001
+                pass
+
+    # ── decoding ────────────────────────────────────────────────────────
+    @staticmethod
+    def _entry(r) -> dict:
+        import math
+
+        def _f(x):
+            try:
+                x = float(x)
+                return None if math.isnan(x) else round(x, 4)
+            except Exception:                           # noqa: BLE001
+                return None
+        return {"text": (r.text or "").strip(), "language": r.language,
+                "avg_logprob": _f(r.avg_logprob), "no_speech_prob": _f(r.no_speech_prob),
+                "compression_ratio": _f(r.compression_ratio), "temperature": _f(r.temperature)}
+
+    def _decode_mels(self, mels, language: str | None) -> list:
+        """``whisper.decode`` on a stacked mel batch with the transcribe-style temperature ladder."""
+        import torch
+        import whisper
+        model = self._load()
+        opts = dict(task="transcribe", language=language, without_timestamps=True, fp16=True)
+        with torch.no_grad():
+            res = list(whisper.decode(model, mels, whisper.DecodingOptions(temperature=0.0, beam_size=self.beam, **opts)))
+            for n, r in enumerate(res):
+                for t in (0.2, 0.4):
+                    if not (r.compression_ratio > 2.4):
+                        break
+                    r = whisper.decode(model, mels[n], whisper.DecodingOptions(temperature=t, best_of=self.beam, **opts))
+                res[n] = r
+        return res
+
+    def _decode_paths(self, paths: list[str]) -> dict[str, dict]:
+        """Decode *paths* (cache misses) → {path: reading}; the hook the tests replace."""
+        import time
+        import torch
+        import whisper
+        model = self._load()
+        out: dict[str, dict] = {}
+        mels, order = [], []
+        for p in paths:
+            try:
+                audio = whisper.pad_or_trim(whisper.load_audio(p))
+                mels.append(whisper.log_mel_spectrogram(audio, n_mels=model.dims.n_mels))
+                order.append(p)
+            except Exception as exc:                    # noqa: BLE001
+                out[p] = {"auto": {"text": "", "language": None, "error": f"{type(exc).__name__}: {exc}"}, "zh": None}
+        t0 = time.time()
+        for k in range(0, len(order), self.batch):
+            batch = torch.stack(mels[k:k + self.batch]).to(self.device)
+            auto = self._decode_mels(batch, None)
+            redo = [n for n, r in enumerate(auto) if r.language != "zh"]
+            forced = {}
+            for j in range(0, len(redo), self.batch):
+                sub = redo[j:j + self.batch]
+                for n, r in zip(sub, self._decode_mels(batch[sub], "zh")):
+                    forced[n] = r
+            for n, r in enumerate(auto):
+                out[order[k + n]] = {"auto": self._entry(r), "zh": self._entry(forced[n]) if n in forced else None}
+        self.seconds += time.time() - t0
+        self.decoded += len(order)
+        return out
+
+    def transcribe(self, paths) -> dict[str, dict]:
+        """{path: reading} for every distinct path; cached readings are not decoded again."""
+        paths = list(dict.fromkeys(str(p) for p in paths))
+        out: dict[str, dict] = {}
+        keys: dict[str, str | None] = {}
+        missing: list[str] = []
+        for p in paths:
+            k = self._key(p)
+            keys[p] = k
+            if k is not None and k in self._cache:
+                out[p] = self._cache[k]
+            else:
+                missing.append(p)
+        if missing:
+            for p, r in self._decode_paths(missing).items():
+                out[p] = r
+                k = keys.get(p)
+                if k is not None and not (r.get("auto") or {}).get("error"):
+                    self._cache[k] = r
+                    self._cache_dirty = True
+            self._save_cache()
+        return out
