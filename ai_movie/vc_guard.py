@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ai_movie.config import VC_GUARD_MIN_VOICED_KEEP, VC_GUARD_RATIO
+from ai_movie.config import VC_GUARD_MIN_BASE_FRAMES, VC_GUARD_MIN_VOICED_KEEP, VC_GUARD_RATIO
 from ai_movie.pitch import f0_median, gender_band
 
 
@@ -41,16 +41,20 @@ def judge_line(conv_wav: str, v1_wav: str, gender: str | None) -> dict:
     f_v, n_v = f0_median(v1_wav)
     rate_c, rate_v = n_c / _dur(conv_wav), n_v / _dur(v1_wav)
     res = {"ok": True, "reason": "", "f0_conv": f_c and round(f_c, 1), "f0_v1": f_v and round(f_v, 1),
-           "voiced_conv": n_c, "voiced_v1": n_v}
-    if rate_v > 0 and rate_c < VC_GUARD_MIN_VOICED_KEEP * rate_v:
+           "voiced_conv": n_c, "voiced_v1": n_v, "judged": n_v >= VC_GUARD_MIN_BASE_FRAMES}
+    # A baseline with a handful of confidently-voiced frames (short or soft built-in lines, most male
+    # lines) cannot judge anything: n_c vs n_v is noise there and produced random fallbacks mid-sentence.
+    if n_v < VC_GUARD_MIN_BASE_FRAMES:
+        return res
+    if rate_c < VC_GUARD_MIN_VOICED_KEEP * rate_v:
         res.update(ok=False, reason=f"lost_voicing_{rate_c / rate_v:.2f}")
         return res
-    if f_c is None and f_v is not None and n_v >= 20:
+    if f_c is None and f_v is not None:
         res.update(ok=False, reason="unvoiced_output")
         return res
     band = gender_band(gender)
     if f_c is not None and band and not (band[0] <= f_c <= band[1]):
-        res.update(ok=False, reason=f"f0_{f_c:.0f}_outside_{gender}_band")
+        res.update(ok=False, reason=f"band_{gender}_{f_c:.0f}Hz")
         return res
     if f_c is not None and f_v:
         r = f_c / f_v
@@ -69,6 +73,7 @@ def guard_lines(segs: list[dict], items: dict, v1_segs: list[dict], *, log=None)
     checked = rejected = 0
     reasons: dict[str, int] = {}
     verdicts: dict[int, dict] = {}
+    bad: set[int] = set()
     for i, s in enumerate(segs):
         it = items.get(i) or {}
         if not it.get("vc") or not it.get("audio"):
@@ -77,15 +82,36 @@ def guard_lines(segs: list[dict], items: dict, v1_segs: list[dict], *, log=None)
         v1_wav = v1.get("audio_fit") or v1.get("audio")
         if not v1_wav or not Path(v1_wav).exists():
             continue
-        checked += 1
-        v = judge_line(it["audio"], v1_wav, s.get("gender") or s.get("tts_gender"))
+        try:
+            v = judge_line(it["audio"], v1_wav, s.get("gender") or s.get("tts_gender"))
+        except Exception as exc:                        # noqa: BLE001  (unreadable wav → treat as lost)
+            v = {"ok": False, "reason": f"unreadable_{type(exc).__name__}", "judged": True}
         verdicts[i] = v
+        if not v.get("judged"):
+            continue
+        checked += 1
         if not v["ok"]:
-            rejected += 1
-            key = v["reason"].split("_")[0] if v["reason"].startswith(("lost", "pitch")) else v["reason"]
+            bad.add(i)
+            key = v["reason"].split("_")[0]
             reasons[key] = reasons.get(key, 0) + 1
-            items[i] = {"audio": v1_wav, "mode": "builtin", "vc": False, "guard": v["reason"]}
+    # A chunk (short neighbouring lines converted as one utterance, tts._vc_chunks) is kept or dropped
+    # whole: a built-in line spliced between two cloned ones inside a sentence is the "several people
+    # talking" effect chunking exists to prevent.
+    drop: set[int] = set()
+    for i in bad:
+        members = (items.get(i) or {}).get("chunk")
+        drop.update(range(members[0], members[1] + 1) if members else [i])
+    for i in sorted(drop):
+        it = items.get(i) or {}
+        if not it.get("vc"):
+            continue
+        v1_wav = (v1_segs[i].get("audio_fit") or v1_segs[i].get("audio")) if i < len(v1_segs) else None
+        if not v1_wav:
+            continue
+        rejected += int(i in bad)
+        reason = verdicts.get(i, {}).get("reason") or "chunk_member"
+        items[i] = {"audio": v1_wav, "mode": "builtin", "vc": False, "guard": reason}
     if log:
-        log(f"  VC guard: {rejected}/{checked} converted lines fell back to the built-in voice"
+        log(f"  VC guard: {rejected}/{checked} judged lines failed → {len(drop)} lines back to the built-in voice"
             + (f" ({', '.join(f'{k}×{n}' for k, n in sorted(reasons.items(), key=lambda kv: -kv[1]))})" if reasons else ""))
-    return {"checked": checked, "rejected": rejected, "reasons": reasons, "verdicts": verdicts}
+    return {"checked": checked, "rejected": rejected, "dropped": len(drop), "reasons": reasons, "verdicts": verdicts}

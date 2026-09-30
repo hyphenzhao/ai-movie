@@ -47,7 +47,8 @@ echo "enrolment chunks: $ENROL"
 for IDX in $ENROL; do
   CN="${NAME}_p${IDX}"
   ln -sfn "$SPLIT/chunks/$CN.mp4" "$ROOT/inputs/$CN.mp4"
-  $PY -u scripts/run_pipeline.py "$ROOT/inputs/$CN.mp4" --name "$CN" --steps demux,separate,osd,asr < /dev/null \
+  # through tts so build_profiles can try each candidate reference on this person's real lines
+  $PY -u scripts/run_pipeline.py "$ROOT/inputs/$CN.mp4" --name "$CN" --steps demux,separate,osd,asr,glossary,translate,tts < /dev/null \
     || { echo "enrol: $CN asr failed"; echo "$IDX enrol asr_failed" >> "$SPLIT/status.txt"; }
 done
 if [ ! -s "$ROOT/workspace/$NAME/profiles.json" ] || [ "${REBUILD_PROFILES:-0}" = 1 ]; then

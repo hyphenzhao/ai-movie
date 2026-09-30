@@ -75,10 +75,12 @@ def real_probe(members: list[dict], cands: list[str], gender: str, out_dir: Path
         if not sp.exists():
             continue
         st = json.loads(sp.read_text())
-        for sg in ((st.get("fit") or {}).get("segments") or []):
-            if sg.get("speaker") == m["speaker"] and sg.get("audio_fit") and Path(sg["audio_fit"]).exists() \
+        segs_ = (st.get("fit") or {}).get("segments") or (st.get("tts") or {}).get("segments") or []
+        for sg in segs_:
+            wav = sg.get("audio_fit") or sg.get("audio")
+            if sg.get("speaker") == m["speaker"] and wav and Path(wav).exists() \
                     and not sg.get("keep_original") and (float(sg["end"]) - float(sg["start"])) >= 1.5:
-                lines.append(dict(sg, speaker="X", gender=gender))
+                lines.append(dict(sg, speaker="X", gender=gender, audio_fit=wav))
     if len(lines) < 4:
         log(f"    real probe skipped ({len(lines)} usable lines)")
         return []
@@ -91,8 +93,13 @@ def real_probe(members: list[dict], cands: list[str], gender: str, out_dir: Path
         rate = stats["rejected"] / max(1, stats["checked"])
         ranked.append({"path": c, "reject_rate": round(rate, 3), "checked": stats["checked"], "reasons": stats["reasons"]})
         log(f"    real probe {Path(c).name}: {stats['rejected']}/{stats['checked']} lines rejected {stats['reasons'] or ''}")
-    ranked.sort(key=lambda r: (r["reject_rate"], -r["checked"]))
-    return ranked
+    # a candidate whose conversion produced nothing measurable (worker died) is not "0 % rejected"
+    measured = [r for r in ranked if r["checked"] > 0]
+    if not measured:
+        log("    real probe measured nothing — keeping the generic probe's pick")
+        return []
+    measured.sort(key=lambda r: (r["reject_rate"], -r["checked"]))
+    return measured + [r for r in ranked if r["checked"] == 0]
 
 
 def main() -> int:

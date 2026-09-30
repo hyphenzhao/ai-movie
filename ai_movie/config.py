@@ -315,6 +315,7 @@ REF_MIN_VOICED_RATIO = 0.1
 REF_MIN_PROBES_MEASURABLE = 2
 # Per-line guard on converted audio (ai_movie/vc_guard.py): a converted line keeps the built-in line
 # unless it retains this share of its voiced frames per second and stays within this pitch ratio.
+VC_GUARD_MIN_BASE_FRAMES = 20  # a built-in line with fewer confidently-voiced frames cannot judge its conversion
 VC_GUARD_MIN_VOICED_KEEP = 0.4
 VC_GUARD_RATIO = (0.7, 1.4)
 VC_GUARD_MAX_REJECT = 0.3      # above this share of rejected lines, try the next reference clip

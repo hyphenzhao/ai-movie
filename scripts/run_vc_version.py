@@ -98,12 +98,18 @@ def _ref_options(refs: dict, args, profiles_doc: dict | None) -> list[dict]:
         base = Path(args.profiles).parent
         for spk, v in refs.items():
             prof = (profiles_doc.get("profiles") or {}).get(v.get("profile") or "") or {}
-            alts[spk] = [str(base / a) if not Path(a).is_absolute() else a for a in (prof.get("ref_alternatives") or [])]
+            primary = Path(v["ref_audio"]).resolve()
+            alts[spk] = [str((base / a).resolve() if not Path(a).is_absolute() else Path(a).resolve())
+                         for a in (prof.get("ref_alternatives") or [])]
+            alts[spk] = [a for a in alts[spk] if Path(a) != primary]
     elif args.refs_json:
         doc = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
         for spk, v in refs.items():
             rows = (doc.get("candidates") or {}).get(v.get("gender"), []) or []
-            alts[spk] = [r["path"] for r in rows if r.get("reject") is None and r["path"] != v["ref_audio"]]
+            primary = Path(v["ref_audio"]).resolve()
+            alts[spk] = [str((ROOT / r["path"]).resolve() if not Path(r["path"]).is_absolute() else Path(r["path"]).resolve())
+                         for r in rows if r.get("reject") is None]
+            alts[spk] = [a for a in alts[spk] if Path(a) != primary]
     n = max([len(a) for a in alts.values()] + [0])
     options = [refs]
     for k in range(n):
@@ -113,6 +119,42 @@ def _ref_options(refs: dict, args, profiles_doc: dict | None) -> list[dict]:
             opt[spk] = dict(v, ref_audio=a[k]) if k < len(a) and Path(a[k]).exists() else v
         options.append(opt)
     return options[:3]
+
+
+def _merge_attempts(attempts: list, segs: list[dict]) -> tuple[dict, dict, dict, dict]:
+    """Per speaker, take the attempt with the lowest judged-rejection rate for that speaker's lines;
+    attempts that judged none of the speaker's lines (conversion failed) lose to any that did."""
+    speakers = sorted({s.get("speaker") or "" for s in segs})
+    by_spk = {spk: [i for i, s in enumerate(segs) if (s.get("speaker") or "") == spk] for spk in speakers}
+    items, refs, chosen = {}, {}, {}
+    tot_checked = tot_rejected = 0
+    reasons: dict[str, int] = {}
+    for spk, idxs in by_spk.items():
+        best = None
+        for k, it, st, ref_set in attempts:
+            vs = [st["verdicts"].get(i) for i in idxs]
+            judged = [v for v in vs if v and v.get("judged")]
+            converted = sum(1 for i in idxs if (it.get(i) or {}).get("vc"))
+            rej = sum(1 for v in judged if not v["ok"])
+            key = (0 if judged else 1, rej / len(judged) if judged else 1.0, -converted, k)
+            if best is None or key < best[0]:
+                best = (key, k, it, st, ref_set, len(judged), rej)
+        _, k, it, st, ref_set, n_j, rej = best
+        chosen[spk] = k
+        for i in idxs:
+            if i in it:
+                items[i] = it[i]
+        if spk in ref_set:
+            refs[spk] = ref_set[spk]
+        tot_checked += n_j; tot_rejected += rej
+        for i in idxs:
+            v = st["verdicts"].get(i)
+            if v and v.get("judged") and not v["ok"]:
+                key2 = v["reason"].split("_")[0]
+                reasons[key2] = reasons.get(key2, 0) + 1
+    stats = {"checked": tot_checked, "rejected": tot_rejected, "reasons": reasons,
+             "dropped": sum(1 for it in items.values() if it.get("guard"))}
+    return items, refs, stats, chosen
 
 
 def main() -> int:
@@ -201,7 +243,7 @@ def main() -> int:
     segs = [dict(s) for s in v1_segs]
     out_dir = work / "synthesized_vc"
     options = _ref_options(refs, args, profiles_doc)
-    attempts = []
+    attempts = []          # (k, items, stats, ref_set)
     for k, ref_set in enumerate(options):
         names = {spk: Path(v["ref_audio"]).name for spk, v in ref_set.items()}
         log(f"voice-converting {len(segs)} segments with {names}…")
@@ -209,14 +251,21 @@ def main() -> int:
             segs, ref_set, out_dir / (f"try{k}" if k else ""),
             progress_cb=lambda d, t: log(f"  VC {d}/{t}") if d % 10 == 0 else None)
         stats = guard_lines(segs, items, v1_segs, log=log)
-        attempts.append((stats["rejected"] / max(1, stats["checked"]), k, items, stats, ref_set))
-        if stats["checked"] == 0 or attempts[-1][0] <= VC_GUARD_MAX_REJECT:
+        attempts.append((k, items, stats, ref_set))
+        rate = stats["rejected"] / max(1, stats["checked"])
+        if k == 0 and stats["checked"] == 0:
+            break                                       # nothing measurable — no basis to retry
+        if stats["checked"] and rate <= VC_GUARD_MAX_REJECT:
             break
-        log(f"  {attempts[-1][0]:.0%} of lines rejected — trying the next reference clip")
-    attempts.sort(key=lambda a: (a[0], a[1]))
-    reject_rate, k, items, stats, refs = attempts[0]
+        if k + 1 < len(options):
+            log(f"  {rate:.0%} of judged lines rejected — trying the next reference clip")
+    # Choose per speaker: each speaker keeps the attempt where *its* lines fared best — an attempt that
+    # converted nothing (worker died: checked 0) never wins, and a speaker with a good primary clip is
+    # not dragged onto a worse alternate by another speaker's numbers.
+    items, refs, stats, chosen = _merge_attempts(attempts, segs)
+    reject_rate = stats["rejected"] / max(1, stats["checked"])
     if len(attempts) > 1:
-        log(f"  kept attempt {k} ({reject_rate:.0%} rejected)")
+        log(f"  kept per speaker: {chosen} → {reject_rate:.0%} rejected overall")
 
     converted = 0
     for i, s in enumerate(segs):
@@ -325,7 +374,8 @@ def main() -> int:
 
     state["vc"] = {"segments": segs, "refs": refs, "video": str(final), "profiles_sha1": profiles_sha1,
                    "guard": {"checked": stats["checked"], "rejected": stats["rejected"], "reasons": stats["reasons"],
-                             "attempts": len(attempts), "reject_rate": round(reject_rate, 3)},
+                             "dropped": stats.get("dropped"), "attempts": len(attempts), "chosen": chosen,
+                             "reject_rate": round(reject_rate, 3)},
                    "converted": converted, "reused_lipsync": reuse_lipsync,
                    "max_drift_ms": round(worst[0] * 1000, 1),
                    "mix": mix_stats}
