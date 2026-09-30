@@ -585,6 +585,37 @@ def eval_f0_gate(state: dict, rep: Report) -> None:
         rep.note("C2c", "F0 gate", "no cloned speakers")
 
 
+def eval_voice_consistency(state: dict, rep: Report) -> None:
+    """C7: is the cloned voice one voice (state.vc.consistency, written by scripts/voice_consistency.py).
+
+    State-only — no encoder here.  C7a/b/c/e mirror V2/V1/V5/V6 per voice (``ok``
+    None = not judged, which ``accept_release.check_rows`` skips); C7d is the
+    listening list (V3, report-only) with the worst three lines.
+    """
+    cons = (state.get("vc") or {}).get("consistency") or {}
+    if not cons:
+        rep.note("C7", "voice consistency", "not measured (run scripts/voice_consistency.py <state>)")
+        return
+    by_gate: dict[str, list[dict]] = {}
+    for g in cons.get("gates") or []:
+        by_gate.setdefault(g.get("gate"), []).append(g)
+    for key_id, gid, desc in (("C7a", "V2", "cloned lines cluster like one voice (median excess over the built-in voice)"),
+                              ("C7b", "V1", "seconds left in the built-in voice"),
+                              ("C7c", "V5", "conversion moved the voice away from the built-in one"),
+                              ("C7e", "V6", "conversion moved the voice toward the enrolled profile")):
+        for g in by_gate.get(gid, []):
+            rep.check(f"{key_id}[{g['key']}]", desc, g.get("ok"),
+                      g["value"] + (f" ({g['note']})" if g.get("note") and g.get("ok") is None else ""))
+    lines = cons.get("lines") or {}
+    for g in by_gate.get("V3", []):
+        worst = sorted(((v.get("d_self") or 0.0, i) for i, v in lines.items()
+                        if v.get("key") == g["key"] and v.get("d_self") is not None and v.get("long")), reverse=True)[:3]
+        rep.note(f"C7d[{g['key']}]", "outlier lines (listening list, not gated)",
+                 g["value"] + (" — worst: " + ", ".join(f"#{i} {d:.2f}" for d, i in worst) if worst else ""))
+    for n in cons.get("notes") or []:
+        rep.note("C7", "voice consistency", n)
+
+
 def eval_cuts(state: dict, rep: Report) -> None:
     pp = (state.get("faces") or {}).get("plan_path")
     if not pp or not Path(pp).exists():
@@ -737,8 +768,8 @@ def main() -> int:
         rep.note("D3", "frame-level lip-sync check skipped",
                  f"{type(exc).__name__}: {exc}")
     eval_compose(state, rep)
-    for fn, key in ((eval_compact, "C5"), (eval_f0_gate, "C2c"), (eval_cuts, "D8"),
-                    (eval_mix, "E2"), (eval_qc, "F1")):
+    for fn, key in ((eval_compact, "C5"), (eval_f0_gate, "C2c"), (eval_voice_consistency, "C7"),
+                    (eval_cuts, "D8"), (eval_mix, "E2"), (eval_qc, "F1")):
         try:
             fn(state, rep)
         except Exception as exc:                        # noqa: BLE001

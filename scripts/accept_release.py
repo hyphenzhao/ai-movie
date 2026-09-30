@@ -19,6 +19,11 @@ Blocking gates
       never had: ≤ 80 % of baseline
   H6  the same pronoun count does not grow on the other films
   H7  lines with leftover kana ≤ max(baseline, 1)
+  H8  the cloned voice is one voice: every judged gate of scripts/voice_consistency.py
+      holds (fallback seconds ≤ 10 %, median excess ≤ 0.15, shift ≥ 0.30, profile
+      gain ≥ 0.10); not measured → reported, not gated
+  L   with --long, every eval_long check including L3b–L3f (voice consistency
+      across chunks); L3c > 0.35 means listen to that chunk, then decide
 
 H5 was first drafted as "halve the fragmented-sentence count".  A Sakura
 A/B on v3.0.0 output_test showed every grouping rule leaves that count at 8:
@@ -184,6 +189,19 @@ def main() -> int:
         for r in cur_rows:
             if r["key"] in ("E3", "E3v"):
                 notes.append(f"{film} {r['key']}: {'PASS' if r['ok'] else 'FAIL'} {r['value']}")
+
+        # H8 — the cloned voice is one voice: absolute floors of scripts/voice_consistency.py
+        # (V1 fallback seconds, V2 median excess, V5 shift, V6 profile gain; V3 is report-only).
+        # H2 covers the regression against the archived C7 rows once the baseline is refreshed.
+        vgates = [g for g in ((state.get("vc") or {}).get("consistency") or {}).get("gates") or []
+                  if g.get("ok") is not None]
+        if vgates:
+            bad = [g["id"] for g in vgates if not g["ok"]]
+            gate(f"H8[{film}]", "v2 音色一致性门（回退秒数 / 中位数超额 / 偏离内置音 / 档案增益）全部通过",
+                 not bad, ("未通过 " + ", ".join(bad) + "；" if bad else "")
+                 + "；".join(f"{g['id']} {g['value']}" for g in vgates))
+        else:
+            notes.append(f"{film} H8: 未测量（先跑 scripts/voice_consistency.py workspace/{film}/state.json）")
 
         # H4–H7 — subtitle / translation metrics
         cur, cur_groups = subs_summary(film, work / "state.json", outdir, "current")

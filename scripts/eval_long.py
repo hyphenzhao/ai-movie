@@ -14,6 +14,8 @@ Gates (L1–L6 in Documentation/v3.3-long-film.md):
   segments (rules of ai_movie.content re-applied post hoc + kept lines far
   from any cue inside subtitled stretches), L2b ASR similarity on read cues,
   L3 voice consistency (one reference file per profile across chunks),
+  L3b–L3f one voice per profile on the delivered v2 lines (ECAPA; read from
+  scripts/voice_consistency.py --film's report, not judged → note),
   L4 kept-original lines untouched, L5 loudness spread, L6 duration.
 Exit 0 = pass, 1 = fail, 2 = cannot evaluate.
 """
@@ -40,8 +42,13 @@ L1_INTERVIEW_MIN = 0.90
 L1_SCENE_MIN = 0.60
 L2_MAX = 0.05
 L2B_INTERVIEW_MIN = 0.75
-L3_MIN_MEDIAN = 0.40
-L3_MAX_SPREAD = 0.15
+# L3b–L3f thresholds live in config (VC_CONSIST_*) and are applied by scripts/voice_consistency.py --film;
+# this script only reads its report (deliver/<film>_full/VOICE_CONSISTENCY.json) so it stays model-free.
+L3_VOICE_GATES = (("L3b", "V2", "median d(line, own centroid) excess over the built-in voice"),
+                  ("L3c", "V4", "leave-one-chunk-out centroid distance (per-chunk reference switch)"),
+                  ("L3d", "V1", "seconds left in the built-in voice"),
+                  ("L3e", "V5", "converted centroid moved away from the built-in voice"),
+                  ("L3f", "V6", "converted centroid moved toward the enrolled profile voice"))
 L5_TOL_LU = 2.0
 L6_TOL_S = 0.5              # ±1 frame per chunk boundary is the concat floor
 
@@ -122,6 +129,55 @@ def cue_distance(cue_iv: list[tuple[float, float]], t0: float, t1: float) -> flo
     return best
 
 
+def voice_consistency_checks(film: str, checks: list[dict], notes: list[str], *,
+                             report: dict | None = None, current_sigs: dict[str, str] | None = None) -> None:
+    """L3b–L3f from ``deliver/<film>_full/VOICE_CONSISTENCY.json`` (scripts/voice_consistency.py --film).
+
+    One check per gate id, over every voice the report judged; ``ok`` is appended
+    ONLY as a bool.  ``evaluate()`` takes ``passed = all(c["ok"] …)`` and
+    ``accept_release --long`` gates ``bool(c["ok"])``, so a "not judged" gate must
+    be a note, never a check with ``ok=None``.  A report whose per-chunk ``vc_sig``
+    no longer matches the chunk's state (one chunk re-cloned since) is stale and
+    yields notes only — stale numbers must not gate a release.
+    """
+    if report is None:
+        p = ROOT / "deliver" / f"{film}_full" / "VOICE_CONSISTENCY.json"
+        if not p.exists():
+            notes.append("L3b–f: not measured (run scripts/voice_consistency.py --film)")
+            return
+        try:
+            report = json.loads(p.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            notes.append(f"L3b–f: report unreadable ({exc})")
+            return
+    if current_sigs is None:
+        from ai_movie.voice_consistency import vc_signature
+        current_sigs = {}
+        for c in (report.get("chunks") or {}):
+            sp = ROOT / "workspace" / f"{film}_p{int(c):02d}" / "state.json"
+            if sp.exists():
+                try:
+                    current_sigs[str(c)] = vc_signature(json.loads(sp.read_text(encoding="utf-8")))
+                except ValueError:
+                    current_sigs[str(c)] = "unreadable"
+    stale = sorted(c for c, m in (report.get("chunks") or {}).items()
+                   if current_sigs.get(str(c)) not in (None, m.get("vc_sig")))
+    if stale:
+        notes.append(f"L3b–f: report stale — chunks {stale} re-cloned since; rerun scripts/voice_consistency.py --film {film}")
+        return
+    rows = report.get("gates") or []
+    for lid, gid, desc in L3_VOICE_GATES:
+        judged = [r for r in rows if r.get("gate") == gid and r.get("ok") is not None]
+        unjudged = [r for r in rows if r.get("gate") == gid and r.get("ok") is None]
+        if judged:
+            checks.append({"id": lid, "desc": desc, "ok": all(bool(r["ok"]) for r in judged),
+                           "value": "; ".join(f"{r['key']}: {r['value']}" for r in judged)})
+        elif unjudged:
+            notes.append(f"{lid}: not judged — " + "; ".join(f"{r['key']}: {r.get('note') or r['value']}" for r in unjudged))
+    for n in report.get("notes") or []:
+        notes.append(f"voice consistency: {n}")
+
+
 def evaluate(film: str, stage: str | None = None) -> dict:
     segs, meta = film_segments(film, stage)
     truth, read = cues(film)
@@ -186,6 +242,8 @@ def evaluate(film: str, stage: str | None = None) -> dict:
                        "value": "ok" if not multi else f"{multi} distinct files"})
     else:
         notes.append("L3: no vc refs recorded")
+    # L3b–L3f: is each delivered voice one voice (ECAPA, scripts/voice_consistency.py --film)
+    voice_consistency_checks(film, checks, notes)
     # L4: kept-original lines untouched
     ko = [s for s in segs if s.get("keep_original")]
     if ko:

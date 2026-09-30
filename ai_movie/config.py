@@ -320,6 +320,45 @@ VC_GUARD_MIN_VOICED_KEEP = 0.4
 VC_GUARD_RATIO = (0.7, 1.4)
 VC_GUARD_MAX_REJECT = 0.3      # above this share of rejected lines, try the next reference clip
 
+# Voice-consistency metric on the delivered v2 lines (ai_movie/voice_consistency.py, run by
+# scripts/voice_consistency.py after run_vc_version, ECAPA on CPU).  Distances are cosine distances
+# between L2-normalised ECAPA embeddings of whole TTS lines.  Scale, measured on the v3.3 outputs
+# (output_test / test_1 / test_2 / SONE-846, 22 chunks) and re-measured by the design review:
+# identical audio 0.00; one built-in SFT voice across a film (v1 lines ≥1.5 s) median 0.20–0.25,
+# p95 0.33–0.44; our converted lines median 0.24–0.33; chunk centroid vs the rest of the film with
+# the SAME reference max 0.17 (n ≥ 5); the same lines converted onto a DIFFERENT clip of the same
+# actress 0.20–0.24 (near alternates c1/c7) up to 0.43–0.93 (c10/c9/c8 and every guard-rejected
+# clip); built-in female vs built-in male 0.83–0.90; a fallback line vs the converted voice ≈ 0.80.
+# ECAPA is largely pitch-invariant: guard-dropped lines score inside the normal spread
+# (0.28–0.45), so this metric complements vc_guard and must never replace or weaken it.
+VC_CONSIST_MIN_LINE_S = 1.5          # judge lines whose delivered audio is ≥1.5 s (median 0.327 vs 0.454 under 1 s);
+                                     # shorter converted lines only feed the centroids
+VC_CONSIST_MIN_LINES = 8             # a group's median needs 8 long converted lines (SE of a median at sd≈0.10 ≈ 0.04)
+VC_CONSIST_MAX_MEDIAN_EXCESS = 0.15  # V2: median d(line, own centroid) of converted long lines MINUS the same lines'
+                                     # built-in median (v1 line vs the built-in voice's centroid).  Today +0.08 (P0),
+                                     # +0.03…+0.06 (short films) → ≥47 % margin.  The relative form isolates conversion
+                                     # instability from line composition (scene/interview, short lines).  An absolute
+                                     # median cannot see a two-reference mix (50/50 at pair distance 0.92 → 0.385) — V4 can.
+VC_CONSIST_OUTLIER = 0.55            # listening-list cutoff only: built-in p95 0.33–0.44, converted p95 0.39–0.55
+VC_CONSIST_MAX_OUTLIER_SHARE = None  # V3 is REPORTED, not gated, until the blind listening check confirms 0.55
+VC_CONSIST_MIN_CHUNK_LINES = 8       # V4 gates a film chunk only with ≥8 converted lines (bootstrap null p99 at n=8 is
+                                     # 0.15 = 43 % of the threshold; at n=5 it is 0.23); 3–7 lines: reported, not gated
+VC_CONSIST_MIN_REST_LINES = 20       # …and only against a leave-one-out pool of ≥20 converted lines from the other chunks
+VC_CONSIST_MAX_CHUNK_DIST = 0.35     # V4, LEAVE-ONE-CHUNK-OUT: chunk centroid vs the centroid of every other chunk's
+                                     # converted lines (a centroid that includes the chunk sits at the half-angle and
+                                     # halves the distance).  Same reference: max 0.17 → 52 % margin; the near alternates
+                                     # a re-clone can reach (alt0/alt1) 0.20–0.24 → usually not flagged (same actress,
+                                     # same session); far alternates 0.43/0.52/0.72 and guard-rejected clips 0.78–0.93 →
+                                     # flagged.  0.30 sits on the near-alternate cluster; 0.40 would miss c10 (0.43).
+VC_CONSIST_MAX_FALLBACK_SEC = 0.10   # V1: share of a voice's DELIVERED seconds (fit_end−start) left in the built-in voice
+                                     # (each such line is a ≈0.8 voice flip).  Today output_test 1.3 %, test_1 1.4 %,
+                                     # test_2 6.1 %, SONE-846 P0 2.9 % → ≥39 % margin.  Slot seconds would say 8.7 % on test_2.
+VC_CONSIST_MIN_SHIFT = 0.30          # V5: d(converted centroid, built-in centroid of the gender): today 0.59–0.71;
+                                     # a silent no-op conversion is 0
+VC_CONSIST_MIN_PROFILE_GAIN = 0.10   # V6 (profiles only): d(built-in, P.voice) − d(converted, P.voice); today +0.33.
+                                     # Cross-domain (the profile vector is 1.5 s windows of the Japanese mix): direction only
+VC_CONSIST_UNCHANGED = 0.30          # d(v2 line, v1 line) below this = the conversion left the line as it was (reported)
+
 TTS_VOCALS_RMS_MIN_RATIO = 0.25
 
 # Minimum ECAPA cosine similarity between a cloned segment and its speaker

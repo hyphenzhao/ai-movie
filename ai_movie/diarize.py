@@ -300,6 +300,81 @@ def embed_units(
     return emb, keep
 
 
+def _encode_clips(clips: list[np.ndarray], *, device: str = DIARIZE_DEVICE,
+                  batch: int = 16) -> np.ndarray:
+    """L2-normalised ECAPA embeddings of 16 kHz clips (pad + encode_batch).
+
+    A copy of the loop in :func:`embed_windows`, not a refactor of it: that
+    function's source text is hashed into the ``enrol`` stage fingerprint, so
+    touching it would send every film's enrolment stale for no output change.
+    """
+    import torch
+
+    if not clips:
+        return np.zeros((0, 192), np.float32)
+    enc = _load_encoder(device)
+    embs: list[np.ndarray] = []
+    for i in range(0, len(clips), batch):
+        chunk = clips[i:i + batch]
+        maxlen = max(len(c) for c in chunk)
+        padded = np.zeros((len(chunk), maxlen), np.float32)
+        lens = np.zeros(len(chunk), np.float32)
+        for j, c in enumerate(chunk):
+            padded[j, :len(c)] = c
+            lens[j] = len(c) / maxlen
+        with torch.no_grad():
+            out = enc.encode_batch(torch.from_numpy(padded),
+                                   torch.from_numpy(lens))
+        embs.append(out.squeeze(1).cpu().numpy())
+    emb = np.concatenate(embs).astype(np.float32)
+    emb /= np.maximum(np.linalg.norm(emb, axis=1, keepdims=True), 1e-9)
+    return emb
+
+
+def embed_files(
+    paths: list[str | Path],
+    *,
+    device: str = DIARIZE_DEVICE,
+    batch: int = 16,
+    min_dur: float = 0.5,
+    max_dur: float = 8.0,
+) -> tuple[np.ndarray, list[int]]:
+    """One embedding per audio file (whole file, centre-cropped above *max_dur*).
+
+    Returns ``(emb [K,192], keep)`` where ``keep[k]`` is the index into *paths*
+    of the file that produced row ``k``; files that are missing, unreadable or
+    shorter than *min_dur* are left out rather than embedded as noise.  Used by
+    the voice-consistency metric on the delivered (v2) and built-in (v1) TTS
+    lines, so it reads any sample rate (``_load_mono16k`` resamples 24 kHz TTS
+    output to the encoder's 16 kHz).  Relative paths resolve against the
+    repository root (``state.json`` of the short films stores ``workspace/…``).
+    """
+    root = Path(__file__).resolve().parent.parent
+    clips: list[np.ndarray] = []
+    keep: list[int] = []
+    for i, p in enumerate(paths):
+        if not p:
+            continue
+        fp = Path(p)
+        if not fp.is_absolute():
+            fp = root / fp
+        if not fp.exists():
+            continue
+        try:
+            a = _load_mono16k(fp)
+        except Exception:                               # noqa: BLE001
+            continue
+        if len(a) < int(min_dur * _SR):
+            continue
+        if len(a) > int(max_dur * _SR):
+            mid = len(a) // 2
+            half = int(max_dur * _SR) // 2
+            a = a[mid - half:mid + half]
+        clips.append(a)
+        keep.append(i)
+    return _encode_clips(clips, device=device, batch=batch), keep
+
+
 # ── clustering ─────────────────────────────────────────────────────
 
 def estimate_num_speakers(emb: np.ndarray,
