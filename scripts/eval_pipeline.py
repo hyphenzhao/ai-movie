@@ -199,6 +199,12 @@ def eval_translation(state: dict, rep: Report) -> None:
         bad = sum(1 for t in texts if "镰鼬" in (t or ""))
         rep.check(f"B5[{eng}]", "name カンナ no longer rendered 镰鼬",
                   bad == 0, bad)
+    # B6: lines that lost their sentence-unit context (v3.4 E12 bookkeeping)
+    n_fb = tr.get("split_fallback")
+    if n_fb is None:
+        n_fb = sum(1 for s in segs if s.get("split_fallback"))
+    rep.note("B6", "segments re-translated individually after an unsplittable unit",
+             f"{n_fb}/{len(segs)}")
 
 
 # ── C. TTS + duration fitting ──────────────────────────────────────
@@ -630,6 +636,73 @@ def eval_cuts(state: dict, rep: Report) -> None:
     rep.check("D8", "no flickering target box inside a shot", jumps == 0, jumps)
 
 
+def eval_passthrough(state: dict, rep: Report) -> None:
+    """D9: where the dubbed picture shows the original instead of a generated
+    mouth, and why (v3.4 L8 step 1).  Notes, not gates — the counts describe
+    the footage as much as the pipeline; the picture review decides.
+
+      D9a  plan pass-through by reason, as % of speech-window frames.  When
+           the faces stage predates the accounting it is recomputed here
+           from face_plan.json + face_tracks_cache.json with the SAME
+           no-lipsync rule step_faces uses, so a v3.3 state is measurable.
+      D9b  gate: frames shown original inside rendered clips, by reason
+           (plan / no_face / lip), sporadic occlusion misses, switches, and
+           how many frames the crossfade blended.
+      D9c  per switch, the step the hard cut would have made vs the largest
+           step written across the ramp.  step_faded is a max over a ramp
+           that includes the source's own motion, so on a moving shot it
+           can exceed step_hard by construction — the median ratio is
+           informational, not a regression gate.
+    """
+    faces = state.get("faces") or {}
+    pt = faces.get("passthrough")
+    if not pt:
+        pp = faces.get("plan_path")
+        if pp and Path(pp).exists():
+            from ai_movie import faces as faces_mod
+            plan = json.loads(Path(pp).read_text(encoding="utf-8"))
+            cache = faces_mod.load_tracks_cache_plan(Path(pp).parent / "face_tracks_cache.json")
+            segs = next((state[k]["segments"] for k in ("fit", "compact", "tts", "asr")
+                         if (state.get(k) or {}).get("segments")), None)
+            if cache and segs:
+                from ai_movie.config import FACE_SKIP_NONLEXICAL
+                if FACE_SKIP_NONLEXICAL:
+                    segs = faces_mod.mark_no_lipsync(segs)
+                pt = faces_mod.passthrough_reasons(plan, segs, tracks=cache["tracks"])
+                pt["_recomputed"] = True
+    if pt:
+        n_pt = sum((pt.get("frames") or {}).values())
+        sw = int(pt.get("speech_frames") or 0)
+        by = ", ".join(f"{k} {v}" for k, v in sorted((pt.get("frames") or {}).items(),
+                                                     key=lambda kv: -kv[1]))
+        rep.note("D9a", "plan pass-through inside speech windows"
+                 + (" [recomputed from face_plan.json]" if pt.get("_recomputed") else ""),
+                 f"{n_pt}/{sw} frames ({n_pt / sw:.0%}): {by}" if sw else "no speech windows")
+
+    ls = state.get("lipsync") or {}
+    if not ls:
+        return
+    by = ls.get("use_orig_by_reason")
+    if by:
+        rep.note("D9b", "gate: frames shown original inside rendered clips",
+                 f"{sum(by.values())}/{ls.get('gated_frames')} frames: "
+                 + ", ".join(f"{k} {v}" for k, v in by.items())
+                 + f"; sporadic occlusion {ls.get('occluded_sporadic')}; "
+                 f"{ls.get('switches')} switches, fade {ls.get('fade_frames')} frames, "
+                 f"{ls.get('faded_frames')} frames blended")
+    else:
+        rep.note("D9b", "gate: occlusion reverted frames (v3.3 state, no reasons)",
+                 ls.get("reverted_frames"))
+    sws = ls.get("switch_list") or []
+    ratios = [s["step_faded"] / s["step_hard"] for s in sws
+              if s.get("step_hard") and s.get("step_faded") is not None]
+    if ratios:
+        worse = sum(1 for r in ratios if r > 1.0)
+        rep.note("D9c", "switch step written/hard (median; informational)",
+                 f"{statistics.median(ratios):.2f} over {len(ratios)} switches, "
+                 f"{worse} with a larger written step (source motion on the ramp)")
+
+
 def eval_qc(state: dict, rep: Report) -> None:
     from ai_movie import qc as qc_mod
     q = qc_mod.build_qc(state)
@@ -738,7 +811,7 @@ def main() -> int:
                  f"{type(exc).__name__}: {exc}")
     eval_compose(state, rep)
     for fn, key in ((eval_compact, "C5"), (eval_f0_gate, "C2c"), (eval_cuts, "D8"),
-                    (eval_mix, "E2"), (eval_qc, "F1")):
+                    (eval_passthrough, "D9"), (eval_mix, "E2"), (eval_qc, "F1")):
         try:
             fn(state, rep)
         except Exception as exc:                        # noqa: BLE001

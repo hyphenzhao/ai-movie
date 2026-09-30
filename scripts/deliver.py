@@ -96,7 +96,7 @@ def main() -> int:
 
     qc_suffix = "_vc" if args.version == "vc" else ""
     for fn in (f"06_qc{qc_suffix}_review.csv", f"06_qc{qc_suffix}_summary.txt",
-               "ACCEPTANCE.md", "03_compact_report.csv"):
+               "ACCEPTANCE.md", "03_compact_report.csv", "04_switches.csv"):
         p = deliver / fn
         if p.exists():
             shutil.copy2(p, folder / fn)

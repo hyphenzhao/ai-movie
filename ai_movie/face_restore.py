@@ -554,6 +554,9 @@ def occlusion_gate_video(
     region_feather_frac: float = 0.02,
     cuts=None,
     stats: dict | None = None,
+    anchored: dict[int, list[float]] | None = None,
+    fade_frames: int | None = None,
+    edge_fade: tuple[bool, bool] = (True, True),
     cancel_check: Callable[[], bool] | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> Path:
@@ -581,14 +584,39 @@ def occlusion_gate_video(
     ``cuts`` are clip-local scdet cut indices (box interpolation never
     bridges one); ``stats`` receives per-clip counts.  Audio is taken from
     *lipsync_video*.  If the parser is unavailable the lip-synced video is
-    passed through unchanged.
+    passed through unchanged (no gate, no fade — documented limit).
+
+    v3.4 (L5/L8): ``anchored`` maps the clip-local frames MuseTalk was asked
+    to paint to their plan box (``[x1, y1, x2, y2]`` in this clip's pixels);
+    ``None`` means every frame was painted (no face plan).  A frame outside
+    it is original by construction, so it is never blended and its reason is
+    ``"plan"``.  Every switch between generated and original frames — plan
+    or occlusion — is crossfaded over ``fade_frames`` generated frames
+    (default ``config.LIPSYNC_SWITCH_FADE_FRAMES``; 0 = hard cut as before)
+    by :class:`ai_movie.switch_fade.FadeWriter`: the blend is per index, so
+    the frame count is exactly what it was.  ``edge_fade`` says whether the
+    clip's first / last frame is a real switch (False when the neighbouring
+    clip in the timeline continues generated, e.g. a 12 s split of one
+    line).  ``stats`` gains ``use_orig_by_reason`` (plan / no_face / lip),
+    ``occluded_sporadic``, ``faded_frames``, ``fade_frames`` and one
+    ``switches`` record per boundary with the size of the visual step the
+    hard cut would have made (``step_hard``), the largest step actually
+    written across the ramp (``step_faded``) and the source's own motion
+    there (``step_src``) — bookkeeping for QC/eval, not a gate.
     """
-    from ai_movie.config import OCCLUSION_FULL_LIP_THRESH, OCCLUSION_MODE
+    from ai_movie.config import (LIPSYNC_SWITCH_FADE_FRAMES, OCCLUSION_FULL_LIP_THRESH,
+                                 OCCLUSION_MODE)
     from ai_movie.shots import local_cuts
+    from ai_movie.switch_fade import FadeWriter, SwitchLog
 
     occlusion_mode = occlusion_mode or OCCLUSION_MODE
     full_lip_thresh = OCCLUSION_FULL_LIP_THRESH if full_lip_thresh is None else full_lip_thresh
     region_mode = occlusion_mode == "region"
+    fade = int(LIPSYNC_SWITCH_FADE_FRAMES if fade_frames is None else fade_frames)
+    fade = max(0, fade)
+    anchored_map = None
+    if anchored is not None:
+        anchored_map = {int(k): v for k, v in anchored.items()}
 
     orig_video, lipsync_video, out_video = Path(orig_video), Path(lipsync_video), Path(out_video)
     if not face_parser_available():
@@ -616,6 +644,28 @@ def occlusion_gate_video(
     reverted = 0
     region_frames = 0
     region_px = 0.0
+    by_reason = {"plan": 0, "no_face": 0, "lip": 0}
+    sporadic = 0
+    n_anchored = 0
+
+    # The fade writer blends (orig, generated) pairs per index and calls
+    # ``_sink`` once per frame, in order; the switch log records every
+    # generated↔original boundary with its step sizes (switch_fade.py).
+    written = 0
+    switch_log = SwitchLog(fade)
+
+    def _sink(idx: int, out: np.ndarray, w: float, item: tuple) -> None:
+        nonlocal written
+        writer.write(out)
+        written += 1
+        switch_log.observe(idx, out, item)
+
+    fade_cuts = set(local_cuts(cuts, 0, total)) if cuts else set()
+    if not edge_fade[0]:
+        fade_cuts.add(0)
+    if not edge_fade[1]:
+        fade_cuts.add(total)
+    fader = FadeWriter(fade, fade_cuts, _sink)
     try:
         while processed < total:
             if cancel_check and cancel_check():
@@ -666,11 +716,14 @@ def occlusion_gate_video(
             # per-pixel occluder is composited right here and only a total
             # loss of lip pixels counts as "occluded" for the frame revert.
             occluded = [False] * n
+            occ_reason = [None] * n
             for i in range(n):
                 box = boxes[i]
                 if box is None:
                     occluded[i] = True
+                    occ_reason[i] = "no_face"
                     continue
+                occ_reason[i] = "lip"
                 y1, y2, x1, x2 = box
                 bw, bh = x2 - x1, y2 - y1
                 if bw > 8 and bh > 8:
@@ -731,19 +784,48 @@ def occlusion_gate_video(
                 else:
                     j += 1
 
+            # Third pass: decide per frame what is shown and why, then hand
+            # the (orig, generated) pairs to the fade writer.  Reasons
+            # partition the original-shown frames: a frame MuseTalk never
+            # painted is "plan" whatever the lip check said about it.
+            items = []
             for i in range(n):
-                writer.write(ow[i] if revert[i] else lw[i])
+                g = base + i
+                is_anchored = anchored_map is None or g in anchored_map
+                if is_anchored:
+                    n_anchored += 1
+                    if occluded[i] and not revert[i]:
+                        sporadic += 1
                 if revert[i]:
                     reverted += 1
+                use_orig = revert[i] or not is_anchored
+                reason = None
+                if not is_anchored:
+                    reason = "plan"
+                elif revert[i]:
+                    reason = occ_reason[i] or "lip"
+                if reason:
+                    by_reason[reason] += 1
+                box = boxes[i]
+                if box is None and is_anchored and anchored_map is not None:
+                    x1, y1, x2, y2 = anchored_map[g][:4]
+                    box = (int(y1), int(y2), int(x1), int(x2))
+                items.append((ow[i], lw[i], use_orig, {"box": box, "reason": reason}))
                 processed += 1
+            fader.push(items)
 
-            del ow, lw, boxes
+            del ow, lw, boxes, items
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if log_cb:
                 log_cb(f"occlusion-gate: {processed}/{total} frames "
                        f"({reverted} kept original)")
+
+        fader.flush()
+        if written != processed:
+            raise RuntimeError(f"occlusion_gate: wrote {written} of {processed} frames read")
+        switches = switch_log.records()
 
         capO.release(); capL.release()
         if writer is not None:
@@ -764,13 +846,23 @@ def occlusion_gate_video(
         if log_cb:
             log_cb(f"occlusion-gate done ({occlusion_mode}): {reverted}/{total} frames "
                    f"kept original"
-                   + (f", {region_frames} frames region-patched" if region_mode else ""))
+                   + (f", {region_frames} frames region-patched" if region_mode else "")
+                   + f"; {written} frames written, {len(switches)} switches, "
+                     f"{fader.faded} faded (fade={fade})")
         if stats is not None:
             stats.update({"mode": occlusion_mode, "frames": int(total),
                           "reverted_frames": int(reverted),
                           "region_frames": int(region_frames),
                           "region_px_mean": round(region_px / region_frames, 4)
-                          if region_frames else 0.0})
+                          if region_frames else 0.0,
+                          # v3.4 L8 counts: reasons partition the frames shown original
+                          "anchored_frames": int(n_anchored),
+                          "use_orig_by_reason": {k: int(v) for k, v in by_reason.items()},
+                          "occluded_sporadic": int(sporadic),
+                          "fade_frames": int(fade),
+                          "faded_frames": int(fader.faded),
+                          "written_frames": int(written),
+                          "switches": switches})
     finally:
         if capO.isOpened():
             capO.release()

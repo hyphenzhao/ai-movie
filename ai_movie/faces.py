@@ -21,6 +21,7 @@ silent, uninterruptible MIOpen JIT compile on gfx1151 — the same trap that
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -1330,6 +1331,189 @@ def build_face_plan(
     _say(f"人脸方案完成：{len(plan['tracks'])} 条轨迹，"
          f"{len(frames)} 帧有目标脸，{n_gated} 帧因侧脸/过小直通")
     return out
+
+
+# ── pass-through accounting (v3.4, L8 step 1) ─────────────────────
+#
+# ``build_face_plan`` only says WHICH frames get a target box; everything else
+# in a speech window passes through, and nobody could say why — an unbound
+# speaker, a profile, a shot cut, a track that ended?  ``passthrough_reasons``
+# re-derives the plan's own decisions (same interpolation, same gate, same
+# parameters, read back from ``plan["gate"]``) and attributes every
+# non-anchored frame of every padded speech window to exactly one reason.
+# It reads the tracks the plan was built from, so it changes nothing that
+# is hashed; ``run_pipeline.step_faces`` stores the result in the state.
+
+PASSTHROUGH_REASONS = ("nonlexical", "unbound", "yaw", "size", "smooth",
+                       "cut", "track_gap", "offscreen", "other")
+
+
+def mark_no_lipsync(segments: list[dict]) -> list[dict]:
+    """Copy of *segments* with ``no_lipsync=True`` on interjection-only lines.
+
+    The one definition of "leave the picture alone for this line", shared by
+    ``run_pipeline.step_faces`` (which builds the plan from it) and the
+    offline accounting in ``passthrough_reasons`` / eval: a line the content
+    classifier called ``nonlexical``, one already flagged, or — for a state
+    written before ``content`` existed — one ``units.is_nonlexical`` calls a
+    moan/laugh.
+    """
+    from ai_movie.units import is_nonlexical
+    return [dict(s, no_lipsync=True)
+            if (s.get("content") == "nonlexical" or s.get("no_lipsync")
+                or (not s.get("content") and is_nonlexical(s.get("text", ""))))
+            else s for s in segments]
+
+
+def load_tracks_cache_plan(path: str | Path) -> dict | None:
+    """The tracks plan stored in ``face_tracks_cache.json``, keys int-ised
+    like ``_load_tracks_cache`` but WITHOUT the cache-key check — for reading
+    back the tracks a plan was built from, not for deciding whether to
+    re-detect."""
+    try:
+        blob = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    plan = blob.get("plan") if isinstance(blob, dict) else None
+    if not plan or "tracks" not in plan:
+        return None
+    plan["size"] = tuple(plan.get("size") or ())
+    for t in plan["tracks"]:
+        t["keyframes"] = {int(k): v for k, v in (t.get("keyframes") or {}).items()}
+        if "yaw" in t:
+            t["yaw"] = {int(k): v for k, v in (t.get("yaw") or {}).items()}
+    return plan
+
+
+def passthrough_reasons(plan: dict, segments: list[dict], *,
+                        tracks: list[dict] | None = None,
+                        pad_seconds: float = 0.7) -> dict:
+    """Why each non-anchored frame inside a speech window passes through.
+
+    *plan* is a ``build_face_plan`` result (in memory, with ``_tracks_full``,
+    or loaded from ``face_plan.json`` plus *tracks* from
+    :func:`load_tracks_cache_plan`).  *segments* are the segments the plan
+    was built from — already through :func:`mark_no_lipsync`.  The window of
+    a segment is the same ``[start·fps − pad, end·fps + pad]`` the plan
+    used, inclusive at both ends.
+
+    Reasons, first match wins, anchored always wins:
+      ``nonlexical``  the line keeps the original picture by design;
+      ``unbound``     no speaker/segment track for the line;
+      ``yaw`` / ``size`` / ``smooth``  tracked but gated (|yaw| > yaw_max,
+                      width below the gate width, or pulled in only by the
+                      median filter);
+      ``cut`` / ``track_gap`` / ``offscreen``  no box: the track's box is
+                      not interpolated across a shot change, across a
+                      keyframe gap longer than ``det_every·(FACE_TRACK_MAX_GAP+1)``,
+                      or the frame lies outside the track's keyframe span;
+      ``other``       tracked, not gated, yet not anchored (a plan built
+                      with different parameters than ``plan["gate"]``).
+
+    Returns ``{"frames": {reason: n}, "speech_frames": N,
+    "anchored_in_windows": M, "segments": {i: {reason: n}}}`` with
+    ``N == M + Σ frames`` (a frame in two windows counts once per window).
+    """
+    from ai_movie.shots import crosses_cut
+
+    tracks = tracks if tracks is not None else (plan.get("_tracks_full") or [])
+    fps = float(plan["fps"])
+    n_frames = int(plan["n_frames"])
+    det_every = int(plan.get("det_every") or FACE_DET_EVERY)
+    cuts = sorted(int(c) for c in (plan.get("cuts") or []))
+    gate = plan.get("gate") or {}
+    yaw_max = float(gate.get("yaw_max", FACE_YAW_MAX))
+    min_width = float(gate.get("min_width", FACE_MIN_WIDTH))
+    min_width_sr = gate.get("min_width_sr")
+    smooth = int(gate.get("smooth", FACE_GATE_SMOOTH))
+    lo = float(min_width_sr) if min_width_sr is not None else min_width
+    anchored = {int(k) for k in (plan.get("frames") or {})}
+    bindings = plan.get("speaker_track") or {}
+    seg_bindings = {int(k): v for k, v in (plan.get("segment_track") or {}).items()}
+
+    by_id = {int(t["id"]): t for t in tracks}
+    per_track: dict[int, dict[int, list[float]]] = {}
+    per_yaw: dict[int, dict[int, float]] = {}
+    keys_of: dict[int, list[int]] = {}
+    for tid, t in by_id.items():
+        per_track[tid] = interpolate_track(t, n_frames, det_every=det_every, cuts=cuts)
+        per_yaw[tid] = interpolate_scalar(t.get("yaw") or {}, n_frames,
+                                          det_every=det_every, cuts=cuts)
+        keys_of[tid] = sorted(int(k) for k in t["keyframes"])
+
+    def _no_box_reason(tid: int, f: int) -> str:
+        keys = keys_of[tid]
+        if not keys or f < keys[0] or f > keys[-1]:
+            return "offscreen"
+        j = bisect.bisect_right(keys, f)
+        if j >= len(keys):
+            return "other"                  # f is the last keyframe itself
+        k0, k1 = keys[j - 1], keys[j]
+        kfs = by_id[tid]["keyframes"]
+        if crosses_cut(k0, k1, cuts) or boxes_disjoint(kfs[k0], kfs[k1]):
+            return "cut"
+        if (k1 - k0) > det_every * (FACE_TRACK_MAX_GAP + 1):
+            return "track_gap"
+        return "other"
+
+    pad = int(round(pad_seconds * fps))
+    totals = {r: 0 for r in PASSTHROUGH_REASONS}
+    per_seg: dict[int, dict[str, int]] = {}
+    speech_frames = 0
+    anchored_in_windows = 0
+    for i, seg in enumerate(segments):
+        a = max(0, int(float(seg["start"]) * fps) - pad)
+        b = min(n_frames, int(float(seg["end"]) * fps) + pad)
+        window = range(a, b + 1)
+        speech_frames += len(window)
+        counts: dict[str, int] = {}
+        if seg.get("no_lipsync"):
+            tid = None
+            fixed = "nonlexical"
+        else:
+            tid = seg_bindings.get(i, bindings.get(seg.get("speaker") or ""))
+            if tid is not None and int(tid) not in by_id:
+                tid = None
+            fixed = "unbound" if tid is None else None
+        cand: dict[int, list[float]] = {}
+        gated: set[int] = set()
+        yaw_of: dict[int, float] = {}
+        if tid is not None:
+            tid = int(tid)
+            cand = {f: per_track[tid][f] for f in window if f in per_track[tid]}
+            yaw_of = per_yaw[tid]
+            if cand:
+                gated, _sr = gate_frames(list(cand), cand, yaw_of, yaw_max=yaw_max,
+                                         min_width=min_width, smooth=smooth,
+                                         min_width_sr=lo)
+        for f in window:
+            if f in anchored:
+                anchored_in_windows += 1
+                continue
+            if fixed:
+                r = fixed
+            elif f in cand:
+                if f in gated:
+                    y = yaw_of.get(f)
+                    box = cand[f]
+                    if y is not None and abs(y) > yaw_max:
+                        r = "yaw"
+                    elif (box[2] - box[0]) < lo:
+                        r = "size"
+                    else:
+                        r = "smooth"
+                else:
+                    r = "other"
+            else:
+                r = _no_box_reason(tid, f)
+            counts[r] = counts.get(r, 0) + 1
+            totals[r] += 1
+        if counts:
+            per_seg[i] = counts
+    return {"frames": {k: v for k, v in totals.items() if v},
+            "speech_frames": int(speech_frames),
+            "anchored_in_windows": int(anchored_in_windows),
+            "segments": {str(k): v for k, v in per_seg.items()}}
 
 
 def save_track_thumbnails(video_path: str | Path, plan: dict,
