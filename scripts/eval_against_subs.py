@@ -367,11 +367,60 @@ def translation_metrics(segments: list[dict]) -> dict:
     }
 
 
+# Second/third person, the same classes units.unsupported_pronoun looks at;
+# 您 is the polite 你.  First person is not scored: supplying 我 for a dropped
+# Japanese subject is normal Chinese and the references do it freely.
+_PRONOUN_CLASSES = (("你", "你您"), ("他", "他"), ("她", "她"))
+
+
+def pronoun_classes(zh: str | None) -> set[str]:
+    return {label for label, chars in _PRONOUN_CLASSES if any(c in (zh or "") for c in chars)}
+
+
+def pronoun_agreement(groups: list[dict]) -> dict:
+    """Agreement of 你/他/她 with the reference Chinese, cue by cue.
+
+    ``units.unsupported_pronoun`` (the F1 flag, the old H5/H6 gates) can only
+    count pronouns the Japanese did not spell out, so it rewards deleting
+    them.  Measured against the reference translations already in the repo
+    the shipped v3.3 output errs the other way: output_test invents 0 and
+    *misses* 11 of 97 scored cues, SONE-846 invents 9 and misses 39 of 445.
+    So each scored cue (reference and our line both non-empty) compares the
+    set of pronoun classes: ``extra`` = we have one the reference lacks,
+    ``missing`` = the reference has one we lack; a cue can be both (他 vs
+    她).  ``mismatch`` is their sum — the number the release gate and the
+    T1/T9 A/B compare, with ``extra`` bounded separately so "missing" cannot
+    be fixed by spraying 你.
+    """
+    scored = agree = extra = missing = 0
+    examples: list[dict] = []
+    for g in groups:
+        ref, ours = (g.get("ref_zh") or "").strip(), (g.get("ours_zh") or "").strip()
+        if not ref or not ours:
+            continue
+        r, o = pronoun_classes(ref), pronoun_classes(ours)
+        scored += 1
+        if o == r:
+            agree += 1
+            continue
+        if o - r:
+            extra += 1
+        if r - o:
+            missing += 1
+        if len(examples) < 20:
+            examples.append({"start": g.get("start"), "ref": ref, "ours": ours,
+                             "extra": "".join(sorted(o - r)), "missing": "".join(sorted(r - o))})
+    return {"scored": scored, "agree": agree, "extra": extra, "missing": missing,
+            "mismatch": extra + missing, "examples": examples}
+
+
 def summarise(groups: list[dict], segments: list[dict]) -> dict:
     scored = [g for g in groups if g["sim"] is not None]
     out = {"cues": len(scored),
            "covered_segments": len({i for g in scored for i in g["idxs"]}),
            **translation_metrics(segments)}
+    if any(g.get("ref_zh") for g in groups):
+        out["pronoun_agreement"] = pronoun_agreement(groups)
     if scored:
         sims = [g["sim"] for g in scored]
         out.update({
@@ -420,6 +469,20 @@ def render(name: str, groups: list[dict], segments: list[dict],
         f"- 译文残留假名的段：**{summary['kana_segments']}**",
         "",
     ]
+    pa = summary.get("pronoun_agreement")
+    if pa:
+        out += [
+            "## 人称代词与参考译文的一致性（你/您、他、她）",
+            "",
+            f"- 可比句 **{pa['scored']}**，一致 {pa['agree']}，"
+            f"我们多出 **{pa['extra']}**，我们缺少 **{pa['missing']}**（不一致合计 {pa['mismatch']}）",
+            "",
+        ]
+        for e in pa["examples"]:
+            out.append(f"- [{e['start']:.1f}s] 参考「{e['ref']}」→ 我们「{e['ours']}」"
+                       + (f"（多出 {e['extra']}）" if e["extra"] else "")
+                       + (f"（缺少 {e['missing']}）" if e["missing"] else ""))
+        out.append("")
     if scored:
         out += [f"## ASR 差异最大的 {worst} 句", ""]
         for g in sorted(scored, key=lambda x: x["sim"])[:worst]:
@@ -545,6 +608,10 @@ def main() -> None:
               f"半截话 {summary['fragmented_cues']}")
     print(f"{args.name}: 单元 {summary['n_units']}，半截话单元 {summary['fragmented_units']}，"
           f"代词可疑 {summary['pronoun_units']}，假名残留 {summary['kana_segments']}")
+    if summary.get("pronoun_agreement"):
+        pa = summary["pronoun_agreement"]
+        print(f"{args.name}: 代词对照参考译文 {pa['scored']} 句，多出 {pa['extra']}，"
+              f"缺少 {pa['missing']}（不一致 {pa['mismatch']}）")
     print(f"报告 {out}")
 
 
