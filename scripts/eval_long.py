@@ -24,6 +24,7 @@ import argparse
 import bisect
 import difflib
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -44,6 +45,14 @@ L3_MIN_MEDIAN = 0.40
 L3_MAX_SPREAD = 0.15
 L5_TOL_LU = 2.0
 L6_TOL_S = 0.5              # ±1 frame per chunk boundary is the concat floor
+# Screen truth = screen.json (human-read tiles, always wins) ∪ screen_ocr.json (scripts/screen_ocr.py,
+# ids the person never read).  OCR rows below OCR_MIN_CONF (their rec score in screen_ocr.meta.json)
+# are not truth: measured on SONE-846's 118 human zh rows the bundled recogniser is at mean CER 0.011
+# / 1 % gross errors above 0.60 and the curve is flat from 0.50 to 0.70, so the cut costs ≤ 2 % coverage.
+# AI_MOVIE_EVAL_TRUTH=human restores the pre-v3.4 population (L2b on the 28 human interview cues);
+# a lower merged L2b is a truer measurement on ~10× the cues, not OCR bias — the 0.75 floor was set on n=28.
+OCR_MIN_CONF = 0.60
+EVAL_TRUTH = os.environ.get("AI_MOVIE_EVAL_TRUTH", "merged")     # "merged" | "human"
 
 _PAREN = re.compile(r"^\s*[（(].*[)）]\s*$")
 
@@ -91,10 +100,40 @@ def film_segments(film: str, stage: str | None = None) -> tuple[list[dict], dict
     return segs, meta
 
 
-def cues(film: str) -> tuple[list[dict], dict]:
+def read_truth(scr: Path, *, truth: str = EVAL_TRUTH, min_conf: float = OCR_MIN_CONF) -> tuple[dict[int, list[str]], dict[int, str]]:
+    """``({id: [zh, ja]}, {id: "human" | "ocr"})`` for a film's ``_screen`` dir.
+
+    A human entry wins even when one of its rows is empty (the person judged that row
+    unreadable).  An OCR row whose score in ``screen_ocr.meta.json`` is below *min_conf*
+    is blanked; an OCR id with both rows blank is dropped.  *truth* ``"human"`` ignores
+    the OCR file altogether."""
+    def _load(p: Path) -> dict:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    read = {int(k): list(v) for k, v in _load(scr / "screen.json").items()}
+    src = {k: "human" for k in read}
+    if truth != "merged":
+        return read, src
+    rows = (_load(scr / "screen_ocr.meta.json").get("rows") or {})
+    for k, v in _load(scr / "screen_ocr.json").items():
+        cid = int(k)
+        if cid in read:
+            continue
+        m = rows.get(str(cid)) or {}
+        zh, ja = (list(v) + ["", ""])[:2]
+        if ((m.get("zh") or {}).get("score") or 0.0) < min_conf and m.get("zh"):
+            zh = ""
+        if ((m.get("ja") or {}).get("score") or 0.0) < min_conf and m.get("ja"):
+            ja = ""
+        if zh or ja:
+            read[cid] = [zh, ja]
+            src[cid] = "ocr"
+    return read, src
+
+
+def cues(film: str, *, truth: str = EVAL_TRUTH) -> tuple[list[dict], dict]:
     scr = ROOT / "workspace" / film / "_screen"
     scan = json.loads((scr / "scan.json").read_text())
-    read = {int(k): v for k, v in json.loads((scr / "screen.json").read_text()).items()} if (scr / "screen.json").exists() else {}
+    read, _ = read_truth(scr, truth=truth)
     out = [c for c in scan if c.get("sub") and not _PAREN.match(c.get("zh") or "")]
     return out, read
 
