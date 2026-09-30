@@ -27,7 +27,7 @@ from . import projects as P
 
 JOBS_FILE = P.WORKSPACE / "_web" / "jobs.json"
 FOREIGN_PATTERNS = ("run_pipeline.py", "run_vc_version.py", "auto_select_refs.py",
-                    "vc_ref_probe.py", "scripts.inference", "run_v3.sh", "deliver.py")
+                    "vc_ref_probe.py", "scripts.inference", "run_v3.sh", "deliver.py", "ab_cross_lingual.py")
 
 _RE_TS = re.compile(r"^\[\d\d:\d\d:\d\d\] ")
 _RE_START = re.compile(r"^▶ (\w+)$")
