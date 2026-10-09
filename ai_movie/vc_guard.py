@@ -21,8 +21,10 @@ the v3.3 release (417 sampled lines, 299 converted) found 43 converted lines
 (14 %) whose Whisper reading resembles neither the built-in line's reading
 nor the intended text — language flips (「不妙啊」→ "Tchau, tchau", 「没有吗？」
 → "Mijn oma") and word drift (「把腿伸直」→「把腿先举」, 「射出来射出来」→
-「秀出來」) — while built-in lines re-read by the same Whisper score 1.00
-(p5 = 1.00), so the loss is in the conversion, not the metric.  The content
+「秀出來」). These are ASR proxy flags, not human labels: the historical
+verify pass uses fitted audio and a different decoder from this guard.
+Agreement when re-reading identical built-in audio does not establish
+accuracy on a converted voice. The content
 judge (:func:`judge_content`) therefore re-reads both wavs and scores the
 conversion by folded similarity to max(v1 reading, intended text):
 
@@ -115,6 +117,21 @@ def _readings(r) -> tuple[str, str | None]:
     return a, (z if z else None)
 
 
+def _reading_error(r) -> str | None:
+    """Missing/failed ASR is not a successful decode with an empty transcript."""
+    if isinstance(r, str):
+        return None
+    if not isinstance(r, dict) or r.get("auto") is None:
+        return "missing transcript"
+    if r.get("error"):
+        return str(r["error"])
+    for key in ("auto", "zh"):
+        part = r.get(key)
+        if isinstance(part, dict) and part.get("error"):
+            return f"{key}: {part['error']}"
+    return None
+
+
 def judge_content(conv, v1, want: str | None, *, min_chars: int = VC_DRIFT_MIN_CHARS,
                   baseline_min: float = VC_DRIFT_BASELINE_MIN, min_sim: float = VC_DRIFT_MIN_SIM,
                   kana_leak: int = VC_DRIFT_KANA_LEAK) -> dict:
@@ -125,10 +142,10 @@ def judge_content(conv, v1, want: str | None, *, min_chars: int = VC_DRIFT_MIN_C
     intended text.  Returns ``{"judged", "ok", "reason", "score", "baseline",
     "heard_conv", "heard_v1"}``.
 
-    Decode regime mirrors ``scripts/verify_dub.py`` (auto language, forced-zh
-    re-decode when auto ≠ zh) so the thresholds calibrated on its rows
-    transfer: a forced-zh decode alone would turn every Portuguese output
-    into phonetic Chinese and ``script_flip`` would never fire.
+    Both this guard and ``scripts/verify_dub.py`` use automatic language ID
+    followed by a forced-zh decode when auto ≠ zh. Their decoder, audio
+    field and forced-decode acceptance metric differ; historical verify
+    rows are a proxy comparison, not proof that the thresholds transfer.
 
     Rules, in order:
 
@@ -159,11 +176,16 @@ def judge_content(conv, v1, want: str | None, *, min_chars: int = VC_DRIFT_MIN_C
     want = want or ""
     v1_auto, v1_zh = _readings(v1)
     c_auto, c_zh = _readings(conv)
-    # ``gate`` says why the drift rule was not applied: no_v1_cjk / short / baseline / None (applied).
+    # ``gate``: transcript_error / no_v1_cjk / short / baseline / None (applied).
     res = {"judged": False, "ok": True, "reason": "", "score": None, "baseline": None,
            "heard_conv": c_auto, "heard_v1": v1_auto, "gate": None}
-    # The built-in line's forced-zh reading only counts when it reads the intended text (verify_dub's
-    # rule); otherwise a v1 heard as "Back off" would pass rule 1 on the strength of phonetic Chinese.
+    errors = {key: err for key, reading in (("conv", conv), ("v1", v1))
+              if (err := _reading_error(reading)) is not None}
+    if errors:
+        res.update(gate="transcript_error", errors=errors)
+        return res
+    # Require similarity to the intended text before accepting a forced-zh baseline; otherwise
+    # phonetic Chinese from an unrelated/nonverbal source could enable rejection of its conversion.
     v1_texts = [t for t in (v1_auto,) if t]
     if v1_zh and text_sim(v1_zh, want) >= min_sim:
         v1_texts.append(v1_zh)
@@ -179,7 +201,7 @@ def judge_content(conv, v1, want: str | None, *, min_chars: int = VC_DRIFT_MIN_C
     s_auto, s_zh = _score(c_auto), (_score(c_zh) if c_zh else None)
     score = max(s_auto, s_zh or 0.0)
     res["score"] = round(score, 3)
-    rescued = s_zh is not None and s_zh >= min_sim      # verify_dub's rule: forced zh reads the line → audio is Chinese
+    rescued = s_zh is not None and s_zh >= min_sim      # ASR support for a pass, not human confirmation
     if fold_zh(c_auto):
         res["judged"] = True
         if not CJK_RE.search(c_auto) and not rescued:
@@ -365,7 +387,7 @@ def _merge_drift(segs, items, v1_segs, verdicts, *, transcribe, source_key, thre
     """
     import time
     units = _drift_units(segs, items, v1_segs, source_key=source_key)
-    out: dict = {"units": len(units), "judged": 0, "rejected": 0, "seconds": None}
+    out: dict = {"units": len(units), "judged": 0, "rejected": 0, "seconds": None, "error_units": 0}
     if not units:
         return out
     t0 = time.time()
@@ -379,6 +401,8 @@ def _merge_drift(segs, items, v1_segs, verdicts, *, transcribe, source_key, thre
     out["seconds"] = round(time.time() - t0, 1)
     for u in units:
         d = judge_content(texts.get(u["conv"]), texts.get(u["v1"]), u["want"], **thresholds)
+        if d.get("errors"):
+            out["error_units"] += 1
         if u["kind"] == "line":
             targets, tag, key = [u["idx"]], "", "drift"
         else:
@@ -394,9 +418,13 @@ def _merge_drift(segs, items, v1_segs, verdicts, *, transcribe, source_key, thre
             v[key] = {"judged": d["judged"], "ok": d["ok"], "reason": d["reason"], "score": d["score"],
                       "baseline": d["baseline"], "gate": d.get("gate"),
                       "heard_conv": d["heard_conv"], "heard_v1": d["heard_v1"]}
+            if d.get("errors"):
+                v[key]["errors"] = d["errors"]
             if d["judged"]:
                 v["judged"] = True
                 if not d["ok"] and v["ok"]:
                     v["ok"] = False
                     v["reason"] = d["reason"]
+    if out["error_units"]:
+        out["error"] = f"transcripts unavailable for {out['error_units']}/{len(units)} units; content not judged"
     return out

@@ -29,6 +29,9 @@ DELIVER = ROOT / "deliver"
 WORKSPACE = Path(WORKSPACE_DIR)
 UPLOADS = WORKSPACE / "_uploads"
 MEDIA_ROOTS = (WORKSPACE, INPUTS, DELIVER)
+LAN_MOUNT = Path.home() / "mnt" / "PrivateFiles"
+LAN_WORKSPACE = LAN_MOUNT / "AI-Movie" / "workspace"
+LAN_MOUNT_SOURCE = "ai-movie-lan:PrivateFiles"
 MEDIA_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".wav", ".mp3", ".jpg", ".jpeg", ".png",
               ".json", ".csv", ".srt", ".md", ".txt", ".log"}
 NAME_RE = re.compile(r"^[A-Za-z0-9_.\-一-鿿]{1,64}$")
@@ -109,6 +112,25 @@ def find_video(name: str, state: dict | None = None) -> Path | None:
     return None
 
 
+def _mounted_lan_workspace() -> Path | None:
+    """Trust only the fixed workspace on the configured, currently mounted NAS."""
+    try:
+        if LAN_MOUNT.resolve() != LAN_MOUNT or LAN_WORKSPACE.resolve() != LAN_WORKSPACE:
+            return None
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            before, sep, after = line.partition(" - ")
+            fields, fs = before.split(), after.split()
+            if not sep or len(fields) < 6 or len(fs) < 3:
+                continue
+            target = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+            source = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fs[1])
+            if target == str(LAN_MOUNT) and source == LAN_MOUNT_SOURCE and fs[0] == "fuse.rclone":
+                return LAN_WORKSPACE
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return None
+
+
 def safe_media_path(p: str) -> Path | None:
     """Absolute path under workspace/inputs/deliver with an allowed extension."""
     try:
@@ -126,6 +148,11 @@ def safe_media_path(p: str) -> Path | None:
                 return path
         except Exception:                               # noqa: BLE001
             continue
+    # workspace itself stays local while its individual project directories
+    # point to the NAS. Resolve both the file and the fixed remote root; never
+    # allow arbitrary external targets merely because a local symlink exists.
+    if path.is_relative_to(LAN_WORKSPACE) and _mounted_lan_workspace() == LAN_WORKSPACE:
+        return path
     return None
 
 

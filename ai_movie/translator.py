@@ -1895,14 +1895,12 @@ TRANSLATE_ENGINES = {
 
 
 # Generation options shared by the single-sentence rewrite channels (enforce,
-# compact).  _call_ollama_chat defaults to repeat_penalty 1.15 because the
-# batch translators degenerated without it; Ollama's penalty also covers the
-# prompt tokens (repeat_last_n), so a copy-with-one-substitution task was
-# being penalised for reproducing the very sentence it was told to keep (the
-# v3.4 design review attributes the 啊啊啊 / 舔×30 mangling of long compact
-# lines to this, not to the model).  scripts/ab_compact_enforce.py runs a
-# 1.15 arm so the change is measured, not assumed.
-_REWRITE_OPTIONS = {"temperature": 0.0, "repeat_penalty": 1.0}
+# compact). T5's full four-arm comparison retained Qwen but did not qualify
+# the 1.0 penalty override: compact accepted 42/52 at 1.0 versus 43/52 at
+# 1.15, failing the pre-registered non-regression gate for both tasks.
+# Inherit _call_ollama_chat's repeat_penalty 1.15; explicit experiment options
+# can still override it. See workspace/_ab/compact_enforce/summary.md.
+_REWRITE_OPTIONS = {"temperature": 0.0}
 
 _ENFORCE_PREFIX_RE = re.compile(r"^(?:改正后|修改后|输出|结果|译文)[：:]\s*")
 _QUOTE_CHARS = "「」『』\"'“”‘’"

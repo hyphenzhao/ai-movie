@@ -103,10 +103,18 @@ def qc_fail_frac(rows: list[dict], key: str) -> float | None:
 def run_eval_pipeline(film: str, outdir: Path) -> list[dict]:
     state = ROOT / "workspace" / film / "state.json"
     js = outdir / f"{film}.eval.json"
-    subprocess.run([sys.executable, str(ROOT / "scripts" / "eval_pipeline.py"), str(state),
+    # An interrupted evaluator must not silently reuse a previous run's report.
+    js.unlink(missing_ok=True)
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "eval_pipeline.py"), str(state),
                     "--out", str(outdir / f"{film}.ACCEPTANCE.md"), "--json", str(js)],
                    capture_output=True, text=True, timeout=3600)
-    return json.loads(js.read_text(encoding="utf-8")) if js.exists() else []
+    if proc.returncode not in (0, 1) or not js.exists():
+        raise RuntimeError(f"{film}: eval_pipeline failed to produce a new report "
+                           f"(exit {proc.returncode}): {proc.stderr[-1000:]}")
+    rows = json.loads(js.read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"{film}: eval_pipeline produced an empty/invalid report")
+    return rows
 
 
 def subs_summary(film: str, state_path: Path, outdir: Path, tag: str) -> tuple[dict, list]:
@@ -185,7 +193,7 @@ def main() -> int:
         regressed = sorted(k for k, v in base_ok.items() if v and cur_ok.get(k) is False)
         fixed = sorted(k for k, v in base_ok.items() if not v and cur_ok.get(k) is True)
         missing = sorted(k for k, v in base_ok.items() if v and k not in cur_ok)
-        gate(f"H2[{film}]", "基线通过的验收项现在没有失败", not regressed,
+        gate(f"H2[{film}]", "基线通过的验收项现在没有失败或缺测", not regressed and not missing,
              f"回退 {regressed or '无'}；新修复 {fixed or '无'}"
              + (f"；本次未检查 {missing}" if missing else ""))
         for qc_key, label in (("F1", "v1"), ("F4", "v2")):
@@ -248,19 +256,6 @@ def main() -> int:
                      f"ASR 音源 {(state.get('asr') or {}).get('asr_audio')}，"
                      f"性别音源 {(state.get('asr') or {}).get('gender_source')}")
 
-    passed = all(g["ok"] for g in gates)
-    md = [f"# {args.version} 发布验收 — {'通过' if passed else '未通过'}", "",
-          "| 门 | 条件 | 结果 | 数据 |", "|---|---|---|---|"]
-    md += [f"| {g['key']} | {g['desc']} | {'✅' if g['ok'] else '❌'} | {g['detail']} |"
-           for g in gates]
-    md += ["", "## 仅报告", ""] + [f"- {n}" for n in notes]
-    if before_after:
-        md += ["", "## output_test：基线或本次 ASR < 0.85 的字幕句，前后对照", ""]
-        for b, c in sorted(before_after, key=lambda t: t[1]["start"]):
-            md += [f"**[{c['start']:.1f}s] {b['sim']:.2f} → {c['sim']:.2f}**",
-                   f"- 画面原文：{c['ref_ja']}",
-                   f"- 基线：{b['asr_ja']} → {b['ours_zh']}",
-                   f"- 本次：{c['asr_ja']} → {c['ours_zh']}", ""]
     if args.long:
         import importlib.util as _ilu
         _spec = _ilu.spec_from_file_location("eval_long", ROOT / "scripts" / "eval_long.py")
@@ -277,6 +272,21 @@ def main() -> int:
                  c["value"] + ("（基线通过，现在失败）" if regressed else ""))
         for n in res.get("notes", []):
             notes.append(f"{args.long}: {n}")
+    # The long-film checks are blocking too: aggregate and render only once all
+    # gates have been collected, so the exit status, JSON and Markdown agree.
+    passed = all(g["ok"] for g in gates)
+    md = [f"# {args.version} 发布验收 — {'通过' if passed else '未通过'}", "",
+          "| 门 | 条件 | 结果 | 数据 |", "|---|---|---|---|"]
+    md += [f"| {g['key']} | {g['desc']} | {'✅' if g['ok'] else '❌'} | {g['detail']} |"
+           for g in gates]
+    md += ["", "## 仅报告", ""] + [f"- {n}" for n in notes]
+    if before_after:
+        md += ["", "## output_test：基线或本次 ASR < 0.85 的字幕句，前后对照", ""]
+        for b, c in sorted(before_after, key=lambda t: t[1]["start"]):
+            md += [f"**[{c['start']:.1f}s] {b['sim']:.2f} → {c['sim']:.2f}**",
+                   f"- 画面原文：{c['ref_ja']}",
+                   f"- 基线：{b['asr_ja']} → {b['ours_zh']}",
+                   f"- 本次：{c['asr_ja']} → {c['ours_zh']}", ""]
     (outdir / "ACCEPTANCE.md").write_text("\n".join(md), encoding="utf-8")
     (outdir / "ACCEPTANCE.json").write_text(
         json.dumps({"version": args.version, "passed": passed, "gates": gates, "notes": notes},

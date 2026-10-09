@@ -354,12 +354,12 @@ VC_GUARD_MIN_BASE_FRAMES = 20  # a built-in line with fewer confidently-voiced f
 VC_GUARD_MIN_VOICED_KEEP = 0.4
 VC_GUARD_RATIO = (0.7, 1.4)
 VC_GUARD_MAX_REJECT = 0.3      # above this share of rejected lines, try the next reference clip
-# Which v1 wav voice conversion takes its content from (tts.run_vc_conversion).  "audio" is the
-# natural-tempo line: it is converted once and then pinned to the v1 slot in ONE stretch, whereas
-# "audio_fit" (v3.3) fed the converter speech already sped up 1.25–1.60× and stretched it a third
-# time afterwards.  Only lines with v1 fit_ratio > 1 differ (22 of 268 short-film lines, 38 of 1239 on
-# SONE-846); "audio_fit" stays selectable for the A/B (run_vc_version.py --vc-source audio_fit).
-VC_SOURCE_KEY = "audio"
+# Which v1 wav voice conversion takes its content from (tts.run_vc_conversion).
+# V6's three-short comparison did not qualify the natural-tempo "audio" input:
+# its ECAPA median fell by 0.085 on test_1 and 0.049 on test_2 (allowed: 0.02).
+# Retain the fitted v3.3 input; natural input remains an explicit experiment
+# (run_vc_version.py --vc-source audio). See workspace/_cache/v34_measure.log.
+VC_SOURCE_KEY = "audio_fit"
 # Content-drift judge on converted lines (ai_movie/vc_guard.py judge_content): the pitch guard cannot
 # see a line whose words changed («把腿伸直» → «把腿先举», «不妙啊» → "Tchau, tchau").  Both the
 # built-in line and its conversion are re-read by Whisper and the folded (t2s / NFKC / kana→hiragana)
@@ -689,8 +689,8 @@ OLLAMA_SAKURA_MODEL = "quantumcookie/Sakura-qwen2.5-v1.0:14b"
 # env override lets the release runner fall back automatically when the
 # model fails its smoke test.
 import os as _os
-# Finished videos stay on this machine.  The uplink here is ~0.7 MB/s and metered, so the release
-# scripts' ``--upload`` (VPS preview site, Google Drive) is a no-op unless AI_MOVIE_UPLOAD=1.
+# The current network is unmetered; delivery uses the private LAN SMB share.
+# Public VPS / Google Drive upload still requires explicit AI_MOVIE_UPLOAD=1.
 PUBLISH_UPLOAD = _os.environ.get("AI_MOVIE_UPLOAD", "0") == "1"
 
 OLLAMA_POLISH_MODEL = _os.environ.get(

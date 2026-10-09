@@ -12,13 +12,13 @@ This script converts v1's audio to the real speakers' timbre with
 *timbre* from a reference clip — so there is still no text conditioning that
 could reintroduce Japanese.  Evidence in ``Documentation/vc-gate-result.md``.
 
-The converter takes v1's *natural* line (``config.VC_SOURCE_KEY = "audio"``;
-``--vc-source audio_fit`` restores the v3.3 input for an A/B) and the whole
-fit ratio is paid once, after conversion: each converted wav is stretched to
+The converter defaults to v1's fitted line (``config.VC_SOURCE_KEY = "audio_fit"``).
+The natural-line experiment (``--vc-source audio``) failed V6's three-short
+ECAPA gate, so it remains opt-in. Each converted wav is stretched to
 exactly the sample count of the v1 fitted wav it stands in for
 (``pin_to_v1``), so the timeline is identical by construction and the
 converted track reuses v1's lip-sync render instead of paying for a second
-one.  Converting the fitted audio instead meant a sped-up line went
+one. Converting the fitted audio means a sped-up line goes
 rubberband(rate) → rubberband(slot) → VC → rubberband again, with the
 converter seeing 1.25–1.6× speech.  (Re-running the ordinary slot fit does
 *not* work here — it recompresses audio v1 already compressed; measured drift
@@ -35,7 +35,7 @@ falls back to the built-in voice like a pitch failure; over
     python scripts/run_vc_version.py workspace/output_test/state.json --refs-json …
     python scripts/run_vc_version.py workspace/F_p01/state.json --profiles workspace/F/profiles.json
     # A/B on one state without overwriting the deliverable:
-    python scripts/run_vc_version.py … --vc-source audio_fit --out-name v2_fitsrc --out-dir synthesized_vc_fitsrc
+    python scripts/run_vc_version.py … --vc-source audio --out-name v2_natural --out-dir synthesized_vc_natural
 """
 
 from __future__ import annotations

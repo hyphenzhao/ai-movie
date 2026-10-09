@@ -71,3 +71,15 @@ asset/hf_token
 
 # 测试视频与外部参考字幕（不入库）
 inputs/
+
+# Local originals retained only while verifying SMB migration
+/.migration-hold/
+
+# Migrated data roots can be symlinks instead of directories
+/inputs
+/deliver
+/projects
+/test_data
+
+# Local service state and diagnostic protocol archives
+/state/

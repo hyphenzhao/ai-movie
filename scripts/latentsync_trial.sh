@@ -65,7 +65,7 @@ for film in ("test_1", "test_2"):
     print(film, f"clip from {a:.1f}s, segment {i} had {gated[str(i)]} gated frames")
 PYEOF
 
-export HF_HUB_OFFLINE=1          # everything it needs is on disk; never pull models over the metered link
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"   # respect an explicit offline request
 # ── run ────────────────────────────────────────────────────────────
 cd "$LS"
 for film in test_1 test_2; do

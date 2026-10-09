@@ -1,0 +1,21 @@
+# Scope: ../../README.md#用途与处理范围 and AGENTS.md existing-text evaluation authorization.
+# Read-only LAN reports; never starts models or edits evaluation evidence.
+[Unit]
+Description=AI-Movie read-only LAN evaluation reports
+After=network-online.target ai-movie-smb.service
+Wants=ai-movie-smb.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ai-movie/ai-movie
+ExecStart=/usr/bin/python3 -B /home/ai-movie/ai-movie/experiments/report_portal/server.py --listen 192.168.50.241 --port 8001 --run-dir /home/ai-movie/mnt/PrivateFiles/AI-Movie/evaluations/text-models/20261007-sone846-text-03
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

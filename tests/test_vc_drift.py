@@ -90,7 +90,7 @@ def test_judge_content_rules():
 
 
 def test_calibration_sample_reproduces():
-    """The v3.3 paired rows the thresholds were set on (design + review recomputed them identically)."""
+    """Regression examples from the calibration transcripts, not independently labelled accuracy."""
     rows = [("这么多", "这么多", "我们都要", False), ("好疼先等等啊", "好 糖先等等啊", "我唐仙懂得啊", False),
             ("大肉棒", "大肉棒", "大萝卜", False), ("射出来射出来", "射出来射出来", "秀出來", False),
             ("变得好大了呢", "变得好大了呢", "电的好大的呢", True), ("疼得要命", "疼得要命", "腾力要命", True),
@@ -98,6 +98,48 @@ def test_calibration_sample_reproduces():
     for want, v1, conv, ok in rows:
         d = judge_content(R(conv), R(v1), want)
         assert d["judged"] and d["ok"] == ok, (want, conv, d)
+
+
+def test_transcript_errors_are_not_content_rejections():
+    good = R("今天天气很好")
+    error = {"auto": {"text": "", "error": "OSError: temporarily unavailable"}, "zh": None}
+    for unavailable in (None, {}, error, {"auto": good["auto"], "zh": {"error": "decode failed"}}):
+        for conv, base in ((unavailable, good), (R("wrong language", "en"), unavailable)):
+            d = judge_content(conv, base, "今天天气很好")
+            assert not d["judged"] and d["ok"] and d["score"] is None
+            assert d["gate"] == "transcript_error" and d["errors"]
+    # A successful decoder returning no speech remains real evidence; this is not a blanket bypass.
+    empty = judge_content(R(""), good, "今天天气很好")
+    assert empty["judged"] and not empty["ok"] and empty["reason"] == "drift_0.00"
+
+
+def test_partial_transcript_errors_preserve_pitch_and_chunk_members():
+    from unittest.mock import patch
+    from ai_movie.vc_guard import guard_lines
+    with tempfile.TemporaryDirectory(prefix="vcdrift_errors_") as tmp:
+        d = Path(tmp)
+        v1, items = [], {}
+        segs = [{"gender": "female", "text_translated": "今天天气很好"} for _ in range(3)]
+        for i in range(3):
+            b, c = d / f"v1_{i}.wav", d / f"conv_{i}.wav"
+            b.touch(); c.touch()
+            v1.append({"audio_fit": str(b)})
+            items[i] = {"audio": str(c), "vc": True}
+        items[0]["chunk"] = items[1]["chunk"] = [0, 1]
+        readings = {v["audio_fit"]: R("今天天气很好") for v in v1}
+        readings[items[0]["audio"]] = {"auto": {"text": "", "error": "read failed"}, "zh": None}
+        readings[items[1]["audio"]] = R("今天天气很好")
+        # Third transcript is absent, but independent pitch evidence still requires its fallback.
+        pitch = [{"judged": True, "ok": True, "reason": ""},
+                 {"judged": True, "ok": True, "reason": ""},
+                 {"judged": True, "ok": False, "reason": "band_female_110Hz"}]
+        with patch("ai_movie.vc_guard.judge_line", side_effect=pitch):
+            st = guard_lines(segs, items, v1, transcribe=lambda paths: readings)
+        assert st["dropped"] == st["rejected"] == 1
+        assert items[0]["vc"] and items[1]["vc"] and not items[2]["vc"]
+        assert st["verdicts"][0]["drift"]["errors"]["conv"] == "auto: read failed"
+        assert st["drift"]["error_units"] == 2 and st["drift"]["error"]
+        assert st["drift"]["judged"] == 1 and st["drift"]["rejected"] == 0
 
 
 def test_whisper_clips_cache_and_regime():

@@ -46,14 +46,32 @@ else
   $PY -u scripts/run_vc_version.py "$STATE" --refs-json "$WORK/refs_auto/refs.json" || die "vc version"
 fi
 # one voice per speaker on the delivered v2 lines (ECAPA on CPU, GPU hidden) → state.vc.consistency, 07_voice_consistency.*
-$PY -u scripts/voice_consistency.py "$STATE" ${PROFILES:+--profiles "$PROFILES"} || echo "(voice consistency failed — kept going)"
+$PY -u scripts/voice_consistency.py "$STATE" ${PROFILES:+--profiles "$PROFILES"} || die "voice consistency execution"
 
 stage "D: QC (v1 + v2), verification, acceptance"
 # shellcheck disable=SC2086
 $PY -u scripts/run_pipeline.py "$VIDEO" --name "$NAME" $PIPE_ARGS --steps qc --force || die "qc"
-$PY -u scripts/verify_dub.py "$STATE" --key fit -n 20 --out "$WORK/verify_v1.json" || echo "(verify v1 failed — kept going)"
-$PY -u scripts/verify_dub.py "$STATE" --key vc --audio-field audio_fit -n 20 --out "$WORK/verify_v2.json" || echo "(verify v2 failed — kept going)"
-$PY -u scripts/eval_pipeline.py "$STATE" || echo "(eval reported failures — kept going)"
+$PY -u scripts/verify_dub.py "$STATE" --key fit -n 20 --out "$WORK/verify_v1.json" || die "verify v1 execution"
+$PY -u scripts/verify_dub.py "$STATE" --key vc --audio-field audio_fit -n 20 --out "$WORK/verify_v2.json" || die "verify v2 execution"
+# Quality failures remain visible in fresh reports, while crashes cannot reuse old reports.
+rm -f "$WORK/eval-current.json"
+$PY -u scripts/eval_pipeline.py "$STATE" --json "$WORK/eval-current.json"
+EVAL_RC=$?
+[ "$EVAL_RC" -le 1 ] && [ -s "$WORK/eval-current.json" ] || die "evaluation execution"
+$PY - "$WORK/eval-current.json" "$EVAL_RC" <<'PYEOF' || die "invalid evaluation report"
+import json
+from pathlib import Path
+import sys
+rows = json.loads(Path(sys.argv[1]).read_text())
+if (not isinstance(rows, list) or not rows
+        or any(not isinstance(r, dict) or not isinstance(r.get('key'), str) or not r['key']
+               or 'ok' not in r or (r['ok'] is not None and type(r['ok']) is not bool) for r in rows)
+        or not any(type(r['ok']) is bool for r in rows)):
+    raise SystemExit('evaluation JSON has no complete check results')
+expected = int(any(r['ok'] is False for r in rows))
+if int(sys.argv[2]) != expected:
+    raise SystemExit('evaluation return code disagrees with its check results')
+PYEOF
 
 stage "E: deliverable (v2 final + demo folder)"
 if [ "$UPLOAD" = "--upload" ]; then
@@ -63,5 +81,9 @@ else
   $PY -u scripts/deliver.py "$STATE" --out "$ROOT/deliver" --version vc || die "deliver"
 fi
 $PY -u scripts/export_project.py "$STATE" >/dev/null || true
+
+if [ -n "${V34_RUN_DIR:-}" ]; then
+  $PY scripts/run_evidence.py record "$NAME" || die "completion receipt"
+fi
 
 stage "DONE in $(( ($(date +%s) - T0) / 60 )) min"

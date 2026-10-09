@@ -157,12 +157,12 @@ def test_run_vc_conversion_source_key_and_fallbacks(monkeypatch=None):
     assert res[2]["source"] == segs[2]["audio"]
     assert res[4]["vc"] is False and res[4]["skipped"].startswith("source > 29") and 4 not in received
     assert res[5]["vc"] is False and res[5]["source"] == segs[5]["audio"] and res[5]["source_dur"] == 1.0
-    # default source key comes from config (audio); audio_fit reproduces v3.3's input
+    # The qualified default comes from config: audio_fit reproduces v3.3's input.
     T.run_isolated_synthesis = fake_isolated
     translator.free_gpu_for_local_work = lambda *a, **k: None
     received.clear()
     try:
-        res2 = T.run_vc_conversion(segs[:1], {"S0": {"ref_audio": ref}}, d / "out2", source_key="audio_fit")
+        res2 = T.run_vc_conversion(segs[:1], {"S0": {"ref_audio": ref}}, d / "out2")
     finally:
         T.run_isolated_synthesis, translator.free_gpu_for_local_work = orig_iso, orig_free
     assert abs(dominant_hz(received[0]) - 440) < 5 and res2[0]["source"] == segs[0]["audio_fit"]

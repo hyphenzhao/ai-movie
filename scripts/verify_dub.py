@@ -21,6 +21,7 @@ So both are measured directly:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -36,6 +37,21 @@ HANZI = re.compile(r"[一-鿿]")
 # voice is unambiguously the wrong sex, not where the boundary sits.
 FEMALE_HZ = (165.0, 320.0)
 MALE_HZ = (70.0, 175.0)
+
+
+def audio_provenance(path: str, field: str) -> dict:
+    """Identify the actual sampled waveform; paths alone can be overwritten by later runs."""
+    p = Path(path)
+    before = p.stat()
+    h = hashlib.blake2b(digest_size=16)
+    with p.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    after = p.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"audio changed during fingerprinting: {p}")
+    return {"path": str(p.absolute()), "field": field, "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns, "blake2b16": h.hexdigest()}
 
 
 def main() -> int:
@@ -74,18 +90,21 @@ def main() -> int:
     rows = []
     for i, s in pool:
         path = s.get(args.audio_field) or s["audio"]
+        field = args.audio_field if s.get(args.audio_field) else "audio"
+        audio = audio_provenance(path, field)
         want = (s.get("text_translated") or "").strip()
         gender = s.get("gender") or "female"
         out, info = asr.transcribe(path, language=None, beam_size=5,
                                    vad_filter=False)
         heard = "".join(x.text for x in out).strip()
+        heard_auto = heard
         wset = set(HANZI.findall(want))
         overlap = len(wset & set(HANZI.findall(heard))) / max(len(wset), 1)
 
         # Whisper's language ID is unreliable on sub-second clips — it labelled
         # two correct Chinese lines "ko" while transcribing them accurately.
-        # Settle those by forcing a Chinese decode: if that returns the text we
-        # asked for, the audio is Chinese and the auto-detect was the error.
+        # Record a forced Chinese decode as additional ASR evidence. Matching
+        # the intended text supports the language score but is not human confirmation.
         forced = None
         if info.language != "zh":
             f_out, _ = asr.transcribe(path, language="zh", beam_size=5,
@@ -95,7 +114,7 @@ def main() -> int:
                          / max(len(wset), 1))
             if f_overlap >= 0.6 and not KANA.search(forced):
                 heard, overlap = forced, f_overlap
-                info_language = "zh*"          # * = confirmed by forced decode
+                info_language = "zh*"          # * = supported by forced-decode overlap
             else:
                 info_language = info.language
         else:
@@ -106,6 +125,9 @@ def main() -> int:
         med = float(np.median(f0[ok])) if int(ok.sum()) >= 6 else None
         lo, hi = FEMALE_HZ if gender == "female" else MALE_HZ
         in_range = None if med is None else (lo <= med <= hi)
+        now = Path(path).stat()
+        if (now.st_size, now.st_mtime_ns) != (audio["size"], audio["mtime_ns"]):
+            raise RuntimeError(f"audio changed during verification: {path}")
 
         rows.append({"index": i + 1, "start": s.get("start"), "gender": gender,
                      "lang": info_language, "lang_auto": info.language,
@@ -114,7 +136,12 @@ def main() -> int:
                      "kana": len(KANA.findall(heard)),
                      "overlap": round(overlap, 3),
                      "f0": round(med, 1) if med else None,
-                     "f0_ok": in_range, "want": want, "heard": heard})
+                     "f0_ok": in_range, "want": want, "heard": heard, "heard_auto": heard_auto,
+                     "audio": audio, "stage": args.key, "vc": s.get("vc"),
+                     "vc_source_key": (state.get("vc") or {}).get("source_key") if args.key == "vc" else None,
+                     "decoder": {"engine": "faster-whisper.transcribe", "model": ASR_MODEL_SIZE,
+                                 "beam_size": 5, "vad_filter": False, "auto_language": True,
+                                 "forced_zh_acceptance": "hanzi_overlap>=0.6 and no kana"}})
         print(f"  #{i+1:>3} {gender:6} {info_language:3} kana={rows[-1]['kana']:>2} "
               f"chars={overlap:.2f} f0={rows[-1]['f0'] or '-':>6} "
               f"{'ok' if in_range else ('OUT' if in_range is False else '-')}  "
@@ -132,9 +159,8 @@ def main() -> int:
     print("\n" + "=" * 72)
     print(f"language : {zh}/{n} Chinese & kana-free   (total kana chars: {kana})")
     if forced_n:
-        print(f"           {forced_n} of those needed a forced Chinese decode to "
-              f"confirm —\n           Whisper's auto language-ID mislabels "
-              f"sub-second clips, the audio itself was fine")
+        print(f"           {forced_n} passed using forced-Chinese transcript overlap; "
+              f"this ASR proxy does not confirm audible correctness")
     print(f"content  : median hanzi overlap {ov[len(ov)//2]:.2f}, "
           f"worst {ov[0]:.2f}")
     if measured:

@@ -15,10 +15,12 @@ Outputs per state, under ``--out`` (default ``workspace/<name>/drift_probe/``):
 * ``lines.csv`` — one row per converted line: verdict, score, baseline, both
   readings, the existing pitch-guard verdict, and (when the film has
   verify_v1/verify_v2 rows) verify_dub's own reading of the same line with
-  the "known bad" flag (max folded sim of verify's v2 reading to v1 reading /
-  intended text < 0.5) so the judge's recall on verify's rows is visible;
+  the historical ASR proxy flag (max folded sim of verify's v2 reading to v1
+  reading / intended text < 0.5). This is not a human content label;
 * ``summary.json`` — counts, reject share, reasons, decode seconds, recall /
-  precision proxies against verify_dub's known-bad rows;
+  precision proxies against verify_dub's flagged rows. The guard uses raw
+  audio/openai-whisper decode while verify defaults to fitted audio and
+  faster-whisper transcribe; their observations are not interchangeable;
 * ``review/`` — ``<idx>_v1.wav`` + ``<idx>_conv.wav`` for every rejection and
   for ``--band-sample`` random passes with 0.5 ≤ score < 0.7, plus
   ``review.csv``: this is what the user listens to.
@@ -60,6 +62,7 @@ def _abs(p: str | None) -> Path | None:
 def _verify_rows(work: Path) -> dict[int, dict]:
     """{0-based idx: {"v1": heard, "v2": heard, "want", "bad"}} from the film's verify JSONs."""
     from ai_movie.vc_guard import text_sim
+    from scripts.vc_drift_calib import same_line
     try:
         v1 = {r["index"]: r for r in json.loads((work / "verify_v1.json").read_text(encoding="utf-8"))}
         src = work / "verify_v2.pre_v34.json"
@@ -71,16 +74,19 @@ def _verify_rows(work: Path) -> dict[int, dict]:
     out = {}
     for r in v2:
         a = v1.get(r["index"])
-        if not a:
+        if not a or not same_line(a, r):
             continue
         score = max(text_sim(r["heard"], a["heard"]), text_sim(r["heard"], r["want"]))
         out[r["index"] - 1] = {"v1": a["heard"], "v2": r["heard"], "want": r["want"],
+                               "start": r.get("start"), "source": str(src),
+                               "audio": r.get("audio"), "decoder": r.get("decoder"),
                                "score": round(score, 3), "bad": score < 0.5}
     return out
 
 
 def probe_state(state_path: Path, out_dir: Path, *, judge, band_sample: int, seed: int = 0) -> dict:
     from ai_movie.vc_guard import judge_content
+    from scripts.vc_drift_calib import same_line
     state = json.loads(state_path.read_text(encoding="utf-8"))
     work = state_path.parent
     vc = state.get("vc") or {}
@@ -116,6 +122,8 @@ def probe_state(state_path: Path, out_dir: Path, *, judge, band_sample: int, see
         d = judge_content(texts.get(u["conv"]), texts.get(u["v1"]), u["want"])
         rc, rv = texts.get(u["conv"]) or {}, texts.get(u["v1"]) or {}
         vr = verify.get(u["idx"])
+        if vr and not same_line(vr, u):
+            vr = None                           # a reused index is not evidence of the same utterance
         row = {"idx": u["idx"], "start": u["start"], "speaker": u["speaker"], "gender": u["gender"],
                "chunk": ("-".join(map(str, u["chunk"])) if u.get("chunk") else ""),
                "judged": int(d["judged"]), "ok": int(d["ok"]), "reason": d["reason"], "gate": d.get("gate") or "",
@@ -123,9 +131,12 @@ def probe_state(state_path: Path, out_dir: Path, *, judge, band_sample: int, see
                "lang_conv": (rc.get("auto") or {}).get("language"), "lang_v1": (rv.get("auto") or {}).get("language"),
                "heard_v1": d["heard_v1"], "heard_conv": d["heard_conv"],
                "heard_conv_zh": ((rc.get("zh") or {}).get("text") if rc.get("zh") else ""),
+               "transcript_errors": json.dumps(d.get("errors") or {}, ensure_ascii=False),
                "want": u["want"], "pitch_guard": u["guard"], "newer_than_state": int(u["newer_than_state"]),
                "verify_sampled": int(vr is not None), "verify_bad": (int(vr["bad"]) if vr else ""),
                "verify_score": (vr["score"] if vr else ""), "verify_heard_v2": (vr["v2"] if vr else ""),
+               "verify_source": vr["source"] if vr else "",
+               "verify_audio": json.dumps(vr.get("audio"), ensure_ascii=False) if vr else "",
                "conv": u["conv"], "v1": u["v1"]}
         rows.append(row)
         if d["judged"]:
@@ -165,6 +176,13 @@ def probe_state(state_path: Path, out_dir: Path, *, judge, band_sample: int, see
     rej_sampled = [r for r in sampled if r["judged"] and not r["ok"]]
     rej_sampled_bad = [r for r in rej_sampled if r["verify_bad"] == 1]
     summary = {"name": work.name, "converted": len(units), "judged": judged, "rejected": rejected,
+               "error_units": sum(r["gate"] == "transcript_error" for r in rows),
+               "provenance": {"state": str(state_path), "state_mtime_ns": state_path.stat().st_mtime_ns,
+                              "conv_audio_field": "audio", "v1_source_key": source_key,
+                              "decoder": "openai-whisper.decode", "model": judge.model_size,
+                              "beam": judge.beam, "batch": judge.batch},
+               "metric_basis": "historical ASR proxy, not human labels; verify defaults to audio_fit and "
+                               "faster-whisper.transcribe; legacy rows cannot prove waveform identity",
                "reject_share_judged": round(rejected / judged, 3) if judged else None,
                "reject_share_converted": round(rejected / len(units), 3),
                "reasons": reasons, "seconds": seconds, "decoded": judge.decoded - d0,
@@ -183,7 +201,8 @@ def report(names: list[str]) -> int:
     ver = {"sampled_converted": 0, "known_bad": 0, "caught": 0, "judge_rejected_in_sample": 0,
            "of_which_known_bad": 0, "missed_unjudgeable": 0, "missed_judged_ok": 0}
     reasons: dict[str, int] = {}
-    print(f"{'film':14} {'conv':>5} {'judged':>6} {'rej':>4} {'share':>6} {'sec':>6}  verify: bad caught | rej rej_bad")
+    print("Historical ASR proxy comparison only; different audio fields/decoders, no human precision or recall.")
+    print(f"{'film':14} {'conv':>5} {'judged':>6} {'rej':>4} {'share':>6} {'sec':>6}  proxy: flagged caught | rej rej_flagged")
     for n in names:
         p = ROOT / "workspace" / n / "drift_probe" / "summary.json"
         if not p.exists():
@@ -206,10 +225,10 @@ def report(names: list[str]) -> int:
               f"rejected {tot['rejected']} ({tot['rejected'] / tot['judged']:.1%} of judged, "
               f"{tot['rejected'] / tot['converted']:.1%} of converted); reasons {reasons}; "
               f"{tot['decoded']} clips decoded in {tot['seconds']:.0f} s ({tot['seconds'] / max(1, tot['decoded']):.2f} s/clip)")
-        print(f"verify_dub rows: {ver['known_bad']} known-bad converted lines of {ver['sampled_converted']} sampled; "
-              f"judge caught {ver['caught']} (recall {ver['caught'] / max(1, ver['known_bad']):.0%}; "
+        print(f"verify_dub proxy rows: {ver['known_bad']} flagged converted lines of {ver['sampled_converted']} sampled; "
+              f"judge rejected {ver['caught']} (proxy recall {ver['caught'] / max(1, ver['known_bad']):.0%}; "
               f"{ver['missed_unjudgeable']} un-judgeable, {ver['missed_judged_ok']} judged ok); "
-              f"judge rejected {ver['judge_rejected_in_sample']} sampled lines of which {ver['of_which_known_bad']} known-bad "
+              f"judge rejected {ver['judge_rejected_in_sample']} sampled lines of which {ver['of_which_known_bad']} proxy-flagged "
               f"(precision proxy {ver['of_which_known_bad'] / max(1, ver['judge_rejected_in_sample']):.0%})")
     return 0
 
@@ -259,7 +278,8 @@ def main() -> int:
             v = s["verify"]
             print(f"{work.name}: {s['rejected']}/{s['judged']} judged rejected of {s['converted']} converted "
                   f"{s['reasons']} — {s['decoded']} clips in {s['seconds']} s ({time.time() - t0:.0f} s total); "
-                  f"verify known-bad {v['known_bad']} → caught {v['caught']}"
+                  f"verify proxy flags {v['known_bad']} → rejected {v['caught']}"
+                  + (f"; ASR unavailable for {s['error_units']} units" if s["error_units"] else "")
                   + (f"; {s['newer_than_state']} conversions NEWER than state (stale mix?)" if s["newer_than_state"] else ""),
                   flush=True)
     finally:

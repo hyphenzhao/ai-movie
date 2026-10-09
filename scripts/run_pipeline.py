@@ -150,6 +150,14 @@ STEP_CONFIG: dict[str, list[str]] = {
            "QC_OVERLAP_WARN", "QC_OVERLAP_FAIL", "VC_CONSIST_OUTLIER"],
 }
 
+# Module-level values read by the stage's functions. Function source alone
+# cannot see a change to this shared dict; hashing all of translator.py would
+# also invalidate translation after unrelated model-loader/logging edits.
+STEP_VALUES: dict[str, list[str]] = {
+    "translate": ["ai_movie.translator._REWRITE_OPTIONS"],
+    "compact": ["ai_movie.translator._REWRITE_OPTIONS"],
+}
+
 # Functions whose source text each stage's output depends on.  Hashing at
 # function level (not module level) means editing mix_audio does not
 # invalidate "fit".  Names that do not resolve hash as "missing" so a stage
@@ -181,6 +189,11 @@ STEP_CODE: dict[str, list[str]] = {
     "glossary": ["ai_movie.glossary.build_glossary"],
     "translate": ["ai_movie.translator.translate_segments", "run_pipeline._translate_by_units",
                   "ai_movie.translator.enforce_glossary",
+                  # Rewrite options inherit defaults from this caller, and the acceptance
+                  # helpers decide whether the rewritten line reaches downstream synthesis.
+                  "ai_movie.translator._call_ollama_chat", "ai_movie.translator._clean_ollama_output",
+                  "ai_movie.translator._clean_enforce_candidate", "ai_movie.translator._enforce_edit_ok",
+                  "ai_movie.translator._glossary_hit",
                   "ai_movie.translator._sakura_translate",
                   "ai_movie.translator._sakura_messages", "ai_movie.translator._speaker_tag",
                   "ai_movie.translator._strip_tag_echo", "ai_movie.translator._sakura_echo",
@@ -196,6 +209,10 @@ STEP_CODE: dict[str, list[str]] = {
             "ai_movie.diarize.extract_speaker_references",
             "ai_movie.tts.verify_clone_quality"],
     "compact": ["ai_movie.translator.compact_translation",
+                "ai_movie.translator._call_ollama_chat", "ai_movie.translator._clean_ollama_output",
+                "ai_movie.translator._glossary_hit", "ai_movie.translator._visible_len",
+                "ai_movie.translator._char_overlap", "ai_movie.glossary._term_pattern",
+                "ai_movie.composer._visible_chars",
                 "ai_movie.composer.segment_slots",
                 "ai_movie.composer.speaker_sec_per_char"],
     "fit": ["ai_movie.composer.fit_segments_to_timeline",
@@ -218,7 +235,9 @@ STEP_CODE: dict[str, list[str]] = {
                 "ai_movie.face_restore.occlusion_gate_video",
                 "ai_movie.lip_sync._gate_clip", "ai_movie.lip_sync._write_clip_bbox_json",
                 "ai_movie.lip_sync._fit_clip_to_duration",
-                "ai_movie.switch_fade.switch_fade_weights", "ai_movie.switch_fade.FadeWriter"],
+                "ai_movie.switch_fade.switch_fade_weights", "ai_movie.switch_fade.FadeWriter",
+                "ai_movie.switch_fade.blend_frames", "ai_movie.switch_fade.SwitchLog",
+                "ai_movie.switch_fade.frame_step"],
     "enhance": ["ai_movie.face_restore.restore_video"],
     "compose": ["ai_movie.composer.compose_video"],
     "qc": ["ai_movie.qc.build_qc"],
@@ -440,6 +459,18 @@ def _fp_repr(value) -> str:
     return repr(value).replace(str(_cfg.ROOT_DIR), "<ROOT>")
 
 
+def _value_repr(dotted: str) -> str:
+    """Snapshot a JSON-like module value, independent of dict insertion order."""
+    import importlib
+    from ai_movie import config as _cfg
+    module, _, name = dotted.rpartition(".")
+    try:
+        value = getattr(importlib.import_module(module), name)
+    except (ImportError, AttributeError):
+        return "missing"
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=_fp_repr).replace(str(_cfg.ROOT_DIR), "<ROOT>")
+
+
 def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
     """Everything ``step``'s output depends on, plus a combined hash."""
     from ai_movie import config as _cfg
@@ -448,6 +479,8 @@ def step_fingerprint(ctx: "Ctx", step: str, args=None) -> dict:
     for name in STEP_CONFIG.get(step, []):
         if hasattr(_cfg, name):
             cfg[name] = _fp_repr(getattr(_cfg, name))
+    for dotted in STEP_VALUES.get(step, []):
+        cfg[dotted] = _value_repr(dotted)
     code = {d: _source_hash(d) for d in STEP_CODE.get(step, [])}
     files = {}
     for rel in STEP_FILES.get(step, []):

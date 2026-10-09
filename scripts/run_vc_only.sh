@@ -27,7 +27,7 @@ STATE="$WORK/state.json"
 [ -s "$STATE" ] || { echo "no state: $STATE"; exit 1; }
 LOG="$WORK/run_vc_only.log"
 exec > >(tee -a "$LOG") 2>&1
-export HF_HUB_OFFLINE=1
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 stage() { echo; echo "===== [$(date +%H:%M:%S)] $NAME · $* ====="; }
 die() { echo "FAILED: $*" >&2; exit 1; }
 T0=$(date +%s)

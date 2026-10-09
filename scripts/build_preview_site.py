@@ -359,7 +359,7 @@ def main() -> int:
     args = ap.parse_args()
     build()
     if args.upload and not _upload_enabled():
-        print(f"upload skipped: local-only mode, site built at {OUT} (set AI_MOVIE_UPLOAD=1 to rsync)")
+        print(f"VPS upload disabled; site built at {OUT} (AI_MOVIE_UPLOAD=1 enables VPS rsync)")
         args.upload = False
     if args.upload or args.dry_run:
         cmd = ["rsync", "-aL", "--info=progress2", "--partial", "--inplace",

@@ -1,5 +1,7 @@
 # MuseTalk patches
 
+> **用途声明（2026-10-05）**：仅用于男女性用品广告的多国家语言本地化，禁止用于色情类电影的制作、翻译或推广。工具不做内容审核；使用方依当地广告法律审核素材及投放并承担使用责任，项目不对其违法内容负责。无词发声保留原声、不翻译、不改口型；画面仅处理必要脸部信息与口型，其余内容不分析或主动编辑。完整边界见 [项目用途与处理范围](../README.md#用途与处理范围)。历史设计、原始测量和模型名称保留用于追溯，不代表 v3.4 已实现全部新边界。
+
 `models/musetalk/` is a downloaded vendor repo (not tracked by this project's git),
 so local modifications are preserved here as patches and re-applied after a fresh
 MuseTalk checkout.
@@ -88,7 +90,9 @@ Applies on top of the two patches above (touches `scripts/inference.py` and
 - **Cubic paste** (`--paste_interp`, default `cubic`): the 256² render was
   scaled up to big faces with bilinear; cubic for upscaling, area for downscaling.
 - **Optional unsharp mask** (`--sharpen`, default 0 = off) on the generated face
-  before paste; a knob for experiments, CodeFormer (人脸增强) is the real fix.
+  before paste; a historical experiment. CodeFormer was evaluated for sharpness,
+  but its lower-face changes have not been validated against the current
+  mouth-only advertising scope. This description does not authorize general face enhancement.
 
 Apply after the other two:
 ```

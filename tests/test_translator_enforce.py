@@ -4,7 +4,7 @@ Ollama is replaced by a fake ``urllib.request.urlopen`` (the module
 attribute — _call_ollama_chat imports the module inside the function), so
 the tests see exactly the request body the pipeline would send: the
 thinking-capable model must always get ``think: false`` and the rewrite
-channels ``repeat_penalty 1.0``.  The edit guard, the candidate cleaning and
+channels the qualified default ``repeat_penalty 1.15``. The edit guard, the candidate cleaning and
 the report plumbing (segment index, one CSV per row shape) are pure.
 
     .venv/bin/python tests/test_translator_enforce.py
@@ -138,7 +138,7 @@ def test_enforce_sends_think_false_and_reports_segment_index():
     assert out == ["我是S1专属套装的坎娜。", "不知道", "小坎娜这么想。", "我演了电视剧。", "小坎娜。"]
     assert [b["think"] for b in fake.bodies] == [False, False, False]
     for b in fake.bodies:
-        assert b["options"]["repeat_penalty"] == 1.0 and b["options"]["temperature"] == 0.0
+        assert b["options"]["repeat_penalty"] == 1.15 and b["options"]["temperature"] == 0.0
         assert b["options"]["num_predict"] >= 64
         assert "不要加引号" in b["messages"][-1]["content"]
     assert [(r["idx"], r["status"]) for r in rows] == [
@@ -156,10 +156,10 @@ def test_enforce_error_row_and_option_override():
     rows: list[dict] = []
     with fake_ollama(reply) as fake:
         out = T.enforce_glossary(SEGS[:1], ZH[:1], GLOSS, model="m", base_url="http://x",
-                                 report=rows, options={"repeat_penalty": 1.15})
+                                 report=rows, options={"repeat_penalty": 1.0})
     assert out == ZH[:1]
     assert rows[0]["status"] == "error" and "TimeoutError" in rows[0]["candidate"]
-    assert fake.bodies[0]["options"]["repeat_penalty"] == 1.15
+    assert fake.bodies[0]["options"]["repeat_penalty"] == 1.0
     # no report list → same behaviour, nothing recorded
     with fake_ollama(reply):
         assert T.enforce_glossary(SEGS[:1], ZH[:1], GLOSS, model="m", base_url="http://x") == ZH[:1]
@@ -180,7 +180,7 @@ def test_compact_sends_think_false():
                                      glossary=GLOSS, model="m", base_url="http://x")
     assert cand == "我演了短剧"
     assert fake.bodies[0]["think"] is False
-    assert fake.bodies[0]["options"]["repeat_penalty"] == 1.0
+    assert fake.bodies[0]["options"]["repeat_penalty"] == 1.15
     # an empty reply (what a thinking model returns without think=False) → None, not a crash
     with fake_ollama(lambda p: ""):
         assert T.compact_translation("ドラマをやりました。", "我之前演了一部短剧哦。", 5,

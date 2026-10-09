@@ -9,8 +9,8 @@
 #    burned-in subtitles; median below 0.90 stops the release early
 # 3. per film: new ASR first, gender guard against the baseline (regression →
 #    re-run that film with --gender-source vocals), then the full run_v3.sh
-# 4. accept_release.py; any blocking gate failing stops here without uploading
-# 5. VPS preview site + Google Drive (<version>/ subfolder)
+# 4. accept_release.py; any blocking gate failing stops here without publishing
+# 5. Verified LAN SMB release (AI-Movie/releases/<version>/)
 set -uo pipefail
 VER="${1:?usage: run_release.sh <version>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,10 +27,11 @@ stage() { echo; echo "##### [$(date '+%m-%d %H:%M:%S')] $VER · $* #####"; }
 die() { echo "FAILED: $*"; exit 1; }
 T0=$(date +%s)
 ASR_ARGS=""
+$PY scripts/publish_smb.py --check-mount || die "LAN share is not mounted"
 
 stage "1: polish model"
 if ! ollama list | awk 'NR>1{print $1}' | grep -qx "$MODEL"; then
-  for _ in $(seq 1 360); do                      # up to 6 h (flaky VPN), then fall back
+  for _ in $(seq 1 360); do                      # wait up to 6 h for the model, then fall back
     ollama list | awk 'NR>1{print $1}' | grep -qx "$MODEL" && break
     if ! pgrep -f "pull_retry.sh|ollama pull" >/dev/null; then
       echo "download not running — starting it"
@@ -112,20 +113,12 @@ done
 
 stage "4: acceptance gate"
 if ! $PY scripts/accept_release.py "$VER" --baseline "$BASE" --films "${FILMS// /,}"; then
-  echo "GATE_FAILED: see $REL/ACCEPTANCE.md — nothing uploaded"
+  echo "GATE_FAILED: see $REL/ACCEPTANCE.md — release not published"
   exit 1
 fi
 
-stage "5: publish — VPS preview site"
-$PY scripts/build_preview_site.py --upload || die "preview site upload"
-
-stage "5: publish — Google Drive $VER/"
-for FILM in $FILMS; do
-  $PY -u scripts/deliver.py "workspace/$FILM/state.json" --out deliver --version vc \
-      --upload --drive-subdir "$VER" \
-      --extra "deliver/$FILM/09_subs_eval.md" --extra "$REL/ACCEPTANCE.md" \
-      || die "$FILM drive upload"
-done
+stage "5: publish — LAN SMB $VER/"
+$PY scripts/publish_smb.py "$VER" --films "${FILMS// /,}" || die "LAN SMB publish"
 
 stage "DONE in $(( ($(date +%s) - T0) / 60 )) min"
 echo "DONE"

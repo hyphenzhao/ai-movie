@@ -111,7 +111,7 @@ def main() -> int:
     print(f"folder: {folder} → {sorted(p.name for p in folder.iterdir())}")
 
     if args.upload and not config.PUBLISH_UPLOAD:
-        print("upload skipped: local-only mode (set AI_MOVIE_UPLOAD=1 to push to Drive)")
+        print("Drive upload disabled (AI_MOVIE_UPLOAD=1 enables it); LAN delivery uses publish_smb.py")
         args.upload = False
     if args.upload or args.dry_run:
         rclone = _rclone()
